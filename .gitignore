@@ -1,0 +1,18 @@
+# 가상환경 / 캐시
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+
+# 사용자 데이터 (SQLite DB, 업로드 바이트)
+data/
+
+# 생성된 샘플·임시 산출물
+samples/
+*.log
+
+# 에디터
+.vscode/
+.idea/
+

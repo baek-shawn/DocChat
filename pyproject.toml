@@ -1,0 +1,40 @@
+[project]
+name = "docchat"
+version = "0.1.0"
+description = "로컬/클라우드 VLM 문서(PDF·이미지) 분석 챗 시스템"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "aiosqlite>=0.20",
+    "pymupdf>=1.24",
+    "pillow>=10.4",
+    "openai>=1.50",
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# --basetemp: 이 PC의 기본 임시 폴더(%TEMP%\pytest-of-<user>)가 접근 거부 상태라 프로젝트 안의 폴더를 쓴다.
+addopts = "-q -m 'not e2e' --basetemp=.pytest_tmp"
+markers = [
+    "e2e: 실제 로컬/클라우드 모델이 필요한 종단 테스트 (uv run pytest -m e2e)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

@@ -1,0 +1,88 @@
+"""FastAPI 앱 조립."""
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from . import config
+from .api import chat, files, models, sessions
+from .db import ChatStore
+
+
+def _ignore_client_disconnects(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """사용자가 "중지"를 눌러 연결을 끊으면 Windows의 asyncio가 ConnectionResetError 트레이스백을 찍는다.
+    실제 오류가 아니므로 이것만 조용히 넘기고 나머지는 기본 처리에 맡긴다."""
+    if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError)):
+        return
+    loop.default_exception_handler(context)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.get_running_loop().set_exception_handler(_ignore_client_disconnects)
+    app.state.store = await ChatStore(config.database_path()).open()
+    try:
+        yield
+    finally:
+        await app.state.store.close()
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="DocChat", description="로컬/클라우드 VLM 문서 분석 챗", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def reject_cross_origin_api(request: Request, call_next):
+        """다른 사이트의 스크립트가 localhost API를 호출하지 못하게 한다(세션 삭제·SSRF 악용 방지)."""
+        if request.url.path.startswith("/api/"):
+            origin = request.headers.get("origin")
+            if origin and urlparse(origin).netloc != request.headers.get("host"):
+                return JSONResponse({"error": "교차 출처 API 요청은 허용되지 않습니다."}, status_code=403)
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(_request: Request, error: StarletteHTTPException):
+        return JSONResponse({"error": str(error.detail)}, status_code=error.status_code)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, error: RequestValidationError):
+        first = error.errors()[0] if error.errors() else {}
+        where = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+        return JSONResponse({"error": f"요청 형식이 올바르지 않습니다: {where} {first.get('msg', '')}".strip()},
+                            status_code=422)
+
+    @app.get("/api/health")
+    async def health() -> dict[str, object]:
+        return {
+            "ok": True,
+            "limits": {
+                "nativeMinChars": config.NATIVE_MIN_CHARS,
+                "sparseOverlayChars": config.SPARSE_OVERLAY_CHARS,
+                "pdfRenderDpi": config.PDF_RENDER_DPI,
+                "maxVisionImageEdge": config.MAX_VISION_IMAGE_EDGE,
+                "maxVisionImagePixels": config.MAX_VISION_IMAGE_PIXELS,
+                "ocrRetryCount": config.OCR_RETRY_COUNT,
+                "ocrConcurrency": config.OCR_CONCURRENCY,
+                "groundingRetryCount": config.GROUNDING_RETRY_COUNT,
+                "pdfVisualPageLimit": config.pdf_visual_page_limit(),
+            },
+        }
+
+    for module in (sessions, models, files, chat):
+        app.include_router(module.router)
+
+    # API 라우트를 먼저 등록한 뒤 마지막에 정적 파일을 루트에 건다.
+    app.mount("/", StaticFiles(directory=config.STATIC_DIR, html=True), name="static")
+    return app
+
+
+app = create_app()
