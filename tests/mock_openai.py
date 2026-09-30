@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -80,7 +81,14 @@ class MockOpenAIServer:
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 })
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
+        class QuietServer(ThreadingHTTPServer):
+            def handle_error(self, request: Any, client_address: Any) -> None:
+                # 앱이 요청을 취소하면(사용자 "중지") 핸들러가 닫힌 소켓에 쓰다 실패한다 — 테스트 출력에 트레이스백을 찍지 않는다.
+                if isinstance(sys.exc_info()[1], (ConnectionError, BrokenPipeError)):
+                    return
+                super().handle_error(request, client_address)
+
+        self._server = QuietServer(("127.0.0.1", 0), RequestHandler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property

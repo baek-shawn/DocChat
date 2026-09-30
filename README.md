@@ -73,6 +73,17 @@ uv run python run.py
 - 추론 끄기와 출력 상한은 로컬(OpenAI 호환) 서버에만 보냅니다. 클라우드 provider에는 적용되지 않습니다.
 - 답변 호출에는 출력 상한이 없습니다. 답변 호출의 추론이 길어지는 문제는 아직 남아 있습니다(STEPS.md Step 6).
 
+### 턴 과정 보기 — 개발용 트레이스
+
+도면을 왜 잘/못 읽었는지, 어떤 정보를 어디서 가져왔는지, 왜 느렸는지를 **한 턴 단위로** 볼 수 있습니다. `.env`에 `DOCCHAT_DEBUG_TRACE=1`을 적고 서버를 다시 띄우면 켜집니다(기본은 꺼짐, 꺼져 있으면 아무것도 기록하지 않습니다).
+
+- 답변마다 **⏱ 과정 보기** 버튼이 생깁니다. 누르면 타임라인이 열립니다: 입력 → 전처리(쪽마다 판별 결과·글자 수·임계값) → 전사(쪽·타일마다 시도·시간·원문) → 증거 조립(실은 텍스트·잘림·예산·보낸 이미지) → 모델 호출마다(보낸 메시지, 제공한 도구, 응답 원문, 추론 글, 도구 호출, 종료 사유, 토큰 수, 시간) → 도구 실행마다(인자·결과, 그 안의 비전 호출) → 최종 답.
+- **진행 중인 턴도 열립니다.** 모델 호출·도구 실행은 시작할 때 먼저 기록되므로, 끝나지 않은 호출이 "진행 중 · 경과 n초"로 보입니다(어느 타일의 어느 호출이 멈춰 있는지). 중지하면 그 호출에 "취소"와 사유가 남습니다. 서버가 다시 시작돼 끊긴 턴은 "중단됨"으로 정리됩니다. 중지·오류로 답변이 저장되지 않은 턴은 질문 아래에 "과정 보기 (취소된 턴)"으로 붙습니다.
+- 행을 누르면 자세히 보입니다. 보낸 이미지는 첨부 ID로 가리켜 "보기"로 뷰어에서 열 수 있습니다(타일은 쪽·이미지 전체가 열립니다. 타일 파일 자체는 `data/files/{대화ID}/tiles/`).
+- **JSON 내려받기**로 실행 간 비교·실험 기록에 쓸 수 있습니다(`GET /api/traces/{id}?download=1`).
+- 기록은 `turn_traces` 테이블에 따로 저장되고(대화를 지우면 함께 지워짐), 답변의 `meta.traceId`가 가리킵니다. API key와 이미지 바이트는 기록하지 않습니다. 글은 조각당 `DOCCHAT_TRACE_TEXT_LIMIT`(기본 40,000자)까지만 남깁니다.
+- 브라우저 확인용 서버(`docchat-scratch`)는 트레이스를 켠 채 뜹니다.
+
 ### 설정: `.env` 파일 또는 환경변수
 
 `.env.example`을 `.env`로 복사한 뒤, 바꿀 줄의 `#`를 지우고 값을 고칩니다. 서버를 다시 띄우면 적용됩니다.
@@ -98,7 +109,8 @@ Copy-Item .env.example .env
 | `DOCCHAT_TILE_RENDER_DPI` | `200` | PDF 타일 렌더 DPI(스캔 쪽은 박힌 이미지 해상도가 상한) |
 | `DOCCHAT_TILE_MIN_SOURCE_EDGE` | `2048` | 원본 긴 변이 이 이하면 타일로 나누지 않음 |
 | `DOCCHAT_MAX_TILES_PER_IMAGE` | `48` | 한 장의 타일 수 상한(넘으면 해상도를 낮춰 맞춤) |
-| `DOCCHAT_DEBUG_TRACE` | 꺼짐 | `1`이면 모델에 보낸 타일을 `data/files/{대화ID}/tiles/`에 남김("모델이 실제로 본 이미지" 확인용) |
+| `DOCCHAT_DEBUG_TRACE` | 꺼짐 | `1`이면 턴 과정을 기록해 답변마다 "과정 보기"(위 절), 타일 모드에서는 모델에 보낸 타일도 `data/files/{대화ID}/tiles/`에 남김 |
+| `DOCCHAT_TRACE_TEXT_LIMIT` | `40000` | 트레이스에 남기는 글 한 조각(메시지·응답·도구 결과)의 최대 글자 수 |
 | `DOCCHAT_NATIVE_MIN_CHARS` | `24` | 이 글자 수 이상이면 네이티브 텍스트 사용 |
 | `DOCCHAT_SPARSE_OVERLAY_CHARS` | `120` | 래스터가 있는데 이 미만이면 비전 전사 |
 | `DOCCHAT_PDF_RENDER_DPI` | `200` | 페이지 렌더 DPI |
@@ -114,7 +126,7 @@ Copy-Item .env.example .env
 
 ## 3. 테스트
 
-### 3.1 자동 테스트 (모델 불필요, 약 30초, 243개)
+### 3.1 자동 테스트 (모델 불필요, 약 35초, 267개)
 
 ```powershell
 uv run pytest
@@ -135,6 +147,7 @@ uv run pytest
 | `tests/test_compare_script.py` | 비교 스크립트의 IoU·정답 짝짓기·기대 문자열 대조 |
 | `tests/test_runaway_guards.py` | 호출별 추론 끄기·출력 상한이 요청에 실리는지, 상한에 닿은 호출은 다시 보내지 않는지, 끊긴 추론 글·미완성 JSON을 쓰지 않는지, 전사의 추론 선택을 바꾸면 다시 전사하는지 |
 | `tests/test_env_file.py` | `.env` 읽기, 셸 환경변수 우선, `.env.example`이 모든 설정과 실제 기본값을 담고 있는지 |
+| `tests/test_trace.py` | 턴 트레이스: 꺼져 있으면 아무것도 기록하지 않음, 한 턴의 입력→전처리→전사→증거→모델 호출→도구→답변 기록, 도구 아래 자식 호출, 진행 중인 턴의 `running` 호출과 취소 시 `cancelled`, API key·base64 미기록, 대화 삭제 시 함께 삭제 |
 
 특정 테스트만: `uv run pytest tests/test_pdf_pipeline.py -k classification -v`
 
@@ -144,6 +157,8 @@ uv run pytest
 uv run python scripts/make_samples.py     # samples/ 에 시험용 PDF·이미지 생성
 uv run python scripts/e2e_check.py        # 기본: Ollama의 gemma3:latest
 ```
+
+트레이스를 켠 채 돌아가며(`DOCCHAT_DEBUG_TRACE=1`) 기존 항목에 더해 트레이스 항목 T1~T4를 확인합니다(STEPS.md "Step 7 실모델 확인 기준").
 
 다른 모델로: `$env:DOCCHAT_E2E_BASE_URL="http://127.0.0.1:8080/v1"; $env:DOCCHAT_E2E_MODEL="qwen2.5-vl"; uv run python scripts/e2e_check.py`
 클라우드로: `$env:DOCCHAT_E2E_PROVIDER="gemini"; $env:DOCCHAT_E2E_API_KEY="…"; $env:DOCCHAT_E2E_MODEL="gemini-2.5-flash"`
@@ -210,8 +225,10 @@ curl -X POST http://127.0.0.1:8000/api/test-connection -H "Content-Type: applica
 
 | 메서드 · 경로 | 설명 |
 |---|---|
-| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`progress`… `final`). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간 |
-| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`) |
+| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
+| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 트레이스 켬 여부(`debugTrace`) |
+| `GET /api/traces/{id}` | 턴 트레이스 JSON(진행 중이면 그때까지의 기록). `?download=1`이면 파일로 |
+| `GET /api/sessions/{id}/traces` | 그 대화의 트레이스 목록(id·시각·상태) |
 | `GET /api/sessions` · `POST /api/sessions` · `DELETE /api/sessions` | 목록 · 생성 · 선택/전체 삭제(`{ids}` 또는 `{all:true}`) |
 | `GET` · `PUT` · `DELETE /api/sessions/{id}` | 불러오기 · 수정 · 삭제 |
 | `POST /api/models` (`GET`도 가능) | 모델 목록. API key는 본문/`X-Api-Key` 헤더로만 |

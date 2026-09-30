@@ -3,6 +3,7 @@
     uv run python scripts/make_samples.py          # 먼저 샘플 생성
     uv run python scripts/e2e_check.py             # 기본: Ollama http://127.0.0.1:11434/v1 의 gemma3:latest
 
+턴 트레이스(Step 7)를 켠 채 돌린다(트레이스 항목 T1~T4 포함, STEPS.md "Step 7 실모델 확인 기준").
 환경변수로 대상을 바꿀 수 있다.
     DOCCHAT_E2E_PROVIDER   openaiCompatible(기본) | openai | anthropic | gemini
     DOCCHAT_E2E_BASE_URL   기본 http://127.0.0.1:11434/v1
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -77,6 +79,9 @@ def main() -> int:
     # `.env`에 실제 위치가 적혀 있어도 점검은 임시 폴더에서만 한다(사용자 데이터를 건드리지 않는다).
     os.environ["DOCCHAT_DB_PATH"] = str(scratch / "e2e.sqlite")
     os.environ["DOCCHAT_FILES_DIR"] = str(scratch / "files")
+    # 턴 트레이스(Step 7)를 켠 채 돌린다 — 트레이스가 앱의 동작을 바꾸지 않는지(기존 항목이 그대로 통과하는지)와
+    # 실제 모델의 턴이 빠짐없이 기록되는지를 함께 본다.
+    os.environ["DOCCHAT_DEBUG_TRACE"] = "1"
     from fastapi.testclient import TestClient
 
     from app.main import create_app
@@ -86,6 +91,19 @@ def main() -> int:
     def check(name: str, passed: bool, detail: str = "") -> None:
         results.append((name, passed, detail))
         print(f"   {'✔' if passed else '✘'} {name}{' — ' + detail if detail else ''}")
+
+    def trace_of(client, data: dict) -> dict | None:
+        trace_id = (data.get("meta") or {}).get("traceId")
+        response = client.get(f"/api/traces/{trace_id}") if trace_id else None
+        return response.json() if response is not None and response.status_code == 200 else None
+
+    def model_events(document: dict, kind: str) -> list[dict]:
+        return [event for event in document.get("events", []) if event["kind"] == "model" and event["data"].get("kind") == kind]
+
+    def trace_is_clean(document: dict) -> bool:
+        raw = json.dumps(document, ensure_ascii=False)
+        starts = [event["startedMs"] for event in document.get("events", [])]
+        return "base64," not in raw and (not CONNECTION["apiKey"] or CONNECTION["apiKey"] not in raw) and starts == sorted(starts)
 
     print(f"대상: {CONNECTION['provider']} · {CONNECTION['baseUrl']} · {MODEL}")
     with TestClient(create_app()) as client:
@@ -112,6 +130,23 @@ def main() -> int:
         check("스캔 PDF에서 도면 번호 추출", "FA-7731" in data.get("text", ""), "기대값 FA-7731-B")
         scanned_conversation = data.get("conversationId", "")
 
+        # T1) 턴 트레이스(Step 7): 전처리 판별 → 전사(자식으로 모델 호출) → 답변 호출이 빠짐없이 기록된다.
+        document = trace_of(client, data)
+        if document is None:
+            check("트레이스 T1: 스캔 PDF 턴이 기록됨", False, "meta.traceId 없음 또는 조회 실패")
+        else:
+            pages = [page for event in document["events"] if event["kind"] == "preprocess"
+                     for page in event["data"].get("pages", [])]
+            ocr_scopes = [event for event in document["events"] if event["kind"] == "ocr" and event["label"].startswith("전사 · ")]
+            ocr_calls = model_events(document, "ocr")
+            nested = all(call.get("parent") in {scope["id"] for scope in ocr_scopes} for call in ocr_calls)
+            usage = all(call["data"].get("finishReason") and call["data"].get("completionTokens") is not None for call in ocr_calls)
+            check("트레이스 T1: 스캔 PDF 턴이 기록됨",
+                  document["status"] == "done" and any(page["needsVlm"] and page["classification"] == "scanned-raster" for page in pages)
+                  and ocr_calls and nested and usage and model_events(document, "answer"),
+                  f"상태 {document['status']} · 전사 호출 {len(ocr_calls)}회(자식 {nested}, 토큰 {usage}) · 답변 호출 {len(model_events(document, 'answer'))}회")
+            check("트레이스 T4: base64·API key 없음, 시간순", trace_is_clean(document))
+
         data = ask(client, "부품표에 있는 품목을 표로 정리해 줘.", conversation_id=scanned_conversation,
                    history=[{"role": "user", "content": "이 도면의 DWG NO와 REV를 알려 줘."},
                             {"role": "assistant", "content": data.get("text", "")}])
@@ -123,6 +158,18 @@ def main() -> int:
         artifacts = data.get("artifacts", [])
         check("inspect_visual 아티팩트 생성", bool(artifacts), "모델이 도구를 호출하지 않으면 실패")
         check("bbox 1개 이상 측정", any(a.get("boxes") for a in artifacts))
+        # T2) 도구 이벤트 아래에 위치 확인 호출이 자식으로 있고, 도구 인자·결과가 기록된다(도구를 불렀을 때만 판정).
+        document = trace_of(client, data)
+        if artifacts and document is not None:
+            tools = [event for event in document["events"] if event["kind"] == "tool" and event["data"].get("name") == "inspect_visual"
+                     and "arguments" in event["data"]]
+            grounding = model_events(document, "grounding")
+            check("트레이스 T2: inspect_visual 도구 아래에 위치 확인 호출",
+                  tools and grounding and all(call.get("parent") in {tool["id"] for tool in tools} for call in grounding)
+                  and all("result" in tool["data"] for tool in tools),
+                  f"도구 {len(tools)}건 · 위치 확인 호출 {len(grounding)}회 · 작업 문장 {tools[0]['data']['arguments'].get('task')!r}" if tools else "도구 이벤트 없음")
+        elif artifacts:
+            check("트레이스 T2: inspect_visual 도구 아래에 위치 확인 호출", False, "트레이스 조회 실패")
 
         # 6) 호출 트리거 — 계획서: "항상 자동으로 부르는 게 아니라 위치 확인 성격일 때만".
         #    불러야 할 때 부르는지만 보면 과잉 호출을 못 잡는다 → 부르면 안 되는 질문(음성 대조)을 함께 본다.
@@ -162,6 +209,15 @@ def main() -> int:
             check("전사 실패 타일 (기준 ≤ 20%)", vision.get("tiles", 0) > 0 and unread <= vision["tiles"] * 0.2,
                   f"{unread}/{vision.get('tiles')}장")
             check("타일 모드 답변에 도면 번호", "AR-2044-C" in data.get("text", ""), "기대값 AR-2044-C")
+            # T3) 타일마다 전사 호출이 하나씩 기록되고 타일 위치가 적힌다.
+            document = trace_of(client, data)
+            if document is None:
+                check("트레이스 T3: 타일 전사 호출이 타일 수만큼 기록됨", False, "트레이스 조회 실패")
+            else:
+                calls = model_events(document, "ocr")
+                check("트레이스 T3: 타일 전사 호출이 타일 수만큼 기록됨",
+                      len(calls) == vision.get("ocrCalls") and all(call["data"].get("tile") for call in calls),
+                      f"기록 {len(calls)}회 vs ocrCalls {vision.get('ocrCalls')} · 타일 표시 {sum(1 for call in calls if call['data'].get('tile'))}회")
 
             data = ask(client, "소화기 표시(빨간 원)가 어디 있는지 이미지 위에 표시해 줘.", ["large_plan.png"], mode="tile")
             show("8) 타일 모드 inspect_visual — 원본에서 자른 타일마다 분리된 bbox 호출", data)

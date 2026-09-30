@@ -136,6 +136,7 @@
       </select>
     </label>
     <p id="imageModeHelp" class="help">전사(OCR)와 위치 확인(bbox) 호출에 적용됩니다. 타일은 작은 글자·심볼을 더 크게 보여 주지만 호출 수가 늘어 느려집니다. 요청마다 적용되므로 같은 문서를 두 방식으로 비교할 수 있습니다.</p>
+    <p id="traceHelp" class="help"></p>
 
     <div class="dialog-foot">
       <div class="test-group">
@@ -149,6 +150,24 @@
       </div>
     </div>
   </form>
+</dialog>
+
+<!-- 턴 과정(트레이스, 개발용): 한 턴의 전처리 → 전사 → 모델 호출 → 도구 실행 타임라인 -->
+<dialog id="traceDialog" class="trace-dialog">
+  <div class="dialog-card trace-card">
+    <div class="dialog-head">
+      <div class="trace-title"><strong>턴 과정</strong><span id="traceStatus" class="trace-status"></span></div>
+      <div class="viewer-actions">
+        <button id="traceFoldAll" type="button" class="btn ghost small" title="도구·전사 묶음을 모두 접기">모두 접기</button>
+        <button id="traceUnfoldAll" type="button" class="btn ghost small" title="모두 펼치기">모두 펼치기</button>
+        <button id="traceRefresh" type="button" class="btn ghost small" title="다시 불러오기">↻</button>
+        <a id="traceDownload" class="btn ghost small" download>JSON 내려받기</a>
+        <button id="traceClose" type="button" class="icon-btn" aria-label="닫기">×</button>
+      </div>
+    </div>
+    <div id="traceSummary" class="trace-summary"></div>
+    <div id="traceBody" class="trace-body"></div>
+  </div>
 </dialog>
 
 <script src="/js/app.js"></script>

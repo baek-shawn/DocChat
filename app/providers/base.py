@@ -144,6 +144,10 @@ class Provider(ABC):
         """이 provider가 추론을 끄라는 요청을 실제로 보내는가(답변 메타데이터에 적을 때 쓴다)."""
         return False
 
+    def thinking_off_for_every_call(self) -> bool:
+        """"추론 끄기 — 모든 호출"로 만들어졌는가. 그러면 `analyze(disable_thinking=False)`여도 추론을 끄고 보낸다."""
+        return False
+
     @abstractmethod
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,

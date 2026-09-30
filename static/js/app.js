@@ -9,6 +9,10 @@
   const PROVIDER_LABELS = { openaiCompatible: '로컬 API', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini' };
   const TYPE_LABELS = { text: '텍스트', object: '객체', table: '표', dimension: '치수', stamp: '도장', signature: '서명', diagram: '다이어그램', other: '기타' };
   const IMAGE_MODE_LABELS = { whole: '전체', tile: '타일' };
+  // 턴 트레이스(Step 7)의 이벤트 종류·상태 — app/trace.py의 KINDS·STATUSES와 짝이다.
+  const TRACE_KINDS = { input: '입력', preprocess: '전처리', ocr: '전사', evidence: '증거', model: '모델', tool: '도구', loop: '루프', cleanup: '정리', progress: '진행', files: '파일', answer: '답변' };
+  const TRACE_STATUS = { running: '진행 중', done: '완료', failed: '실패', cancelled: '취소', interrupted: '중단됨' };
+  const MODEL_KIND_LABELS = { answer: '답변', ocr: '전사', grounding: '위치 확인' };
 
   const store = {
     get(key, fallback = '') { try { return localStorage.getItem(`docchat.${key}`) ?? fallback; } catch { return fallback; } },
@@ -40,6 +44,8 @@
     disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
     serverVision: { disableThinkingGrounding: true, disableThinkingOcr: true, maxTokens: 4096 },
+    serverDebugTrace: false,                 // 서버가 턴 트레이스를 기록하는지(/api/health)
+    trace: { id: '', doc: null, timer: 0, open: new Set(), sections: new Map(), collapsed: new Set() },   // 열려 있는 "턴 과정" 창(펼친 행·접이식·접은 가지 기억)
     models: []
   };
   if (!PROVIDER_LABELS[state.provider]) state.provider = LOCAL_PROVIDER;
@@ -53,7 +59,8 @@
     'toggleLabels', 'zoomOut', 'zoomReset', 'zoomIn', 'viewerDownload', 'viewerClose', 'viewerStage', 'viewerRegions',
     'settingsDialog', 'providerSelect', 'baseUrlField', 'baseUrl', 'apiKey', 'apiKeyLabel', 'modelName', 'modelOptions',
     'contextField', 'contextSize', 'disableThinking', 'callThinking', 'disableThinkingGrounding', 'disableThinkingOcr', 'callThinkingHelp',
-    'imageMode', 'imageModeHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings'
+    'imageMode', 'imageModeHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
+    'traceDialog', 'traceStatus', 'traceRefresh', 'traceFoldAll', 'traceUnfoldAll', 'traceDownload', 'traceClose', 'traceSummary', 'traceBody'
   ].map((id) => [id, $(id)]));
 
   const el = (tag, className, text) => {
@@ -129,7 +136,21 @@
     const session = await request(`/api/sessions/${encodeURIComponent(id)}`);
     Object.assign(state, { currentId: session.id, messages: session.messages || [], pendingFiles: [], editingIndex: -1 });
     closeViewer();
+    await attachOrphanTraces(session.id);
     render(); renderSessions();
+  }
+
+  // 답변이 저장되지 않은 턴(중지·오류·연결 끊김)의 트레이스는 답변 메시지가 없어 버튼을 걸 곳이 없다
+  // → 그 질문 메시지 아래에 단다. 트레이스가 꺼진 서버는 빈 목록을 돌려준다.
+  async function attachOrphanTraces(sessionId) {
+    let traces = [];
+    try { traces = (await request(`/api/sessions/${encodeURIComponent(sessionId)}/traces`)).traces || []; } catch { return; }
+    const known = new Set(state.messages.map((message) => message.meta?.traceId).filter(Boolean));
+    for (const item of traces) {
+      if (known.has(item.id)) continue;
+      const target = [...state.messages].reverse().find((message) => message.role === 'user' && (message.createdAt || 0) <= item.createdAt + 5000);
+      if (target && !target.traceId) { target.traceId = item.id; target.traceStatus = item.status; }
+    }
   }
 
   async function deleteSession(id) {
@@ -210,6 +231,7 @@
       if (IMAGE_MODE_LABELS[health.imageMode]) state.serverImageMode = health.imageMode;
       state.tiling = health.tiling || null;
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
+      state.serverDebugTrace = health.debugTrace === true;
     } catch { /* 기본값(전체)으로 둔다 */ }
   }
 
@@ -271,6 +293,9 @@
     const tiling = state.tiling;
     els.imageModeHelp.textContent = '전사(OCR)와 위치 확인(bbox) 호출에 적용됩니다. 타일은 작은 글자·심볼을 더 크게 보여 주지만 호출 수가 늘어 느려집니다. 요청마다 적용되므로 같은 문서를 두 방식으로 비교할 수 있습니다.'
       + (tiling ? ` 현재 타일 설정: ${tiling.tileSize}px · 겹침 ${Math.round(tiling.overlap * 1000) / 10}% · ${tiling.renderDpi}DPI · 긴 변 ${tiling.minSourceEdge}px 이하는 나누지 않음 · 장당 최대 ${tiling.maxTiles}타일.` : '');
+    els.traceHelp.textContent = state.serverDebugTrace
+      ? '턴 과정 기록(개발용)이 켜져 있습니다. 답변마다 "과정 보기"로 전처리·전사·모델 호출·도구 실행을 시간순으로 볼 수 있습니다(.env의 DOCCHAT_DEBUG_TRACE).'
+      : '턴 과정 기록(개발용)은 꺼져 있습니다. 켜려면 .env에 DOCCHAT_DEBUG_TRACE=1을 적고 서버를 다시 띄우세요.';
     syncSettingsForm();
     if (!els.settingsDialog.open) els.settingsDialog.showModal();
   }
@@ -408,7 +433,11 @@
         messages: history.map(({ role, content, files: sent, artifacts, meta, createdAt }) => ({ role, content, files: sent, artifacts, meta, createdAt })),
         attachments: files.map(({ name, mime, size, base64 }) => ({ name, mime, size, base64 }))
       }, state.abort.signal, (event) => {
-        if (event.type === 'conversation') state.currentId = event.conversationId;
+        if (event.type === 'conversation') {
+          state.currentId = event.conversationId;
+          // 트레이스를 켠 서버는 id를 먼저 알려 준다 → 답이 나오기 전에도 "과정 보기"를 열 수 있다.
+          if (event.traceId) { placeholder.traceId = event.traceId; render(); }
+        }
         if (event.type === 'progress' && placeholder.activity.at(-1) !== event.message) { placeholder.activity.push(event.message); render(); }
       });
       Object.assign(placeholder, { content: final.text, artifacts: final.artifacts || [], meta: final.meta || {}, pending: false });
@@ -509,6 +538,16 @@
     const processing = isBot && !message.pending ? describeProcessing(message.meta) : '';
     if (processing) body.append(el('div', 'msg-meta', processing));
 
+    // 턴 트레이스(개발용): 이 답을 만든 과정. 진행 중인 턴도 열리고, 답변이 저장되지 않은 턴은 질문 아래에 붙는다.
+    const traceId = message.meta?.traceId || message.traceId || '';
+    if (traceId) {
+      const orphan = { running: '끝나지 않은 턴', failed: '실패한 턴', cancelled: '취소된 턴', interrupted: '중단된 턴' };
+      const suffix = message.pending ? ' (진행 중)' : (message.traceStatus && message.traceStatus !== 'done' ? ` (${orphan[message.traceStatus] || message.traceStatus})` : '');
+      const open = el('button', 'trace-btn', `⏱ 과정 보기${suffix}`);
+      open.addEventListener('click', () => openTrace(traceId));
+      const row = el('div', 'trace-row'); row.append(open); body.append(row);
+    }
+
     if (!isBot && !message.pending) {
       const actions = el('div', 'msg-actions');
       const edit = el('button', '', state.editingIndex === index ? '수정 중' : '수정'); edit.disabled = state.busy;
@@ -542,6 +581,261 @@
     if (!calls) parts.push('이번 턴에는 전사·위치 확인 호출 없음');
     if (typeof meta.elapsedMs === 'number') parts.push(`${(meta.elapsedMs / 1000).toFixed(1)}초`);
     return parts.join(' · ');
+  }
+
+  // ------------------------------------------------------------------ 턴 과정(트레이스) 창
+  const fmtMs = (ms) => ms < 1000 ? `${Math.round(ms)}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.floor(ms / 60000)}분 ${((ms % 60000) / 1000).toFixed(0)}초`;
+  const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+  async function openTrace(traceId) {
+    state.trace.id = traceId; state.trace.doc = null; state.trace.open = new Set(); state.trace.sections = new Map(); state.trace.collapsed = new Set();
+    els.traceDownload.href = `/api/traces/${encodeURIComponent(traceId)}?download=1`;
+    els.traceDownload.download = `trace-${traceId}.json`;
+    els.traceSummary.replaceChildren(); els.traceBody.replaceChildren(el('div', 'trace-empty', '불러오는 중…'));
+    els.traceStatus.textContent = '';
+    if (!els.traceDialog.open) els.traceDialog.showModal();
+    await loadTrace();
+  }
+
+  async function loadTrace() {
+    const id = state.trace.id;
+    if (!id) return;
+    try {
+      const doc = await request(`/api/traces/${encodeURIComponent(id)}`);
+      if (state.trace.id !== id) return;                       // 그새 다른 트레이스를 열었다
+      state.trace.doc = doc;
+      renderTrace(doc);
+    } catch (error) {
+      els.traceBody.replaceChildren(el('div', 'trace-empty', `트레이스를 불러오지 못했습니다: ${error.message}`));
+      stopTracePolling();
+      return;
+    }
+    // 진행 중인 턴은 잠시마다 다시 읽어 "진행 중 · 경과 n초"를 갱신한다. 서버가 "살아 있다"고 한 턴만.
+    if (state.trace.doc.status === 'running' && state.trace.doc.live !== false && els.traceDialog.open) {
+      stopTracePolling();
+      state.trace.timer = setTimeout(() => void loadTrace(), 1000);
+    } else stopTracePolling();
+  }
+
+  function stopTracePolling() { if (state.trace.timer) clearTimeout(state.trace.timer); state.trace.timer = 0; }
+  function closeTrace() { stopTracePolling(); state.trace.id = ''; if (els.traceDialog.open) els.traceDialog.close(); }
+
+  function renderTrace(doc) {
+    // "진행 중"은 서버가 지금 붙들고 있는 턴(live)일 때만 그렇게 부른다. DB에만 running으로 남은 기록(서버 재시작 등)은
+    // 마지막 기록 시점에서 멈춘 것으로 보여 준다 — 시간이 계속 올라가면 살아 있는 것으로 오해한다.
+    const stale = doc.status === 'running' && doc.live === false;
+    const status = stale ? '기록 중단' : (TRACE_STATUS[doc.status] || doc.status);
+    // 살아 있는 턴의 경과는 시작 시각부터 지금까지로 센다. 문서의 elapsedMs는 마지막 저장 시점의 값이라,
+    // 새 이벤트가 없으면(모델이 한 호출을 몇 분째 붙들고 있으면) 멈춰 보인다.
+    const live = doc.status === 'running' && !stale;
+    const now = live ? Math.max(doc.elapsedMs || 0, Date.now() - (doc.createdAt || Date.now())) : (doc.elapsedMs || 0);
+    const staleNote = stale ? ` · 마지막 기록 ${fmtMs(Math.max(0, Date.now() - (doc.updatedAt || doc.createdAt || Date.now())))} 전 · 서버에서 끝났는지 알 수 없습니다` : '';
+    els.traceStatus.textContent = `${status} · ${fmtMs(now)}` + (doc.reason ? ` · ${doc.reason}` : '') + staleNote;
+    els.traceStatus.dataset.status = stale ? 'interrupted' : doc.status;
+
+    // 요약: 호출 수와 걸린 시간을 한 줄로
+    const events = doc.events || [];
+    const models = events.filter((event) => event.kind === 'model');
+    const counts = {};
+    models.forEach((event) => { const kind = MODEL_KIND_LABELS[event.data?.kind] || event.data?.kind || '모델'; counts[kind] = (counts[kind] || 0) + 1; });
+    const modelTime = models.reduce((sum, event) => sum + (event.elapsedMs || 0), 0);
+    const tokens = models.reduce((sum, event) => sum + (event.data?.completionTokens || 0), 0);
+    const parts = [
+      `모델 호출 ${models.length}회` + (models.length ? ` (${Object.entries(counts).map(([kind, count]) => `${kind} ${count}`).join(', ')})` : ''),
+      `도구 실행 ${events.filter((event) => event.kind === 'tool' && event.data?.name && event.data?.arguments).length}회`,
+      `모델 대기 합계 ${fmtMs(modelTime)}`,
+    ];
+    if (tokens) parts.push(`출력 토큰 합계 ${tokens.toLocaleString()}`);
+    const failed = events.filter((event) => event.status === 'failed' || event.status === 'cancelled').length;
+    if (failed) parts.push(`실패·취소 ${failed}건`);
+    els.traceSummary.replaceChildren(el('span', '', parts.join(' · ')));
+    els.traceSummary.append(el('span', 'trace-hint', '행을 누르면 세부가 열리고, 도구·전사 묶음은 접힙니다(세부는 "세부" 버튼).'));
+
+    // 타임라인: 트리로 그린다 — 자식(모델 호출)은 시작 시각과 무관하게 부모(도구·전사) 바로 아래에 들여 쓴다.
+    // (타일 20장은 한꺼번에 시작해 순서대로 호출되므로, 시작 시각순으로 펼치면 자식이 엉뚱한 부모 밑에 보인다.)
+    const known = new Set(events.map((event) => event.id));
+    const children = new Map();
+    for (const event of events) {
+      const key = event.parent && known.has(event.parent) ? event.parent : 0;
+      if (!children.has(key)) children.set(key, []);
+      children.get(key).push(event);
+    }
+    const body = el('div', 'trace-list');
+    const spanKinds = new Set(['model', 'tool', 'ocr', 'preprocess']);
+    // 도구 실행은 한 턴에 여러 번이고 제목이 같기 쉽다(같은 이미지를 문장만 바꿔 다시 부름) → 번호와 작업 문장으로 구분한다.
+    const executions = events.filter((event) => event.kind === 'tool' && event.data?.name && event.data?.arguments);
+    const titleOf = (event) => {
+      const index = executions.indexOf(event);
+      if (index < 0) return event.label;
+      const args = event.data.arguments || {};
+      const what = args.task || args.query || args.name || '';
+      return `도구 실행 #${index + 1} · ${event.data.name}${what ? ` — ${String(what).slice(0, 60)}${String(what).length > 60 ? '…' : ''}` : ''}`;
+    };
+    const emit = (event, depth) => {
+      const row = el('div', `trace-row-item k-${event.kind} s-${event.status}${state.trace.open.has(event.id) ? ' open' : ''}`);
+      row.style.setProperty('--depth', depth);
+      const head = el('button', 'trace-head'); head.type = 'button';
+      head.append(el('span', 'trace-time', `+${fmtMs(event.startedMs)}`));
+      const running = event.status === 'running';
+      const own = children.get(event.id) || [];
+      // 자식이 있는 행(도구·전사)은 행을 누르면 가지를 접고 펼친다(타일 20장이면 한 도구 아래 60줄이 넘는다).
+      // 세부(인자·결과)는 오른쪽 "세부" 버튼으로 연다. 자식이 없는 행은 행을 누르면 세부가 열린다.
+      const folded = state.trace.collapsed.has(event.id);
+      const fold = el('span', `trace-fold${own.length ? '' : ' none'}`, own.length ? (folded ? '▸' : '▾') : '');
+      head.append(fold);
+      const toggleDetail = () => { state.trace.open.has(event.id) ? state.trace.open.delete(event.id) : state.trace.open.add(event.id); renderTrace(state.trace.doc); };
+      const toggleFold = () => { folded ? state.trace.collapsed.delete(event.id) : state.trace.collapsed.add(event.id); renderTrace(state.trace.doc); };
+      head.title = own.length ? (folded ? `펼치기 (${own.length}개)` : '접기') : '세부 보기';
+      const firstCall = own.find((child) => child.kind === 'model');
+      // 전사 타일은 한꺼번에 시작해 차례를 기다린다 → 첫 모델 호출 전까지는 "대기", 끝난 뒤에는 대기 시간을 따로 보인다.
+      const wait = firstCall ? firstCall.startedMs - event.startedMs : (running ? now - event.startedMs : 0);
+      let duration = '';
+      if (running) duration = (stale ? '기록 중단 · ' : event.kind === 'ocr' && !firstCall ? '차례 대기 중 · ' : '진행 중 · ') + fmtMs(Math.max(0, now - event.startedMs));
+      else if (spanKinds.has(event.kind) || event.elapsedMs > 0) duration = fmtMs(event.elapsedMs || 0) + (event.kind === 'ocr' && wait > 100 ? ` (대기 ${fmtMs(wait)})` : '');
+      head.append(el('span', 'trace-kind', TRACE_KINDS[event.kind] || event.kind));
+      head.append(el('span', 'trace-label', titleOf(event) + (folded ? ` (+${own.length})` : '')));
+      head.append(el('span', `trace-dur${running ? ' live' : ''}`, duration));
+      head.append(el('span', 'trace-state', event.status === 'done' ? '' : (TRACE_STATUS[event.status] || event.status)));
+      if (own.length) {
+        const detail = el('span', `trace-detail-btn${state.trace.open.has(event.id) ? ' on' : ''}`, '세부');
+        detail.title = '이 실행의 인자·결과';
+        detail.addEventListener('click', (click) => { click.stopPropagation(); toggleDetail(); });
+        head.append(detail);
+        head.addEventListener('click', toggleFold);
+      } else {
+        head.append(el('span', 'trace-detail-btn none', ''));
+        head.addEventListener('click', toggleDetail);
+      }
+      row.append(head);
+      if (state.trace.open.has(event.id)) row.append(traceDetail(event));
+      body.append(row);
+      if (!folded) own.forEach((child) => emit(child, depth + 1));
+    };
+    (children.get(0) || []).forEach((event) => emit(event, 0));
+    if (!events.length) body.append(el('div', 'trace-empty', '아직 기록된 이벤트가 없습니다.'));
+    const scrolled = els.traceBody.scrollTop;
+    els.traceBody.replaceChildren(body);
+    els.traceBody.scrollTop = scrolled;
+  }
+
+  // 이벤트 하나의 세부 내용. 모델 출력은 전부 textContent로만 넣는다.
+  let detailEvent = 0;      // 지금 세부를 그리는 이벤트 id — 접이식의 열림 상태를 기억하는 키에 쓴다
+  function traceDetail(event) {
+    detailEvent = event.id;
+    const box = el('div', 'trace-detail');
+    const data = event.data || {};
+    if (event.kind === 'model') {
+      const chips = [
+        ['종류', MODEL_KIND_LABELS[data.kind] || data.kind], ['모델', data.model], ['temperature', data.temperature],
+        ['추론 끄기', data.thinkingControl === false ? '서버가 지원하지 않음' : (data.disableThinking ? '예' : '아니오')],
+        ['출력 상한', data.maxTokens], ['종료 사유', data.finishReason], ['입력 토큰', data.promptTokens], ['출력 토큰', data.completionTokens],
+        ['도구 제공', (data.tools || []).join(', ') || '없음'],
+      ];
+      box.append(chipRow(chips));
+      if (data.error) box.append(el('div', 'trace-error', data.error));
+      if (data.reason) box.append(el('div', 'trace-error', data.reason));
+      if (data.images?.length) box.append(section('보낸 이미지', imageTable(data.images), true));
+      box.append(section(`보낸 메시지 ${data.messages?.length || 0}개`, messageList(data.messages || [], (data.images || []).length), false));
+      if (data.text !== undefined) box.append(section(`응답 본문 (${(data.textChars || 0).toLocaleString()}자)`, pre(data.text || '(비어 있음)'), true));
+      if (data.reasoning) box.append(section(`추론 (${(data.reasoningChars || 0).toLocaleString()}자)`, pre(data.reasoning), false));
+      if (data.toolCalls?.length) box.append(section('도구 호출', pre(JSON.stringify(data.toolCalls, null, 2)), true));
+      return box;
+    }
+    if (event.kind === 'tool' && data.arguments) {
+      box.append(chipRow([['도구', data.name], ['순서', data.step]]));
+      box.append(section('인자', pre(JSON.stringify(data.arguments, null, 2)), true));
+      if (data.result !== undefined) box.append(section(`결과 (${(data.resultChars || 0).toLocaleString()}자)`, pre(data.result), false));
+      if (data.error) box.append(el('div', 'trace-error', data.error));
+      if (data.reason) box.append(el('div', 'trace-error', data.reason));
+      return box;
+    }
+    for (const [key, value] of Object.entries(data)) box.append(traceValue(key, value));
+    return box;
+  }
+
+  function traceValue(key, value) {
+    if (Array.isArray(value)) {
+      if (value.length && value.every(isPlainObject)) {
+        if (key === 'messages') return section(`${key} (${value.length})`, messageList(value), false);
+        if (key === 'images') return section(`${key} (${value.length})`, imageTable(value), true);
+        return section(`${key} (${value.length})`, objectTable(value), true);
+      }
+      return section(key, pre(JSON.stringify(value, null, 2)), value.length <= 12);
+    }
+    if (isPlainObject(value)) return section(key, chipRow(Object.entries(value)), true);
+    if (typeof value === 'string' && (value.length > 160 || value.includes('\n'))) return section(`${key} (${value.length.toLocaleString()}자)`, pre(value), key === 'text' || key === 'question');
+    return chipRow([[key, value]]);
+  }
+
+  function chipRow(pairs) {
+    const row = el('div', 'trace-chips');
+    for (const [key, value] of pairs) {
+      if (value === undefined || value === null || value === '') continue;
+      const chip = el('span', 'trace-chip');
+      chip.append(el('b', '', `${key} `), el('span', '', typeof value === 'object' ? JSON.stringify(value) : String(value)));
+      row.append(chip);
+    }
+    return row;
+  }
+
+  // 접이식. 진행 중인 턴은 1초마다 다시 그리므로, 사용자가 펼치거나 접은 상태를 (이벤트, 제목) 키로 기억해 되살린다.
+  function section(title, content, open) {
+    const key = `${detailEvent}:${title}`;
+    const details = el('details', 'trace-section');
+    const remembered = state.trace.sections.get(key);
+    details.open = remembered === undefined ? !!open : remembered;
+    details.addEventListener('toggle', () => state.trace.sections.set(key, details.open));
+    details.append(el('summary', '', title), content);
+    return details;
+  }
+
+  function pre(text) { const node = el('pre', 'trace-pre'); node.textContent = String(text ?? ''); return node; }
+
+  // imageCount: 이 호출에 실린 이미지 수. 닻 표시(imagesAnchor)는 이미지가 없어도 붙으므로 실제 이미지가 있을 때만 적는다.
+  function messageList(messages, imageCount = 0) {
+    const list = el('div', 'trace-messages');
+    messages.forEach((message, index) => {
+      const title = `${index + 1}. ${message.role}${message.name ? ` (${message.name})` : ''} · ${(message.chars || 0).toLocaleString()}자`
+        + (message.imagesAnchor && imageCount ? ` · 이미지 ${imageCount}장 첨부` : '') + (message.toolCalls ? ` · 도구 호출 ${message.toolCalls.length}건` : '');
+      const content = el('div');
+      if (message.content) content.append(pre(message.content));
+      if (message.toolCalls) content.append(pre(JSON.stringify(message.toolCalls, null, 2)));
+      list.append(section(title, content, index === messages.length - 1 && message.role !== 'system'));
+    });
+    return list;
+  }
+
+  function imageTable(images) {
+    const rows = images.map((image) => ({
+      이름: image.name, 크기: image.width && image.height ? `${image.width}×${image.height}` : '', 바이트: image.bytes,
+      타일: image.tile ? `r${image.tile[0]}c${image.tile[1]}` : '', 영역: image.sourceBox ? image.sourceBox.join(', ') : '',
+      // 뷰어는 모달 뒤에 있으므로 창을 닫고 연다(타일은 저장된 첨부가 아니라 쪽·이미지 전체가 열린다).
+      _open: Number.isInteger(image.attachmentId) ? () => { closeTrace(); openArtifact({ name: image.name, title: image.name, mime: image.mime || 'image/png', view: 'image', attachmentId: image.attachmentId }); } : null,
+    }));
+    return objectTable(rows);
+  }
+
+  function objectTable(rows) {
+    const columns = [...new Set(rows.flatMap((row) => Object.keys(row).filter((key) => !key.startsWith('_'))))];
+    const wrap = el('div', 'md-table-wrap'), node = el('table', 'md-table trace-table'), head = el('tr'), body = el('tbody');
+    columns.forEach((column) => head.append(el('th', '', column)));
+    if (rows.some((row) => row._open)) head.append(el('th', '', ''));
+    const thead = el('thead'); thead.append(head); node.append(thead);
+    for (const row of rows) {
+      const tr = el('tr');
+      for (const column of columns) {
+        const value = row[column];
+        const text = value === undefined || value === null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+        const cell = el('td', '', text.length > 200 ? `${text.slice(0, 200)}…` : text);
+        if (text.length > 200) cell.title = text;
+        tr.append(cell);
+      }
+      if (row._open) { const open = el('button', 'link-btn', '보기'); open.type = 'button'; open.addEventListener('click', row._open); const cell = el('td'); cell.append(open); tr.append(cell); }
+      else if (rows.some((item) => item._open)) tr.append(el('td'));
+      body.append(tr);
+    }
+    node.append(body); wrap.append(node);
+    return wrap;
   }
 
   // ------------------------------------------------------------------ 결과 뷰어 (이미지 + bbox 오버레이)
@@ -721,6 +1015,19 @@
   els.dropZone.addEventListener('drop', (event) => void addFiles([...event.dataTransfer.files]));
   // 입력창 밖에 떨어뜨려도 브라우저가 파일을 열어 버리지 않게 한다.
   ['dragover', 'drop'].forEach((type) => window.addEventListener(type, (event) => event.preventDefault()));
+
+  els.traceClose.addEventListener('click', closeTrace);
+  els.traceRefresh.addEventListener('click', () => void loadTrace());
+  // 자식이 있는 이벤트(도구·전사 묶음)를 한꺼번에 접거나 펼친다.
+  els.traceFoldAll.addEventListener('click', () => {
+    const events = state.trace.doc?.events || [];
+    const parents = new Set(events.map((event) => event.parent).filter(Boolean));
+    state.trace.collapsed = new Set(events.filter((event) => parents.has(event.id)).map((event) => event.id));
+    if (state.trace.doc) renderTrace(state.trace.doc);
+  });
+  els.traceUnfoldAll.addEventListener('click', () => { state.trace.collapsed = new Set(); if (state.trace.doc) renderTrace(state.trace.doc); });
+  els.traceDialog.addEventListener('close', stopTracePolling);
+  els.traceDialog.addEventListener('cancel', stopTracePolling);
 
   els.viewerClose.addEventListener('click', closeViewer);
   els.zoomIn.addEventListener('click', () => setZoom(view.zoom * 1.25));

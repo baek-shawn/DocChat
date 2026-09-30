@@ -102,6 +102,9 @@ class OpenAICompatProvider(Provider):
     def can_disable_thinking(self) -> bool:
         return self._thinking_control
 
+    def thinking_off_for_every_call(self) -> bool:
+        return self._disable_thinking
+
     async def aclose(self) -> None:
         await self._client.close()
 

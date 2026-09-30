@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import aiosqlite
 
@@ -66,9 +66,18 @@ CREATE TABLE IF NOT EXISTS attachments (
   source_path TEXT,
   UNIQUE(conversation_id, name)
 );
+CREATE TABLE IF NOT EXISTS turn_traces (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  events_json TEXT NOT NULL DEFAULT '{}'
+);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, position);
 CREATE INDEX IF NOT EXISTS idx_attachments_conversation ON attachments(conversation_id, position);
+CREATE INDEX IF NOT EXISTS idx_turn_traces_conversation ON turn_traces(conversation_id, created_at);
 """
 
 # 이미 만들어진 DB에는 CREATE TABLE IF NOT EXISTS가 컬럼을 더해 주지 않는다 → 없는 컬럼만 덧붙인다.
@@ -199,6 +208,9 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
     limit = _bounded_number(value.get("visionMaxTokens"), 1_000_000)
     if limit:
         meta["visionMaxTokens"] = int(limit)
+    # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
+    if valid_id(value.get("traceId")):
+        meta["traceId"] = value["traceId"]
     return meta
 
 
@@ -590,3 +602,53 @@ class ChatStore:
                 [(identifier, conversation_id) for identifier in identifiers],
             )
             await self.db.commit()
+
+    # ------------------------------------------------------------------ 턴 트레이스(Step 7, 개발용)
+    async def save_trace(self, trace_id: str, conversation_id: str, status: str, document_json: str,
+                         created_at: int) -> None:
+        """턴이 진행되는 동안 여러 번 덮어쓴다(같은 id). 대화를 지우면 함께 지워진다(FK CASCADE)."""
+        if not valid_id(trace_id) or not valid_id(conversation_id):
+            return
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO turn_traces (id, conversation_id, created_at, updated_at, status, events_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, status = excluded.status,
+                  events_json = excluded.events_json
+                """,
+                (trace_id, conversation_id, int(created_at), now_ms(), _clean_field(status, 24), document_json),
+            )
+            await self.db.commit()
+
+    async def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        if not valid_id(trace_id):
+            return None
+        cursor = await self.db.execute("SELECT events_json FROM turn_traces WHERE id = ?", (trace_id,))
+        row = await cursor.fetchone()
+        return _json_dict(row["events_json"]) if row is not None else None
+
+    async def interrupt_running_traces(self, rewrite: Callable[[dict[str, Any]], dict[str, Any]]) -> int:
+        """서버 시작 때: 지난 프로세스가 `running`으로 남긴 트레이스를 정리한다(살아 있을 수 없다). 정리한 수를 돌려준다."""
+        cursor = await self.db.execute("SELECT id, events_json FROM turn_traces WHERE status = 'running'")
+        rows = await cursor.fetchall()
+        if not rows:
+            return 0
+        async with self._write_lock:
+            for row in rows:
+                document = rewrite(_json_dict(row["events_json"]))
+                await self.db.execute(
+                    "UPDATE turn_traces SET status = ?, updated_at = ?, events_json = ? WHERE id = ?",
+                    (str(document.get("status") or "interrupted"), now_ms(),
+                     json.dumps(document, ensure_ascii=False, default=str), row["id"]),
+                )
+            await self.db.commit()
+        return len(rows)
+
+    async def list_traces(self, conversation_id: str) -> list[dict[str, Any]]:
+        if not valid_id(conversation_id):
+            return []
+        cursor = await self.db.execute(
+            "SELECT id, created_at AS createdAt, updated_at AS updatedAt, status FROM turn_traces "
+            "WHERE conversation_id = ? ORDER BY created_at, rowid", (conversation_id,))
+        return [dict(row) for row in await cursor.fetchall()]

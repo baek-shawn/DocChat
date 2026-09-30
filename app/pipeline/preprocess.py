@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from .. import config
+from .. import config, trace
 from ..attachments import Attachment
 from .evidence import page_image_name
 from .images import prepare_uploaded_image
@@ -31,25 +31,49 @@ async def preprocess_attachments(uploads: list[Attachment], *, include_visual_as
 
 
 async def _preprocess_one(upload: Attachment, include_visual_assets: bool) -> list[Attachment]:
-    if upload.is_pdf and upload.data:
-        inspection = await run_pdf(render_pdf_for_vision, upload.data, render_images=include_visual_assets)
-        return [_describe_pdf(upload, inspection), *_page_attachments(upload.name, inspection)]
-    if upload.is_image and upload.data:
-        original = upload.data
-        prepared = await asyncio.to_thread(prepare_uploaded_image, original, upload.mime)
-        upload.kind = "image"
-        # 원본은 덮어쓰지 않고 따로 보관한다(타일링 재료). 사본이 원본과 같은 바이트면 한 벌만 둔다.
-        upload.source_mime = prepared.source_mime or upload.mime
-        upload.source_data = original if prepared.data != original else None
-        upload.data, upload.mime, upload.size = prepared.data, prepared.mime, len(prepared.data)
-        upload.width, upload.height = prepared.width, prepared.height
-        upload.source_width, upload.source_height = prepared.source_width, prepared.source_height
-        upload.ocr_required = False
-        upload.send_to_model = True
-        upload.text = (f"Original image: {prepared.source_width} x {prepared.source_height} px. "
-                       f"Whole-image vision input: {prepared.width} x {prepared.height} px.")
+    async with trace.scope("preprocess", f"전처리 · {upload.name}", kind=upload.kind, mime=upload.mime,
+                           size=upload.size) as span:
+        if upload.is_pdf and upload.data:
+            inspection = await run_pdf(render_pdf_for_vision, upload.data, render_images=include_visual_assets)
+            span.set(**_describe_inspection(inspection))
+            return [_describe_pdf(upload, inspection), *_page_attachments(upload.name, inspection)]
+        if upload.is_image and upload.data:
+            original = upload.data
+            prepared = await asyncio.to_thread(prepare_uploaded_image, original, upload.mime)
+            upload.kind = "image"
+            # 원본은 덮어쓰지 않고 따로 보관한다(타일링 재료). 사본이 원본과 같은 바이트면 한 벌만 둔다.
+            upload.source_mime = prepared.source_mime or upload.mime
+            upload.source_data = original if prepared.data != original else None
+            upload.data, upload.mime, upload.size = prepared.data, prepared.mime, len(prepared.data)
+            upload.width, upload.height = prepared.width, prepared.height
+            upload.source_width, upload.source_height = prepared.source_width, prepared.source_height
+            upload.ocr_required = False
+            upload.send_to_model = True
+            upload.text = (f"Original image: {prepared.source_width} x {prepared.source_height} px. "
+                           f"Whole-image vision input: {prepared.width} x {prepared.height} px.")
+            span.set(sourceWidth=prepared.source_width, sourceHeight=prepared.source_height, width=prepared.width,
+                     height=prepared.height, resized=prepared.resized, sourceMime=prepared.source_mime,
+                     limits={"maxEdge": config.MAX_VISION_IMAGE_EDGE, "maxPixels": config.MAX_VISION_IMAGE_PIXELS})
+            return [upload]
+        span.set(skipped="PDF도 이미지도 아니거나 내용이 비어 있음")
         return [upload]
-    return [upload]
+
+
+def _describe_inspection(inspection: PdfInspection) -> dict:
+    """쪽마다 어떤 판별을 내렸는지 — 임계값과 함께 적어야 "왜 전사로 갔나"를 나중에 알 수 있다."""
+    rendered = {page.page_number: page for page in inspection.pages}
+    return {
+        "totalPages": inspection.total_pages, "processedPages": inspection.processed_pages,
+        "visualPages": inspection.visual_pages, "truncated": inspection.truncated,
+        "nativeChars": len(inspection.native_text), "metadata": inspection.metadata, "renderDpi": config.PDF_RENDER_DPI,
+        "thresholds": {"nativeMinChars": config.NATIVE_MIN_CHARS, "sparseOverlayChars": config.SPARSE_OVERLAY_CHARS},
+        "pages": [{
+            "page": page.page_number, "classification": page.classification, "nativeCharacters": page.native_characters,
+            "rasterImages": page.raster_images, "vectorOperations": page.vector_operations, "needsVlm": page.needs_vlm,
+            "rendered": ({"width": rendered[page.page_number].width, "height": rendered[page.page_number].height}
+                         if page.page_number in rendered else None),
+        } for page in inspection.page_analysis],
+    }
 
 
 def _describe_pdf(upload: Attachment, inspection: PdfInspection) -> Attachment:
