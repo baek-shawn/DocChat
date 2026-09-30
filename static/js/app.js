@@ -8,6 +8,7 @@
   const LOCAL_PROVIDER = 'openaiCompatible';
   const PROVIDER_LABELS = { openaiCompatible: '로컬 API', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini' };
   const TYPE_LABELS = { text: '텍스트', object: '객체', table: '표', dimension: '치수', stamp: '도장', signature: '서명', diagram: '다이어그램', other: '기타' };
+  const IMAGE_MODE_LABELS = { whole: '전체', tile: '타일' };
 
   const store = {
     get(key, fallback = '') { try { return localStorage.getItem(`docchat.${key}`) ?? fallback; } catch { return fallback; } },
@@ -32,9 +33,17 @@
     model: store.get('model', ''),
     contextSize: Number(store.get('contextSize', '8192')) || 8192,
     disableThinking: store.get('disableThinking', 'true') !== 'false',
+    imageMode: store.get('imageMode', ''),   // '' = 고른 적 없음 → 서버 기본값(DOCCHAT_IMAGE_MODE)을 따른다
+    serverImageMode: 'whole',
+    tiling: null,                            // 서버에 적용 중인 타일 설정(/api/health)
+    // 호출 종류별 추론 끄기. 'true' | 'false' | ''(고른 적 없음 → 서버 기본값)
+    disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
+    disableThinkingOcr: store.get('disableThinkingOcr', ''),
+    serverVision: { disableThinkingGrounding: true, disableThinkingOcr: true, maxTokens: 4096 },
     models: []
   };
   if (!PROVIDER_LABELS[state.provider]) state.provider = LOCAL_PROVIDER;
+  if (!IMAGE_MODE_LABELS[state.imageMode]) state.imageMode = '';
 
   const $ = (id) => document.getElementById(id);
   const els = Object.fromEntries([
@@ -43,7 +52,8 @@
     'dropZone', 'attach', 'prompt', 'send', 'fileInput', 'viewer', 'viewerResize', 'viewerTitle', 'viewerMeta',
     'toggleLabels', 'zoomOut', 'zoomReset', 'zoomIn', 'viewerDownload', 'viewerClose', 'viewerStage', 'viewerRegions',
     'settingsDialog', 'providerSelect', 'baseUrlField', 'baseUrl', 'apiKey', 'apiKeyLabel', 'modelName', 'modelOptions',
-    'contextField', 'contextSize', 'disableThinking', 'settingsTest', 'testDot', 'testText', 'saveSettings'
+    'contextField', 'contextSize', 'disableThinking', 'callThinking', 'disableThinkingGrounding', 'disableThinkingOcr', 'callThinkingHelp',
+    'imageMode', 'imageModeHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings'
   ].map((id) => [id, $(id)]));
 
   const el = (tag, className, text) => {
@@ -185,6 +195,36 @@
   function persistSettings() {
     store.set('provider', state.provider); store.set('baseUrl', state.baseUrl);
     store.set('model', state.model); store.set('contextSize', state.contextSize); store.set('disableThinking', state.disableThinking);
+    store.set('imageMode', state.imageMode);
+    store.set('disableThinkingGrounding', state.disableThinkingGrounding); store.set('disableThinkingOcr', state.disableThinkingOcr);
+  }
+
+  // 요청에 실을 이미지 처리 방식. 사용자가 고른 적이 없으면 서버 기본값.
+  const imageMode = () => state.imageMode || state.serverImageMode;
+  // 요청에 실을 호출별 추론 끄기(kind: 'disableThinkingGrounding' | 'disableThinkingOcr'). 고른 적이 없으면 서버 기본값.
+  const callThinkingOff = (kind) => state[kind] === '' ? state.serverVision[kind] !== false : state[kind] === 'true';
+
+  async function loadServerDefaults() {
+    try {
+      const health = await request('/api/health');
+      if (IMAGE_MODE_LABELS[health.imageMode]) state.serverImageMode = health.imageMode;
+      state.tiling = health.tiling || null;
+      if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
+    } catch { /* 기본값(전체)으로 둔다 */ }
+  }
+
+  // "추론 끄기"(모든 호출)가 켜져 있으면 호출별 선택은 적용되지 않는다 → 고른 값은 그대로 두고 잠가서 보여 준다.
+  function syncCallThinking() {
+    const everything = els.disableThinking.checked;
+    els.disableThinkingGrounding.disabled = everything; els.disableThinkingOcr.disabled = everything;
+    els.callThinking.classList.toggle('inactive', everything);
+    const limit = state.serverVision.maxTokens;
+    els.callThinkingHelp.textContent = (everything
+      ? '위 항목이 켜져 있어 모든 호출의 추론이 꺼집니다. 위 항목을 끄면 아래 두 선택이 적용됩니다.'
+      : '답변 호출만 추론을 쓰고, 위치 확인과 전사는 끌 수 있습니다. 이 둘은 보이는 것을 옮겨 적는 호출이라, 추론을 켜면 같은 생각을 맴돌다 끝나지 않는 일이 있습니다.')
+      + (limit > 0
+        ? ` 위치 확인·전사 호출은 출력 ${Number(limit).toLocaleString()}토큰에서 끊고 다시 보내지 않습니다(.env의 DOCCHAT_VISION_MAX_TOKENS). 이 둘에 추론을 켜려면 8,000 이상을 권합니다.`
+        : ' 위치 확인·전사 호출의 출력 상한이 꺼져 있습니다(.env의 DOCCHAT_VISION_MAX_TOKENS=0).');
   }
 
   function renderModelBar() {
@@ -224,6 +264,13 @@
     els.baseUrl.value = state.baseUrl;
     els.contextSize.value = state.contextSize;
     els.disableThinking.checked = state.disableThinking;
+    els.disableThinkingGrounding.checked = callThinkingOff('disableThinkingGrounding');
+    els.disableThinkingOcr.checked = callThinkingOff('disableThinkingOcr');
+    syncCallThinking();
+    els.imageMode.value = imageMode();
+    const tiling = state.tiling;
+    els.imageModeHelp.textContent = '전사(OCR)와 위치 확인(bbox) 호출에 적용됩니다. 타일은 작은 글자·심볼을 더 크게 보여 주지만 호출 수가 늘어 느려집니다. 요청마다 적용되므로 같은 문서를 두 방식으로 비교할 수 있습니다.'
+      + (tiling ? ` 현재 타일 설정: ${tiling.tileSize}px · 겹침 ${Math.round(tiling.overlap * 1000) / 10}% · ${tiling.renderDpi}DPI · 긴 변 ${tiling.minSourceEdge}px 이하는 나누지 않음 · 장당 최대 ${tiling.maxTiles}타일.` : '');
     syncSettingsForm();
     if (!els.settingsDialog.open) els.settingsDialog.showModal();
   }
@@ -260,6 +307,9 @@
     state.model = els.modelName.value.trim();
     state.contextSize = Math.max(1024, Number(els.contextSize.value) || 8192);
     state.disableThinking = els.disableThinking.checked;
+    state.disableThinkingGrounding = String(els.disableThinkingGrounding.checked);
+    state.disableThinkingOcr = String(els.disableThinkingOcr.checked);
+    state.imageMode = IMAGE_MODE_LABELS[els.imageMode.value] ? els.imageMode.value : '';
     store.setKey(form.provider, form.apiKey);
     persistSettings();
     els.settingsDialog.close();
@@ -309,6 +359,9 @@
           if (report.truncated) item.status += ` (앞 ${report.processedPages}쪽만 검사)`;
         } else {
           item.status = report.resized ? `${report.sourceWidth}×${report.sourceHeight} → ${report.width}×${report.height}로 축소해 전달` : `${report.width}×${report.height} 원본 그대로 전달`;
+          // 타일 모드에서도 답변 호출에는 위의 한 장이 간다. 위치 확인(bbox)만 원본을 타일로 나눠 본다.
+          const longEdge = Math.max(report.sourceWidth || 0, report.sourceHeight || 0);
+          if (imageMode() === 'tile' && state.tiling && longEdge > Math.max(state.tiling.minSourceEdge, state.tiling.tileSize)) item.status += ' · 위치 확인은 원본을 타일로';
         }
       } catch (error) { item.status = `오류: ${error.message}`; item.tone = 'bad'; item.failed = true; }
       renderPendingFiles();
@@ -348,14 +401,17 @@
 
     try {
       const final = await streamChat({
-        ...connection(), model: state.model, contextSize: state.contextSize, disableThinking: state.disableThinking, conversationId: state.currentId, stream: true,
-        messages: history.map(({ role, content, files: sent, artifacts, createdAt }) => ({ role, content, files: sent, artifacts, createdAt })),
+        ...connection(), model: state.model, contextSize: state.contextSize, disableThinking: state.disableThinking,
+        disableThinkingGrounding: callThinkingOff('disableThinkingGrounding'), disableThinkingOcr: callThinkingOff('disableThinkingOcr'),
+        imageMode: imageMode(), conversationId: state.currentId, stream: true,
+        // meta(답변을 어떤 방식으로 처리했는지)도 되돌려 보내야 서버가 대화를 다시 저장할 때 지워지지 않는다.
+        messages: history.map(({ role, content, files: sent, artifacts, meta, createdAt }) => ({ role, content, files: sent, artifacts, meta, createdAt })),
         attachments: files.map(({ name, mime, size, base64 }) => ({ name, mime, size, base64 }))
       }, state.abort.signal, (event) => {
         if (event.type === 'conversation') state.currentId = event.conversationId;
         if (event.type === 'progress' && placeholder.activity.at(-1) !== event.message) { placeholder.activity.push(event.message); render(); }
       });
-      Object.assign(placeholder, { content: final.text, artifacts: final.artifacts || [], pending: false });
+      Object.assign(placeholder, { content: final.text, artifacts: final.artifacts || [], meta: final.meta || {}, pending: false });
       if (final.files?.length) userMessage.files = final.files;               // 저장된 첨부 id가 붙어 돌아온다
       const withBoxes = [...placeholder.artifacts].reverse().find((artifact) => artifact.view === 'image');
       if (withBoxes) openArtifact(withBoxes);
@@ -450,6 +506,9 @@
       body.append(row);
     }
 
+    const processing = isBot && !message.pending ? describeProcessing(message.meta) : '';
+    if (processing) body.append(el('div', 'msg-meta', processing));
+
     if (!isBot && !message.pending) {
       const actions = el('div', 'msg-actions');
       const edit = el('button', '', state.editingIndex === index ? '수정 중' : '수정'); edit.disabled = state.busy;
@@ -460,6 +519,29 @@
     }
     wrap.append(body);
     return wrap;
+  }
+
+  // 이 답을 어떤 이미지 처리 방식으로 만들었는지. 비전 호출이 없었던 전체 모드 답변(일반 대화)에는 표시하지 않는다.
+  function describeProcessing(meta) {
+    if (!meta || !IMAGE_MODE_LABELS[meta.imageMode]) return '';
+    const vision = meta.vision || {};
+    const calls = (vision.ocrCalls || 0) + (vision.groundingCalls || 0);
+    if (meta.imageMode !== 'tile' && !calls) return '';
+    const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
+    if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
+    // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다)
+    const detail = (kind, stops) => {
+      const notes = [];
+      const off = meta.thinkingDisabled?.[kind];
+      if (typeof off === 'boolean') notes.push(off ? '추론 끔' : '추론 끄지 않음');
+      if (stops) notes.push(`출력 상한${meta.visionMaxTokens ? ` ${Number(meta.visionMaxTokens).toLocaleString()}토큰` : ''} 도달 ${stops}회`);
+      return notes.length ? ` (${notes.join(', ')})` : '';
+    };
+    if (vision.ocrCalls) parts.push(`전사 호출 ${vision.ocrCalls}회${detail('ocr', vision.ocrLengthStops)}`);
+    if (vision.groundingCalls) parts.push(`위치 확인 호출 ${vision.groundingCalls}회${detail('grounding', vision.groundingLengthStops)}`);
+    if (!calls) parts.push('이번 턴에는 전사·위치 확인 호출 없음');
+    if (typeof meta.elapsedMs === 'number') parts.push(`${(meta.elapsedMs / 1000).toFixed(1)}초`);
+    return parts.join(' · ');
   }
 
   // ------------------------------------------------------------------ 결과 뷰어 (이미지 + bbox 오버레이)
@@ -623,6 +705,7 @@
   els.deleteAll.addEventListener('click', () => deleteAll().catch((error) => alert(error.message)));
   els.openSettings.addEventListener('click', openSettings);
   els.providerSelect.addEventListener('change', syncSettingsForm);
+  els.disableThinking.addEventListener('change', syncCallThinking);
   els.settingsTest.addEventListener('click', () => void testFromSettings());
   els.saveSettings.addEventListener('click', saveSettings);
   els.testConnection.addEventListener('click', () => void testConnection());
@@ -672,4 +755,5 @@
   renderModelBar(); render();
   loadSessions().catch(() => {});
   void loadModels();
+  void loadServerDefaults();
 })();

@@ -6,18 +6,20 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from .. import config
 from ..attachments import Attachment
 from ..db import ChatStore
 from ..pipeline.evidence import attachment_root_name, page_image_name
-from ..pipeline.images import assemble_model_images
+from ..pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
 from ..pipeline.pdf import PdfError, render_pdf_page_image, run_pdf
-from ..providers.base import Provider, ToolCall, ToolSpec
-from .grounding import VisualInspection, map_box_to_source, parse_visual_inspection, valid_box
+from ..providers.base import Provider, ToolCall, ToolSpec, is_output_length_stop
+from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
+                        valid_box)
 from .prompts import GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, grounding_instruction
 
 
@@ -81,6 +83,13 @@ class ToolContext:
     conversation_id: str = ""
     default_read_chars: int = 16_000
     on_progress: Callable[[str], None] = lambda _message: None
+    # 이미지 처리 방식(요청마다 고른다). "tile"이면 bbox 호출을 타일마다 따로 보낸다.
+    image_mode: str = "whole"
+    usage: VisionUsage = field(default_factory=VisionUsage)
+    # 트레이스를 켰을 때 모델에 보낸 타일을 파일로 남기는 자리
+    on_tiles: Callable[[str, str, list[ModelImage]], Awaitable[None]] | None = None
+    # bbox 호출의 추론을 끈다(요청마다 고른다, Step 6-0). 출력 상한은 `config.VISION_MAX_TOKENS`.
+    disable_thinking: bool = False
 
 
 def available_tools(attachments: list[Attachment]) -> list[ToolSpec]:
@@ -116,7 +125,7 @@ async def execute_tool(context: ToolContext, call: ToolCall) -> str:
         return f"ERROR: unknown tool \"{call.name}\". Available tools: {', '.join(handlers)}."
     try:
         return await handler(context, call.arguments or {})
-    except (ToolError, PdfError) as error:
+    except (ToolError, PdfError, ImageError) as error:
         return f"ERROR: {error}"
 
 
@@ -182,6 +191,105 @@ async def _resolve_visual_surface(context: ToolContext, record: Attachment, page
     return surface
 
 
+async def _tile_source(context: ToolContext, surface: Attachment) -> TileSource | None:
+    """타일을 잘라 낼 고해상도 원본. PDF 쪽이면 원본 PDF, 업로드 이미지면 보관해 둔 원본(Step 5-0)."""
+    root = attachment_root_name(surface.name)
+    if root != surface.name:
+        pdf = next((item for item in context.attachments if item.name == root and item.is_pdf), None)
+        if pdf is not None and await _bytes_of(context, pdf):
+            return TileSource(kind="pdf", data=pdf.data or b"", page_number=surface.page_number or 1)
+        return None
+    if surface.source_data is not None:
+        return TileSource(kind="image", data=surface.source_data, mime=surface.source_mime or surface.mime)
+    if surface.id is not None and context.store is not None:
+        original = await context.store.load_attachment_source(surface.id)
+        if original is not None:
+            return TileSource(kind="image", data=original[0], mime=original[1])
+    return TileSource(kind="image", data=surface.data, mime=surface.mime) if surface.data else None
+
+
+def _limit_words() -> str:
+    limit = config.vision_max_tokens()
+    return f"the output limit of {limit} tokens" if limit else "its output limit"
+
+
+async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, task: str,
+                  limiter: asyncio.Semaphore) -> VisualInspection:
+    """이미지 한 장(전체 또는 타일)에 대한 grounding 호출. 구조화 JSON이 아니면 정해진 횟수만큼 다시 묻는다.
+
+    출력 상한에 닿아 끊긴 호출은 다시 묻지 않는다 — 다시 물으면 상한만큼의 시간이 또 든다(예전에는 타일마다 3번).
+    끊긴 글은 추론이거나 미완성 JSON이라 결과로도 쓰지 않는다.
+    어느 타일이 끊기는지는 실행마다 달랐다(Qwen3.5 실측) — 다시 물으면 될 수도 있지만 시간을 보장할 수 없다.
+    """
+    part = VisualInspection()
+    for attempt in range(1 + config.GROUNDING_RETRY_COUNT):
+        instruction = grounding_instruction(task, surface.name, tile=image.tile is not None)
+        if attempt:
+            instruction = f"{instruction}\n{GROUNDING_RETRY_NOTE}"
+        async with limiter:
+            context.usage.grounding_calls += 1
+            response = await context.provider.analyze(
+                [{"role": "system", "content": GROUNDING_SYSTEM_PROMPT}, {"role": "user", "content": instruction}],
+                images=[image], temperature=0.0, disable_thinking=context.disable_thinking,
+                max_tokens=config.vision_max_tokens(),
+            )
+        if is_output_length_stop(response.finish_reason):
+            context.usage.grounding_length_stops += 1
+            return VisualInspection(cut_off=True)
+        # 픽셀 좌표로 답하는 모델을 위해 **모델이 실제로 본 이미지**의 크기를 넘긴다(타일이면 타일 크기).
+        part = parse_visual_inspection(response.text, image_width=image.width or surface.width,
+                                       image_height=image.height or surface.height)
+        if part.structured:
+            break
+    # 타일 기준 좌표 → 전체 기준 좌표. 전체 이미지(0,0,1,1)면 그대로다.
+    return VisualInspection(text=part.text, structured=part.structured,
+                            boxes=[map_box_to_source(box, image.source_box) for box in part.boxes])
+
+
+async def _inspect_tiles(context: ToolContext, surface: Attachment, images: list[ModelImage],
+                         task: str) -> tuple[VisualInspection, str]:
+    """타일마다 따로 물은 뒤 전체 좌표에서 합친다. (합친 결과, 일부 실패 시 모델에게 알릴 경고)"""
+    context.usage.count_images(images)
+    if context.on_tiles is not None:
+        await context.on_tiles(surface.name, "grounding", images)
+    limiter = asyncio.Semaphore(config.OCR_CONCURRENCY)
+    finished = 0
+
+    async def one(image: ModelImage) -> VisualInspection:
+        nonlocal finished
+        part = await _ground(context, surface, image, task, limiter)
+        finished += 1
+        context.on_progress(f"타일에서 위치를 확인하는 중… {surface.name} ({finished}/{len(images)})")
+        return part
+
+    outcomes = await asyncio.gather(*(one(image) for image in images), return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+    errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    parts = [outcome for outcome in outcomes if isinstance(outcome, VisualInspection)]
+    if not parts:
+        raise errors[0]      # 한 타일도 성공하지 못했다 → 전체 모드에서 호출이 실패한 것과 같게 처리한다
+    structured = [part for part in parts if part.structured]
+    boxes = merge_tile_boxes([part.boxes for part in structured])[: config.MAX_GROUNDING_REGIONS]
+    # 소견은 대상을 찾은 타일의 것만 싣는다. "이 타일에는 없다"가 타일 수만큼 쌓이면 잡음이다.
+    notes = list(dict.fromkeys(part.text.strip() for part in structured if part.boxes and part.text.strip()))
+    if not structured:
+        notes = list(dict.fromkeys(part.text.strip() for part in parts if part.text.strip()))[:3]
+    unreadable = len(images) - len(structured)
+    cut = sum(1 for part in parts if part.cut_off)
+    warning = ""
+    if structured and unreadable:
+        warning = (f"{unreadable} of {len(images)} tiles did not return structured regions, "
+                   "so targets inside those tiles may be missing.")
+    elif cut:
+        warning = "The vision model did not return structured regions for any tile; no boxes could be measured."
+    if cut:
+        warning += (f" {cut} of {len(images)} tiles stopped at {_limit_words()} before answering and were not retried.")
+    return VisualInspection(text="\n".join(notes), boxes=boxes, structured=bool(structured),
+                            cut_off=bool(cut) and not structured), warning
+
+
 async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> str:
     name, task = str(arguments.get("name") or ""), str(arguments.get("task") or "").strip()[:500]
     if not task:
@@ -193,26 +301,17 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
     page_number = int(page) if isinstance(page, (int, float)) and page >= 1 else None
     surface = await _resolve_visual_surface(context, record, page_number)
 
-    inspection = VisualInspection()
-    boxes: list[dict[str, Any]] = []
-    attempts = 1 + config.GROUNDING_RETRY_COUNT
-    for attempt in range(attempts):
-        instruction = grounding_instruction(task, surface.name)
-        if attempt:
-            instruction = f"{instruction}\n{GROUNDING_RETRY_NOTE}"
-        boxes, texts, structured = [], [], True
-        for image in assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="grounding"):
-            response = await context.provider.analyze(
-                [{"role": "system", "content": GROUNDING_SYSTEM_PROMPT}, {"role": "user", "content": instruction}],
-                images=[image], temperature=0.0,
-            )
-            part = parse_visual_inspection(response.text, image_width=surface.width, image_height=surface.height)
-            structured = structured and part.structured
-            texts.append(part.text)
-            boxes += [map_box_to_source(box, image.source_box) for box in part.boxes]
-        inspection = VisualInspection(text="\n".join(text for text in texts if text), boxes=boxes, structured=structured)
-        if inspection.structured:
-            break
+    source = await _tile_source(context, surface) if context.image_mode == "tile" else None
+    images = await assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="grounding",
+                                         mode=context.image_mode, source=source)
+    warning = ""
+    if images[0].grid is None:
+        inspection = await _ground(context, surface, images[0], task, asyncio.Semaphore(1))
+        if inspection.cut_off:
+            warning = (f"The vision model stopped at {_limit_words()} before answering, so no boxes could be measured. "
+                       "The call was not retried.")
+    else:
+        inspection, warning = await _inspect_tiles(context, surface, images, task)
 
     regions = [box for box in inspection.boxes if valid_box(box)]
     artifact: dict[str, Any] = {
@@ -226,7 +325,9 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
     _upsert_artifact(context.artifacts, artifact)
     result: dict[str, Any] = {"source": surface.name, "text": inspection.text, "regions": regions}
     if not inspection.structured:
-        result["warning"] = "The vision model did not return structured regions; no boxes could be measured."
+        result["warning"] = warning or "The vision model did not return structured regions; no boxes could be measured."
+    elif warning:
+        result["warning"] = warning
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

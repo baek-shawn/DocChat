@@ -41,6 +41,7 @@ class LoopResult:
     steps: int = 0
     used_json_fallback: bool = False
     stopped_reason: str = ""  # "" | "max_steps" | "repeated_tool_call"
+    model_calls: int = 0      # 답변 모델을 부른 횟수(도구 안의 비전 호출은 포함하지 않는다)
 
 
 def strip_reasoning(text: str) -> str:
@@ -236,6 +237,12 @@ async def run_tool_loop(
     last_signature, repeats, steps = "", 0, 0
     stopped = ""
     malformed = 0
+    model_calls = 0
+
+    async def ask(request: list[Message], offered: list[ToolSpec] | None) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        return await provider.analyze(request, images, offered, temperature=temperature)
 
     def hinted() -> list[Message]:
         """원래 질문(anchor) 끝에 언어 힌트를 붙인 사본."""
@@ -249,14 +256,14 @@ async def run_tool_loop(
         nonlocal use_fallback
         if with_tools and not use_fallback:
             try:
-                return await provider.analyze(hinted() + transcript, images, tools, temperature=temperature)
+                return await ask(hinted() + transcript, tools)
             except ToolsUnsupportedError:
                 use_fallback = True
                 notify("이 모델은 네이티브 도구 호출을 지원하지 않아 JSON 방식으로 전환합니다…")
         if with_tools:
             # 도구가 이미 한 번 실행된 뒤라면(transcript 있음) 최종 답을 기대하는 상황이라 힌트는 결과 뒤에 붙어 있다.
-            return await provider.analyze(_with_protocol(base, tools) + transcript, images, None, temperature=temperature)
-        return await provider.analyze(hinted() + _plain(transcript), images, None, temperature=temperature)
+            return await ask(_with_protocol(base, tools) + transcript, None)
+        return await ask(hinted() + _plain(transcript), None)
 
     response = ModelResponse()
     text = ""
@@ -326,7 +333,7 @@ async def run_tool_loop(
         notify(f"답변이 길어 이어서 작성하는 중… ({continuations})")
         transcript.append({"role": "assistant", "content": text[-24_000:]})
         _append_user(transcript, CONTINUE_ANSWER)
-        response = await provider.analyze(hinted() + _plain(transcript), images, None, temperature=temperature)
+        response = await ask(hinted() + _plain(transcript), None)
         addition = strip_reasoning(response.text)
         if not addition or text.endswith(addition):
             break
@@ -337,4 +344,5 @@ async def run_tool_loop(
         text = ("모델이 도구 호출 형식(JSON)을 올바르게 만들지 못해 답변을 완성하지 못했습니다. "
                 "다시 시도하거나, 도구 호출을 더 안정적으로 지원하는 모델을 선택해 주세요.")
         stopped = stopped or "malformed_tool_call"
-    return LoopResult(text=text, steps=steps, used_json_fallback=use_fallback, stopped_reason=stopped)
+    return LoopResult(text=text, steps=steps, used_json_fallback=use_fallback, stopped_reason=stopped,
+                      model_calls=model_calls)

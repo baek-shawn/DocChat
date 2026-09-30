@@ -2,6 +2,7 @@
 
 - PDF  : 네이티브 텍스트를 우선 쓰고, 검사에서 탈락한 페이지만 VLM용 이미지가 된다(§5.1, §5.2).
 - 이미지: 전사 없이 그대로 VLM에 전달한다. 크기 한도만 적용한다(§5.4).
+          한도에 맞춘 사본과 별개로 업로드 원본을 보관한다 — 타일 모드는 원본에서 자른다.
 """
 from __future__ import annotations
 
@@ -34,8 +35,12 @@ async def _preprocess_one(upload: Attachment, include_visual_assets: bool) -> li
         inspection = await run_pdf(render_pdf_for_vision, upload.data, render_images=include_visual_assets)
         return [_describe_pdf(upload, inspection), *_page_attachments(upload.name, inspection)]
     if upload.is_image and upload.data:
-        prepared = await asyncio.to_thread(prepare_uploaded_image, upload.data, upload.mime)
+        original = upload.data
+        prepared = await asyncio.to_thread(prepare_uploaded_image, original, upload.mime)
         upload.kind = "image"
+        # 원본은 덮어쓰지 않고 따로 보관한다(타일링 재료). 사본이 원본과 같은 바이트면 한 벌만 둔다.
+        upload.source_mime = prepared.source_mime or upload.mime
+        upload.source_data = original if prepared.data != original else None
         upload.data, upload.mime, upload.size = prepared.data, prepared.mime, len(prepared.data)
         upload.width, upload.height = prepared.width, prepared.height
         upload.source_width, upload.source_height = prepared.source_width, prepared.source_height

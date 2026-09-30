@@ -5,6 +5,9 @@
   - PDF 페이지 이미지    kind="image"    (이름: "<pdf> · page N", 전사 대상)
   - 시각 OCR 증거        kind="document" (이름: "<pdf> · visual OCR", 전사 텍스트)
   - 업로드 이미지        kind="image"    (send_to_model=True → 메인 요청에 이미지로 직접 전달)
+
+바이트는 `data/files/{대화ID}/` 아래 파일로 저장되고(Step 5-0) DB에는 상대 경로만 남는다.
+업로드 이미지는 두 벌이다: `data`(모델 전송·뷰어용 사본, 최대 3072px)와 `source_data`(원본, 타일링 재료).
 """
 from __future__ import annotations
 
@@ -43,6 +46,14 @@ class Attachment:
     send_to_model: bool = False
     visual_pages: int = 0
     total_pages: int = 0
+    # 저장 폴더(data/files) 기준 상대 경로. 없으면 예전 방식(DB BLOB)으로 저장된 첨부다.
+    file_path: str | None = None
+    # 업로드 이미지의 원본. 모델 전송용 사본과 바이트가 같으면 따로 두지 않는다(None).
+    source_path: str | None = None
+    source_data: bytes | None = None
+    source_mime: str | None = None
+    # 이 쪽을 전사할 때 쓴 이미지 처리 방식(`config.image_mode_variant`). 요청 모드가 달라지면 다시 전사한다.
+    ocr_variant: str | None = None
 
     @property
     def is_image(self) -> bool:
@@ -65,6 +76,8 @@ class Attachment:
             "sendToModel": self.send_to_model or None,
             "visualPages": self.visual_pages or None,
             "totalPages": self.total_pages or None,
+            "sourceMime": self.source_mime,
+            "ocrVariant": self.ocr_variant,
         }
         return {key: value for key, value in pairs.items() if value is not None}
 
@@ -79,6 +92,8 @@ class Attachment:
         self.send_to_model = bool(meta.get("sendToModel"))
         self.visual_pages = int(meta.get("visualPages") or 0)
         self.total_pages = int(meta.get("totalPages") or 0)
+        self.source_mime = meta.get("sourceMime")
+        self.ocr_variant = meta.get("ocrVariant")
         return self
 
     def to_public(self) -> dict[str, Any]:

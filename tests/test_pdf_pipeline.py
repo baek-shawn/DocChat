@@ -179,9 +179,11 @@ def test_fit_image_bytes_shrinks_under_api_limit():
     assert fit_image_bytes(b"tiny", "image/png", 400_000) == (b"tiny", "image/png")
 
 
-def test_assemble_model_images_is_the_tiling_seam():
-    images = assemble_model_images("a.png", "image/png", b"x", purpose="ocr")
+async def test_assemble_model_images_is_the_tiling_seam():
+    """전체 모드는 Step 4까지와 같다: 받은 이미지 한 장, 전체 영역. (타일 모드는 test_tiling.py)"""
+    images = await assemble_model_images("a.png", "image/png", b"x", purpose="ocr")
     assert len(images) == 1 and images[0].source_box == (0.0, 0.0, 1.0, 1.0)
+    assert images[0].data == b"x" and images[0].tile is None and images[0].grid is None
 
 
 # --------------------------------------------------------------------------- 업로드 정제 · 전처리

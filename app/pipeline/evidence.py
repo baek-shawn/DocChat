@@ -117,7 +117,7 @@ def attachment_context_for_prompt(prompt: str, attachments: list[Attachment], to
     for item in document_candidates:
         text = item.text or ""
         clipped = clip_visual_ocr_coverage(text, per_file) if is_visual_ocr(item) else clip(text, per_file)
-        documents.append(replace(item, text=clipped, data=None))
+        documents.append(replace(item, text=clipped, data=None, source_data=None))
 
     # 문서별로 한 장씩 돌아가며 뽑아, 긴 문서 하나가 다른 업로드를 밀어내지 못하게 한다.
     groups: dict[str, list[Attachment]] = {}

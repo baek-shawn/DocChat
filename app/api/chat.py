@@ -30,6 +30,12 @@ class ChatBody(BaseModel):
     conversationId: str = ""
     contextSize: int | None = None
     disableThinking: bool = True
+    # 호출 종류별 추론 끄기(bbox / 전사). 비우면 서버 기본값(DOCCHAT_GROUNDING_DISABLE_THINKING, DOCCHAT_OCR_DISABLE_THINKING).
+    # disableThinking이 true면 모든 호출이 꺼지므로 이 둘은 쓰이지 않는다.
+    disableThinkingGrounding: bool | None = None
+    disableThinkingOcr: bool | None = None
+    # 이미지 처리 방식: "whole"(전체) | "tile"(타일). 비우면 서버 기본값(DOCCHAT_IMAGE_MODE).
+    imageMode: str = ""
     stream: bool = False
     messages: list[dict[str, Any]] = Field(default_factory=list)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
@@ -39,7 +45,8 @@ def _to_request(body: ChatBody) -> ChatRequest:
     return ChatRequest(
         provider=body.provider, api_key=body.apiKey, base_url=body.baseUrl, model=body.model,
         conversation_id=body.conversationId, context_size=body.contextSize, disable_thinking=body.disableThinking,
-        messages=body.messages, attachments=body.attachments,
+        disable_thinking_grounding=body.disableThinkingGrounding, disable_thinking_ocr=body.disableThinkingOcr,
+        image_mode=body.imageMode, messages=body.messages, attachments=body.attachments,
     )
 
 

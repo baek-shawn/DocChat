@@ -87,6 +87,7 @@ select, input[type="text"], input[type="url"], input[type="password"], input[typ
 .msg-actions button { border: 0; background: none; color: var(--fg-muted); font-size: 12px; padding: 2px 6px; border-radius: 5px; cursor: pointer; }
 .msg-actions button:hover:not(:disabled) { background: var(--bg-hover); color: var(--fg); }
 .file-row, .artifact-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.msg-meta { margin-top: 6px; font-size: 11.5px; color: var(--fg-faint); }
 .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 320px; border: 1px solid var(--line); background: var(--bg-raised); border-radius: 8px; padding: 5px 9px; font-size: 12px; }
 .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 button.chip { cursor: pointer; }
@@ -161,6 +162,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .5); }
 .dialog-card input, .dialog-card select { width: 100%; color: var(--fg); }
 .dialog-card label.check { display: flex; align-items: center; gap: 8px; color: var(--fg); }
 .dialog-card label.check input { width: auto; }
+/* "추론 끄기" 아래에 딸린 호출별 선택. 위 항목이 켜져 있으면 적용되지 않으므로 흐리게 보인다. */
+.sub-options { margin: 6px 0 0 8px; padding-left: 14px; border-left: 2px solid var(--line); }
+.sub-options label.check { margin: 7px 0 2px; }
+.sub-options.inactive label.check { color: var(--fg-faint); }
 .help { margin: 2px 0 0; font-size: 11.5px; color: var(--fg-faint); line-height: 1.5; }
 .muted { color: var(--fg-faint); font-weight: 400; }
 .dialog-foot { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 18px; }

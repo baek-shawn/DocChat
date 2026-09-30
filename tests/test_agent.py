@@ -45,6 +45,15 @@ def test_unstructured_answer_is_flagged_for_retry():
     assert not result.structured and result.boxes == [] and "lower right" in result.text
 
 
+def test_a_bare_json_value_is_not_a_structured_answer():
+    """값 하나만 온 응답(`3600`, `"none"`)도 JSON으로는 읽힌다. 예전에는 객체로 다루다 AttributeError가 났다."""
+    for reply in ("3600", '"none"', "true", "0.5", "null"):
+        result = parse_visual_inspection(reply)
+        assert not result.structured and result.boxes == [] and result.text == reply
+    # 값 뒤에 객체가 따라오면 그 객체를 읽는다.
+    assert parse_visual_inspection('2 {"regions":[{"label":"A","bbox":[0,0,500,500]}]}').structured
+
+
 def test_invalid_boxes_are_dropped_and_coordinates_clamped():
     result = parse_visual_inspection(json.dumps({"regions": [
         {"label": "reversed", "bbox": [500, 500, 100, 100]},
