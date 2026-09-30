@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import config
-from .api import chat, files, models, sessions
+from . import config, trace
+from .api import chat, files, models, sessions, traces
 from .db import ChatStore
 
 
@@ -28,6 +28,10 @@ def _ignore_client_disconnects(loop: asyncio.AbstractEventLoop, context: dict) -
 async def lifespan(app: FastAPI):
     asyncio.get_running_loop().set_exception_handler(_ignore_client_disconnects)
     app.state.store = await ChatStore(config.database_path(), files_dir=config.files_dir()).open()
+    # 지난 프로세스가 진행 중인 채 끝난 턴 트레이스는 살아 있을 수 없다 → "중단됨"으로 정리한다(Step 7).
+    interrupted = await app.state.store.interrupt_running_traces(trace.interrupt_document)
+    if interrupted:
+        print(f"진행 중으로 남아 있던 턴 트레이스 {interrupted}개를 '중단됨'으로 정리했습니다.")
     try:
         yield
     finally:
@@ -84,9 +88,11 @@ def create_app() -> FastAPI:
                 "disableThinkingOcr": config.OCR_DISABLE_THINKING,
                 "maxTokens": config.VISION_MAX_TOKENS,
             },
+            # 개발용 턴 트레이스(Step 7)가 켜져 있는지 — 화면이 "과정 보기"를 안내할 때 쓴다
+            "debugTrace": config.debug_trace_enabled(),
         }
 
-    for module in (sessions, models, files, chat):
+    for module in (sessions, models, files, chat, traces):
         app.include_router(module.router)
 
     # API 라우트를 먼저 등록한 뒤 마지막에 정적 파일을 루트에 건다.

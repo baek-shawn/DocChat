@@ -26,7 +26,7 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable
 
-from .. import config
+from .. import config, trace
 from ..agent.prompts import OCR_RETRY_NOTE, OCR_SYSTEM_PROMPT, TILE_OCR_NOTE, ocr_instruction
 from ..attachments import Attachment
 from ..providers.base import ModelResponse, Provider, is_output_length_stop
@@ -296,6 +296,15 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
 
     async def transcribe(image: ModelImage, instruction: str) -> tuple[str, str]:
         """이미지 한 장(쪽 전체 또는 타일)을 전사한다. (상태, 글)을 돌려준다."""
+        async with trace.scope("ocr", f"전사 · {image.name}", image=image.name, tile=list(image.tile) if image.tile else None,
+                               disableThinking=disable_thinking, maxTokens=config.vision_max_tokens()) as span:
+            status, text = await _transcribe(image, instruction)
+            span.set(result=status, text=trace.clip(text), chars=len(text))
+            if status == "failed":
+                span.status = "failed"
+            return status, text
+
+    async def _transcribe(image: ModelImage, instruction: str) -> tuple[str, str]:
         last_error: object = "unknown error"
         for attempt in range(1, config.OCR_RETRY_COUNT + 1):
             prompt = instruction if attempt == 1 else f"{instruction}\n{OCR_RETRY_NOTE}"
@@ -311,12 +320,17 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
                     # 출력 상한에 닿았다 → 재시도하지 않는다(다시 보내면 상한만큼의 시간이 또 든다).
                     usage.ocr_length_stops += 1
                     partial = cut_off_transcription(provider, response, thinking_disabled=disable_thinking)
+                    trace.note("ocr", "출력 상한에서 끊김 → 다시 보내지 않음" + (" · 읽은 데까지 남김" if partial else " · 버림"),
+                               keptChars=len(partial), finishReason=response.finish_reason)
                     if partial:
                         return "ok", (f"{partial}\n{INCOMPLETE_MARK}: the model reached {_limit_words()} here. "
                                       "Text after this point was not transcribed.]")
                     return "failed", (f"{_FAILED_PREFIX}: the model reached {_limit_words()} without producing a "
                                       "transcription. Not retried.]")
                 text = clean_transcription(response.text)
+                if "[REPEATED LINE OMITTED" in text or _SPECIAL_TOKENS.search(response.text or ""):
+                    trace.note("cleanup", "전사에서 잡음 제거(특수 토큰·되풀이 줄)", rawChars=len(response.text or ""),
+                               cleanedChars=len(text))
                 if image.tile is not None and is_no_text_reply(text):
                     return "empty", ""
                 if is_usable_ocr_response(text):
@@ -326,6 +340,8 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
                 raise
             except Exception as error:  # 한 페이지의 실패가 전체 답변을 막지 않게 한다.
                 last_error = error
+            if attempt < config.OCR_RETRY_COUNT:
+                trace.note("ocr", f"전사가 아니어서 다시 시도 ({attempt + 1}/{config.OCR_RETRY_COUNT})", reason=str(last_error)[:500])
         return "failed", f"{_FAILED_PREFIX} AFTER {config.OCR_RETRY_COUNT} ATTEMPTS: {last_error}]"
 
     async def assemble(attachment: Attachment) -> list[ModelImage]:
@@ -349,6 +365,9 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
             _status, text = await transcribe(images[0], instruction)
             return text
         usage.count_images(images)
+        trace.note("ocr", f"{attachment.name}을(를) 타일 {len(images)}장으로 나눠 전사",
+                   grid={"rows": grid.rows, "cols": grid.cols, "blank": grid.blank, "width": grid.width,
+                         "height": grid.height, "dpi": grid.dpi})
         if on_tiles is not None:
             await on_tiles(attachment.name, "ocr", images)
         finished = 0
@@ -362,7 +381,11 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
             return TileText(row=row, col=col, box=image.source_box, text=text, status=status)
 
         parts = await asyncio.gather(*(read_tile(image) for image in images))
-        return merge_tile_transcriptions(list(parts), rows=grid.rows, cols=grid.cols, blank=grid.blank)
+        merged = merge_tile_transcriptions(list(parts), rows=grid.rows, cols=grid.cols, blank=grid.blank)
+        counts = Counter(part.status for part in parts)
+        trace.note("ocr", f"타일 전사 병합 · {attachment.name}", ok=counts.get("ok", 0), empty=counts.get("empty", 0),
+                   failed=counts.get("failed", 0), chars=len(merged), text=trace.clip(merged))
+        return merged
 
     return read
 
@@ -420,6 +443,9 @@ async def prepare_visual_ocr_evidence(
         notify(f"전사 호출의 추론 설정이 바뀌어 {total}쪽을 다시 전사하는 중…")
     else:
         notify(f"이미지 처리 방식이 바뀌어 {total}쪽을 다시 전사하는 중…")
+    trace.note("ocr", f"전사 대상 {total}쪽", variant=variant,
+               pages=[{"name": item.name, "reason": "아직 전사하지 않음" if item.ocr_required
+                       else f"다른 방식으로 전사돼 있음: {transcribed_with(item, attachments)}"} for item in sources])
     results: list[str] = [""] * total
     cursor = 0
     finished = 0
@@ -441,6 +467,8 @@ async def prepare_visual_ocr_evidence(
                 # 실패는 캐시하지 않는다. 타일 하나라도 실패했으면 다음에 다시 시도할 수 있게 쪽 전체를 캐시하지 않는다.
                 if _FAILED_PREFIX not in text.upper():
                     cache.remember(key, text)
+            else:
+                trace.note("ocr", f"전사 캐시 사용(모델 호출 없음) · {source.name}", chars=len(text))
             results[index] = text
             finished += 1
             notify(f"페이지 전사 중… ({finished}/{total})")

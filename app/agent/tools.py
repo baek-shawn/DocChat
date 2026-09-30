@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from .. import config
+from .. import config, trace
 from ..attachments import Attachment
 from ..db import ChatStore
 from ..pipeline.evidence import attachment_root_name, page_image_name
@@ -178,6 +178,8 @@ async def _resolve_visual_surface(context: ToolContext, record: Attachment, page
         return existing
     # 네이티브 텍스트로 충분해 미리 렌더하지 않았던 페이지도 요청이 오면 원본 PDF에서 바로 그린다.
     rendered = await run_pdf(render_pdf_page_image, pdf.data, page_number=page_number, dpi=config.PDF_RENDER_DPI)
+    trace.note("tool", f"{page_image_name(pdf.name, page_number)}을(를) 요청 시점에 렌더", width=rendered.width,
+               height=rendered.height, dpi=config.PDF_RENDER_DPI, classification=rendered.page_classification)
     surface = Attachment(
         name=page_image_name(pdf.name, page_number), mime=rendered.mime, kind="image", size=rendered.size,
         data=rendered.data, has_data=True, width=rendered.width, height=rendered.height,
@@ -188,6 +190,9 @@ async def _resolve_visual_surface(context: ToolContext, record: Attachment, page
     context.attachments.append(surface)
     if context.store is not None and context.conversation_id:
         await context.store.save_attachments(context.conversation_id, context.attachments)
+    turn = trace.current()
+    if turn is not None:        # 지금 렌더한 쪽도 트레이스가 첨부 ID·크기로 가리킬 수 있게
+        turn.register_attachments(context.attachments)
     return surface
 
 
@@ -235,12 +240,18 @@ async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, 
             )
         if is_output_length_stop(response.finish_reason):
             context.usage.grounding_length_stops += 1
+            trace.note("tool", f"출력 상한에서 끊김 → 다시 묻지 않음 · {image.name}", finishReason=response.finish_reason)
             return VisualInspection(cut_off=True)
         # 픽셀 좌표로 답하는 모델을 위해 **모델이 실제로 본 이미지**의 크기를 넘긴다(타일이면 타일 크기).
         part = parse_visual_inspection(response.text, image_width=image.width or surface.width,
                                        image_height=image.height or surface.height)
         if part.structured:
             break
+        if attempt < config.GROUNDING_RETRY_COUNT:
+            trace.note("tool", f"구조화 JSON이 아니어서 다시 묻는 중 ({attempt + 2}/{1 + config.GROUNDING_RETRY_COUNT}) "
+                               f"· {image.name}", text=trace.clip(response.text))
+    trace.note("tool", f"위치 확인 결과 · {image.name}", structured=part.structured, boxes=len(part.boxes),
+               text=trace.clip(part.text), regions=[dict(box) for box in part.boxes[:50]])
     # 타일 기준 좌표 → 전체 기준 좌표. 전체 이미지(0,0,1,1)면 그대로다.
     return VisualInspection(text=part.text, structured=part.structured,
                             boxes=[map_box_to_source(box, image.source_box) for box in part.boxes])
@@ -304,8 +315,15 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
     source = await _tile_source(context, surface) if context.image_mode == "tile" else None
     images = await assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="grounding",
                                          mode=context.image_mode, source=source)
+    grid = images[0].grid
+    trace.note("tool", (f"{surface.name}을(를) 타일 {len(images)}장으로 나눠 확인" if grid is not None
+                        else f"{surface.name} 전체 한 장으로 확인"),
+               surface=surface.name, attachmentId=surface.id, width=surface.width, height=surface.height,
+               imageMode=context.image_mode, task=task,
+               grid={"rows": grid.rows, "cols": grid.cols, "blank": grid.blank, "width": grid.width,
+                     "height": grid.height, "dpi": grid.dpi} if grid is not None else None)
     warning = ""
-    if images[0].grid is None:
+    if grid is None:
         inspection = await _ground(context, surface, images[0], task, asyncio.Semaphore(1))
         if inspection.cut_off:
             warning = (f"The vision model stopped at {_limit_words()} before answering, so no boxes could be measured. "
@@ -314,6 +332,9 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
         inspection, warning = await _inspect_tiles(context, surface, images, task)
 
     regions = [box for box in inspection.boxes if valid_box(box)]
+    trace.note("tool", f"inspect_visual 결과 · 영역 {len(regions)}개" + (" · 경고 있음" if warning else ""),
+               structured=inspection.structured, cutOff=inspection.cut_off, boxes=len(regions), warning=warning or None,
+               text=trace.clip(inspection.text))
     artifact: dict[str, Any] = {
         "name": surface.name, "mime": surface.mime, "view": "image",
         "title": f"시각 검사 · {surface.name}", "task": task, "text": inspection.text[:20_000],

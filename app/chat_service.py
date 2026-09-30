@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import config
+from . import config, trace
 from .agent.loop import run_tool_loop
 from .agent.prompts import FALSE_REFUSAL_CORRECTION, system_prompt
 from .agent.tools import ToolContext, available_tools, describe_tool_call, execute_tool
@@ -30,6 +30,7 @@ from .pipeline.ocr import TileSink, build_ocr_reader, prepare_visual_ocr_evidenc
 from .pipeline.pdf import PdfError
 from .pipeline.preprocess import preprocess_attachments
 from .providers import Provider, ProviderError, create_provider
+from .providers.traced import TracedProvider
 from .storage import StorageError, extension_for, safe_filename
 
 logger = logging.getLogger("docchat.chat")
@@ -201,22 +202,42 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
     conversation_id = request.conversation_id if valid_id(request.conversation_id) else ""
     conversation_id = await store.save_conversation(
         conversation_id=conversation_id or None, provider=request.provider, model=request.model, messages=messages)
-    emit({"type": "conversation", "conversationId": conversation_id})
+    # 개발용 턴 트레이스(Step 7): 켜져 있을 때만 만든다. id를 먼저 알려 줘야 화면이 진행 중에도 "과정 보기"를 열 수 있다.
+    turn = trace.TurnTrace(conversation_id, store.save_trace) if config.debug_trace_enabled() else None
+    emit({"type": "conversation", "conversationId": conversation_id, **({"traceId": turn.id} if turn else {})})
+    trace_meta = {"traceId": turn.id} if turn else {}
 
     started = time.monotonic()
+    if turn is not None:
+        provider = TracedProvider(provider, turn)
+        turn.activate()
     thinking = plan_thinking(request, provider)
+    if turn is not None:
+        _record_input(turn, request, messages, uploads, image_mode, thinking, provider)
     try:
         answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode, thinking)
     except (ProviderError, UploadError, PdfError, ImageError, StorageError) as error:
         failure = ChatError(str(error), status=502 if isinstance(error, ProviderError) else 400)
-        await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [], {})
+        await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [], trace_meta)
+        if turn is not None:
+            await turn.close("failed", reason=str(error))
         raise failure from error
+    except asyncio.CancelledError:
+        if turn is not None:
+            await turn.close("cancelled", reason=trace.CANCELLED_REASON)
+        raise
+    except Exception as error:      # 예상 밖 오류도 트레이스에는 남긴다(라우터가 사용자에게 알린다)
+        if turn is not None:
+            await turn.close("failed", reason=f"{type(error).__name__}: {error}")
+        raise
     finally:
         await provider.aclose()
+        if turn is not None:
+            turn.deactivate()
 
     # 이 답을 어떤 방식으로 만들었는지 남긴다 — 모드를 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 알 수 있어야 한다.
     meta: dict[str, Any] = {"imageMode": image_mode, "vision": answer.usage.to_public(),
-                            "elapsedMs": int((time.monotonic() - started) * 1000)}
+                            "elapsedMs": int((time.monotonic() - started) * 1000), **trace_meta}
     if image_mode == "tile":
         meta["tiling"] = config.tile_settings()
     if thinking.controllable and provider.can_disable_thinking():
@@ -224,7 +245,12 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         meta["thinkingDisabled"] = thinking.to_public()
     if provider.is_local and config.vision_max_tokens():
         meta["visionMaxTokens"] = config.vision_max_tokens()
+    if turn is not None:
+        turn.note("answer", "최종 답변", text=trace.clip(answer.text), chars=len(answer.text), meta=meta,
+                  artifacts=[{"name": item.get("name"), "boxes": len(item.get("boxes") or [])} for item in answer.artifacts])
     await _save_reply(store, request, conversation_id, messages, answer.text, answer.artifacts, meta)
+    if turn is not None:
+        await turn.close("done")
     return {
         "type": "final",
         "conversationId": conversation_id,
@@ -234,6 +260,19 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         "files": messages[-1].get("files") or [],
         "meta": meta,
     }
+
+
+def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[dict[str, Any]], uploads: list[Attachment],
+                  image_mode: str, thinking: ThinkingPlan, provider: Provider) -> None:
+    """턴의 입력: 질문, 새 첨부, 이번 턴의 설정. API key는 넣지 않는다."""
+    turn.note(
+        "input", "입력", question=trace.clip(messages[-1]["content"]), historyMessages=len(messages) - 1,
+        attachments=[{"name": item.name, "kind": item.kind, "mime": item.mime, "size": item.size} for item in uploads],
+        provider=request.provider, model=request.model, baseUrl=request.base_url or None, imageMode=image_mode,
+        contextSize=request.context_size, thinkingDisabled=thinking.to_public() if thinking.controllable else None,
+        thinkingControl=provider.can_disable_thinking(), visionMaxTokens=config.vision_max_tokens(),
+        tiling=config.tile_settings() if image_mode == "tile" else None,
+    )
 
 
 async def _save_reply(store: ChatStore, request: ChatRequest, conversation_id: str, messages: list[dict[str, Any]],
@@ -279,6 +318,8 @@ def _tile_sink(store: ChatStore, conversation_id: str) -> TileSink | None:
                 await asyncio.to_thread(store.files.write, conversation_id, target, image.data, keep_existing=True)
             except StorageError as error:      # 확인용 파일이다. 못 써도 답변은 계속한다.
                 logger.warning("타일을 저장하지 못했습니다: %s (%s)", target, error)
+        trace.note("files", f"모델에 보낸 타일 {len(images)}장을 저장 · {name}", folder=f"{conversation_id}/{folder}",
+                   purpose=purpose)
 
     return save
 
@@ -288,6 +329,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
                   image_mode: str, thinking: ThinkingPlan) -> Answer:
     def progress(message: str) -> None:
         emit({"type": "progress", "message": message})
+        trace.note("progress", message)      # 화면에 보인 진행 단계가 트레이스의 시간축에도 남는다
 
     progress("요청을 준비하는 중…")
     usage = VisionUsage()
@@ -302,6 +344,9 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         await store.delete_attachments(conversation_id, [item.id for item in replaced if item.id is not None])
         await store.save_attachments(conversation_id, attachments)
         _link_uploaded_files(messages[-1], uploads)
+    turn = trace.current()
+    if turn is not None:
+        turn.register_attachments(attachments)      # 모델에 보낸 이미지를 첨부 ID로 가리키기 위해
 
     # 2) 시각 OCR: needs_vlm 페이지만, 메인 답변 전에, 선택된 VLM에게 전사시킨다
     #    (다른 방식 — 이미지 처리 방식·추론 여부 — 으로 전사해 둔 쪽은 이번 요청의 방식으로 다시 전사한다)
@@ -319,13 +364,15 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     )
     if transcribed:
         await store.save_attachments(conversation_id, attachments)
+        if turn is not None:
+            turn.register_attachments(attachments)
     # 큰 바이트는 메모리에서 내려놓는다. 필요하면 도구가 DB에서 다시 읽는다.
     for item in attachments:
         if item.id is not None and not item.send_to_model:
             item.data = None
 
     # 3) 프롬프트 예산 안에서 증거 선택
-    _, attachment_budget, history_budget = _budgets(provider, request.context_size)
+    char_budget, attachment_budget, history_budget = _budgets(provider, request.context_size)
     latest_user = messages[-1]["content"]
     context = attachment_context_for_prompt(latest_user, attachments, attachment_budget, config.MAX_MODEL_IMAGES)
     model_images = []
@@ -341,11 +388,14 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     history = compact_conversation_messages(messages[-config.MAX_HISTORY_MESSAGES:], history_budget)
     if not history or history[-1]["role"] != "user":
         history.append({"role": "user", "content": latest_user})
-    history[-1] = {"role": "user", "content": _user_content(
-        history[-1]["content"], context.documents, any(is_visual_ocr(item) for item in attachments))}
+    has_visual_ocr = any(is_visual_ocr(item) for item in attachments)
+    history[-1] = {"role": "user", "content": _user_content(history[-1]["content"], context.documents, has_visual_ocr)}
     model_messages = [{"role": "system", "content": system_prompt(attachment_manifest(attachments),
                                                                  tools_enabled=bool(tools),
                                                                  model_name=request.model)}, *history]
+    if turn is not None:
+        _record_evidence(turn, attachments, context, model_images, tools, history, model_messages[0]["content"],
+                         budgets=(char_budget, attachment_budget, history_budget), has_visual_ocr=has_visual_ocr)
 
     # 4) 단일 tool-calling 루프
     tool_context = ToolContext(
@@ -366,6 +416,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     # 5) 내용을 이미 줬는데 "첨부를 볼 수 없다"고 하면 한 번만 바로잡는다
     if has_usable_attachment_content(attachments) and looks_like_false_attachment_refusal(text):
         progress("첨부 내용을 근거로 다시 답변하는 중…")
+        trace.note("cleanup", "첨부를 볼 수 없다는 답 → 첨부 내용을 근거로 다시 요청", rejected=trace.clip(text))
         usage.answer_calls += 1
         retry = await provider.analyze(
             [*model_messages, {"role": "assistant", "content": text},
@@ -376,6 +427,24 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     if not text.strip():
         raise ProviderError("모델이 빈 응답을 돌려주었습니다. 다시 시도하거나 다른 모델을 선택하세요.")
     return Answer(text=text, artifacts=tool_context.artifacts, attachments=attachments, usage=usage)
+
+
+def _record_evidence(turn: trace.TurnTrace, attachments: list[Attachment], context: Any, model_images: list[ModelImage],
+                     tools: list[Any], history: list[dict[str, Any]], system: str, *, budgets: tuple[int, int, int],
+                     has_visual_ocr: bool) -> None:
+    """증거 조립: 어떤 텍스트를 얼마나 실었고 무엇이 잘렸는지, 어떤 이미지를 보냈는지, 예산은 얼마였는지."""
+    full = {item.name: len(item.text or "") for item in attachments}
+    documents = []
+    for item in context.documents:
+        sent = len(item.text or "")
+        documents.append({"name": item.name, "kind": item.kind, "chars": full.get(item.name, sent), "sentChars": sent,
+                          "clipped": sent < full.get(item.name, sent), "visualOcr": is_visual_ocr(item)})
+    turn.note(
+        "evidence", "증거 조립", budgets={"chars": budgets[0], "attachmentText": budgets[1], "history": budgets[2]},
+        documents=documents, images=turn.describe_images(model_images), tools=trace.describe_tools(tools),
+        historyMessages=len(history), visualOcrNote=has_visual_ocr, systemPrompt=trace.clip(system),
+        manifest=attachment_manifest(attachments),
+    )
 
 
 async def _none() -> None:

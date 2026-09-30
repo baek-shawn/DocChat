@@ -81,6 +81,18 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 - 추론 끄기와 출력 상한은 **로컬(OpenAI 호환) provider에만** 보낸다. 답변 호출에는 출력 상한을 붙이지 않는다(Step 6의 범위).
 - 전사 호출의 추론 여부는 `image_mode_variant(mode, thinking=…)`로 OCR 캐시 키와 쪽 기록에 들어간다.
 
+개발용 턴 트레이스(Step 7) — `DOCCHAT_DEBUG_TRACE=1`일 때만 기록한다(`config.debug_trace_enabled()`, 요청마다 읽는다).
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `TRACE_TEXT_LIMIT` | 40,000 | 트레이스에 남기는 글 한 조각(메시지·응답·도구 결과)의 최대 글자 수. 넘치면 앞·뒤를 남기고 자른다 |
+
+- 기록 지점은 `trace.note()`(한 줄)와 `trace.scope()`(시작·끝이 있는 구간, 그 안의 모델 호출은 자식이 된다)만 부른다. 트레이스가 없으면 아무 일도 하지 않으므로 **기록 지점을 조건문으로 감싸지 않는다.** 데이터 키는 `kind`·`label`과 겹쳐도 된다(위치 전용 인자).
+- 모델 호출은 `providers/traced.py`의 `TracedProvider`가 기록한다(`chat_service`가 트레이스를 켠 턴에만 감싼다). 새 호출 지점에 따로 기록 코드를 넣지 않는다.
+- **기록이 앱의 동작을 바꾸면 안 된다.** `TurnTrace`의 메서드는 예외를 삼키고, 안쪽 provider의 예외는 그대로 다시 던진다. 새 기록 지점을 넣을 때도 예외를 낼 수 있는 계산은 기록 인자 안에서 하지 않는다.
+- 이미지는 첨부 ID·타일 위치로만 가리킨다(base64 저장 금지). API key는 어디에도 적지 않는다(`TracedProvider`는 key를 갖지 않는다).
+- 답변의 `meta.traceId`가 트레이스를 가리킨다. 메시지 id는 저장할 때마다 새로 매겨져 키로 쓸 수 없다.
+
 ## 4. 기술 스택과 실행
 
 | 영역 | 선택 |
@@ -103,6 +115,8 @@ uv run python scripts/compare_tiling.py samples/large_scanned_plan.pdf --expect-
 uv run python scripts/check_runaway.py --image plan.png --task "Find every door symbol." --conditions A:2,B:2,C
                                          # 추론형 모델로 bbox·전사 호출의 폭주 확인(호출별 종료 사유·토큰·시간). 사용법은 README 3.4
 ```
+
+- 한 턴이 왜 그렇게 답했는지·왜 느렸는지는 `.env`에 `DOCCHAT_DEBUG_TRACE=1`을 켜고 답변의 **"과정 보기"**(또는 `GET /api/traces/{id}`)로 본다(Step 7). 재현 스크립트를 따로 짜기 전에 이것부터 본다. `docchat-scratch`는 켠 채 뜬다.
 
 - 브라우저로 UI를 확인할 때는 `.claude/launch.json`의 **`docchat-scratch`**(포트 8765, DB는 `%TEMP%\docchat-scratch`)를 쓴다. 기본 `docchat` 구성은 사용자의 실제 `data/`를 쓴다.
 - 이 PC에는 **Ollama(`http://127.0.0.1:11434/v1`)에 `gemma3:latest`(비전 지원, tool-calling 미지원)** 가 있다 → 종단 점검에 사용. tool-calling 미지원이므로 **JSON 폴백 경로**가 실제로 검증된다. bbox 위치 정확도는 낮다(모델 한계) — 파이프라인 버그로 오해하지 말 것.
@@ -144,11 +158,12 @@ uv run python scripts/check_runaway.py --image plan.png --task "Find every door 
 app/
   main.py            FastAPI 앱 조립, 정적 파일, Origin 검사
   config.py          모든 임계값/환경변수
-  db.py              aiosqlite 세션·메시지·첨부 저장소(첨부 바이트는 storage를 통해 파일로)
+  trace.py           개발용 턴 트레이스(Step 7) — 이벤트 기록·컨텍스트 변수·DB 저장 시점. config만 가져온다
+  db.py              aiosqlite 세션·메시지·첨부·턴 트레이스 저장소(첨부 바이트는 storage를 통해 파일로)
   storage.py         FileStore — data/files 아래 파일 쓰기·읽기, 경로 검사, 대화 폴더 삭제
   attachments.py     Attachment 모델, 업로드 정제
-  api/               sessions / models / files / chat 라우터
-  providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현
+  api/               sessions / models / files / chat / traces 라우터
+  providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현, traced(트레이스용 겉싸개)
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)
                      / preprocess / ocr(전사·타일 전사 병합) / evidence
@@ -163,10 +178,15 @@ samples/             생성된 시험 문서, compare/ 아래에 비교 결과 (
 ```
 
 import 방향(순환 금지): `config` ← `attachments` ← `storage` ← `db`, `config` ← `attachments` ← `pipeline/*` ← `providers/*` ← `agent/*` ← `chat_service` ← `api/*` ← `main`.
+`trace`는 `config` 바로 옆이다(`config` ← `trace`): `pipeline/*`·`agent/*`·`providers/traced`·`chat_service`가 가져오되, `trace`는 그 어느 것도 가져오지 않는다(이미지·provider 객체는 속성 이름으로만 읽는다).
 `pipeline` 안에서는 `geometry` ← `pdf` ← `images` 순이다(`images`가 타일 렌더를 부르므로 `pdf`는 `images`를 가져오지 않는다).
 `pipeline/ocr.py`만 예외적으로 `agent/prompts`와 `providers/base`를 가져온다. 각 패키지의 `__init__.py`는 비워 둔다(`providers`만 팩토리 제공).
 
-## 7. 하지 말 것
+## 7. git
+
+브랜치·커밋·태그 규칙은 [GIT_WORKFLOW.md](GIT_WORKFLOW.md)에 있다. 커밋과 push는 **사용자가 직접** 한다 — Claude는 요청받았을 때만 하고, 그 전에는 커밋 메시지 초안만 제안한다.
+
+## 8. 하지 말 것
 
 - 계획서에 없는 큰 기능을 임의로 추가하지 않는다(작은 편의 기능은 STEPS.md "변경점"에 기록).
 - 테스트를 통과시키려고 임계값이나 단언을 느슨하게 바꾸지 않는다.

@@ -10,7 +10,7 @@
     {
       "name": "docchat-scratch",
       "runtimeExecutable": "cmd",
-      "runtimeArgs": ["/c", "set DOCCHAT_DB_PATH=%TEMP%\\docchat-scratch\\docchat.sqlite&& uv run python run.py --port 8765"],
+      "runtimeArgs": ["/c", "set DOCCHAT_DB_PATH=%TEMP%\\docchat-scratch\\docchat.sqlite&& set DOCCHAT_DEBUG_TRACE=1&& uv run python run.py --port 8765"],
       "port": 8765
     }
   ]

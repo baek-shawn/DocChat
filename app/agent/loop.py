@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .. import config
+from .. import config, trace
 from ..pipeline.images import ModelImage
 from ..providers.base import (Message, ModelResponse, Provider, ToolCall, ToolSpec, ToolsUnsupportedError,
                               is_output_length_stop, last_user_index)
@@ -257,9 +257,10 @@ async def run_tool_loop(
         if with_tools and not use_fallback:
             try:
                 return await ask(hinted() + transcript, tools)
-            except ToolsUnsupportedError:
+            except ToolsUnsupportedError as error:
                 use_fallback = True
                 notify("이 모델은 네이티브 도구 호출을 지원하지 않아 JSON 방식으로 전환합니다…")
+                trace.note("loop", "네이티브 도구 호출 거절 → JSON 방식으로 전환", error=str(error)[:500])
         if with_tools:
             # 도구가 이미 한 번 실행된 뒤라면(transcript 있음) 최종 답을 기대하는 상황이라 힌트는 결과 뒤에 붙어 있다.
             return await ask(_with_protocol(base, tools) + transcript, None)
@@ -271,21 +272,28 @@ async def run_tool_loop(
         offer_tools = bool(tools) and not stopped
         response = await call_model(offer_tools)
         text = strip_reasoning(response.text)
+        if "<think" in (response.text or "").lower() or "</think>" in (response.text or "").lower():
+            trace.note("cleanup", "본문에서 추론 블록 제거", removedChars=len(response.text or "") - len(text))
         calls = list(response.tool_calls) if offer_tools else []
         if offer_tools and not calls:
             # 네이티브 모드여도 일부 서버는 호출을 본문에 적어 보낸다 → 두 형태를 모두 받아 준다.
             calls, remainder = parse_embedded_tool_calls(text, tool_names)
             if calls:
                 text = remainder
+                trace.note("loop", f"본문에 적힌 도구 호출 JSON을 읽음 ({len(calls)}건)",
+                           calls=[trace.describe_tool_call(call) for call in calls])
         if offer_tools and not calls and looks_like_tool_envelope(text, tool_names):
             # 도구를 부르려다 JSON을 망가뜨린 경우다. 이 글을 '최종 답'으로 사용자에게 내보내면 안 된다.
             malformed += 1
             transcript.append({"role": "assistant", "content": response.text})
             if malformed <= _MAX_MALFORMED_ENVELOPES:
                 notify("도구 호출 형식이 올바르지 않아 다시 요청하는 중…")
+                trace.note("loop", f"도구 호출 JSON이 깨져 다시 요청 ({malformed}/{_MAX_MALFORMED_ENVELOPES})",
+                           text=trace.clip(text))
                 _append_user(transcript, RESEND_VALID_TOOL_JSON)
             else:
                 stopped = "malformed_tool_call"
+                trace.note("loop", "도구 호출 JSON이 계속 깨져 도구 없이 최종 답을 요구", text=trace.clip(text))
                 _append_user(transcript, FORCE_FINAL_ANSWER)
             continue
         if not calls:
@@ -300,6 +308,9 @@ async def run_tool_loop(
             stopped = "max_steps"
         if stopped:
             notify("도구 호출을 멈추고 답변을 정리하는 중…")
+            trace.note("loop", ("같은 도구 호출이 되풀이돼 중단" if stopped == "repeated_tool_call"
+                                else f"도구 호출 상한({max_steps}회)에 닿아 중단") + " → 도구 없이 최종 답을 요구",
+                       reason=stopped, steps=steps, repeats=repeats)
             transcript.append({"role": "assistant", "content": text or f"[called tools: {signature}]"})
             _append_user(transcript, FORCE_FINAL_ANSWER)
             continue
@@ -312,10 +323,14 @@ async def run_tool_loop(
                                "raw": response.raw_assistant})
         for call in calls:
             notify(describe(call) if describe else f"도구 실행 중… ({call.name})")
-            try:
-                result = await execute(call)  # type: ignore[misc]
-            except Exception as error:  # 도구의 예기치 못한 실패도 모델에게 알려 스스로 복구하게 한다.
-                result = f"ERROR: {error}"
+            async with trace.scope("tool", describe(call) if describe else f"도구 실행 · {call.name}", name=call.name,
+                                   arguments=call.arguments, step=steps) as span:
+                try:
+                    result = await execute(call)  # type: ignore[misc]
+                except Exception as error:  # 도구의 예기치 못한 실패도 모델에게 알려 스스로 복구하게 한다.
+                    result = f"ERROR: {error}"
+                    span.status = "failed"
+                span.set(result=trace.clip(result), resultChars=len(result))
             if use_fallback:
                 _append_user(transcript, f"TOOL RESULT ({call.name}):\n{result}")
             else:
@@ -331,6 +346,7 @@ async def run_tool_loop(
     while is_output_length_stop(response.finish_reason) and continuations < config.MAX_CONTINUATIONS:
         continuations += 1
         notify(f"답변이 길어 이어서 작성하는 중… ({continuations})")
+        trace.note("loop", f"답변이 출력 한도에서 끊겨 이어 쓰기 요청 ({continuations}/{config.MAX_CONTINUATIONS})")
         transcript.append({"role": "assistant", "content": text[-24_000:]})
         _append_user(transcript, CONTINUE_ANSWER)
         response = await ask(hinted() + _plain(transcript), None)
@@ -341,8 +357,11 @@ async def run_tool_loop(
 
     if tool_names and looks_like_tool_envelope(text, tool_names):
         # 마지막 안전망: 끝까지 도구 봉투만 내놓는 모델. 날 JSON을 답변이라고 보여 주지 않는다.
+        trace.note("cleanup", "최종 답이 도구 호출 JSON이라 안내문으로 대체", text=trace.clip(text))
         text = ("모델이 도구 호출 형식(JSON)을 올바르게 만들지 못해 답변을 완성하지 못했습니다. "
                 "다시 시도하거나, 도구 호출을 더 안정적으로 지원하는 모델을 선택해 주세요.")
         stopped = stopped or "malformed_tool_call"
+    trace.note("loop", "도구 루프 종료", steps=steps, modelCalls=model_calls, jsonFallback=use_fallback,
+               stoppedReason=stopped or None, continuations=continuations)
     return LoopResult(text=text, steps=steps, used_json_fallback=use_fallback, stopped_reason=stopped,
                       model_calls=model_calls)

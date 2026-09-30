@@ -176,6 +176,56 @@ dialog::backdrop { background: rgba(0, 0, 0, .5); }
 .dot[data-status="busy"] { background: var(--warn); animation: pulse 1.1s infinite; }
 @keyframes pulse { 50% { opacity: .4; } }
 
+/* ---------- 턴 과정(트레이스, 개발용) ---------- */
+.trace-row { margin-top: 6px; }
+.trace-btn { border: 1px dashed var(--line); background: transparent; color: var(--fg-muted); border-radius: 8px; padding: 3px 9px; font-size: 11.5px; cursor: pointer; }
+.trace-btn:hover { color: var(--fg); background: var(--bg-hover); }
+dialog.trace-dialog { width: min(1040px, calc(100vw - 28px)); }
+.trace-card { display: flex; flex-direction: column; max-height: 90vh; padding: 14px 18px 16px; }
+.trace-card .dialog-head { margin-bottom: 6px; }
+.trace-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.trace-status { font-size: 12px; color: var(--fg-muted); }
+.trace-status[data-status="running"] { color: var(--accent); }
+.trace-status[data-status="failed"] { color: var(--danger); }
+.trace-status[data-status="cancelled"], .trace-status[data-status="interrupted"] { color: var(--warn); }
+.s-interrupted .trace-state { color: var(--warn); }
+.trace-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 14px; font-size: 12px; color: var(--fg-muted); padding: 2px 0 8px; border-bottom: 1px solid var(--line); }
+.trace-hint { color: var(--fg-faint); }
+.trace-body { flex: 1; min-height: 0; overflow: auto; margin-top: 6px; }
+.trace-list { display: flex; flex-direction: column; gap: 2px; }
+.trace-row-item { border-radius: 7px; }
+.trace-row-item.open { background: var(--bg); }
+.trace-head { display: grid; grid-template-columns: 62px 14px 44px minmax(0, 1fr) auto auto auto; gap: 8px; align-items: center; width: 100%; border: 0; background: none; text-align: left; padding: 4px 8px 4px calc(8px + var(--depth, 0) * 22px); border-radius: 7px; cursor: pointer; font-size: 12.5px; }
+.trace-head:hover { background: var(--bg-hover); }
+.trace-fold { color: var(--fg-muted); font-size: 12px; text-align: center; }
+.trace-detail-btn { font-size: 11px; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 5px; padding: 0 6px; white-space: nowrap; }
+.trace-detail-btn:hover, .trace-detail-btn.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.trace-detail-btn.none { border: 0; padding: 0; width: 0; }
+.trace-time { color: var(--fg-faint); font-variant-numeric: tabular-nums; font-size: 11.5px; }
+.trace-kind { font-size: 10.5px; color: #fff; background: var(--fg-faint); border-radius: 4px; padding: 1px 0; text-align: center; }
+.k-model .trace-kind { background: var(--accent); } .k-tool .trace-kind { background: #b047d6; } .k-ocr .trace-kind { background: #14a3a3; }
+.k-preprocess .trace-kind { background: #2f9e5b; } .k-evidence .trace-kind { background: #ff8a1f; } .k-answer .trace-kind { background: #d6479a; }
+.k-loop .trace-kind, .k-cleanup .trace-kind { background: #8a8f98; }
+.k-progress .trace-head { color: var(--fg-faint); }
+.trace-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-dur { color: var(--fg-muted); font-variant-numeric: tabular-nums; font-size: 11.5px; white-space: nowrap; }
+.trace-dur.live { color: var(--accent); }
+.trace-state { font-size: 11px; white-space: nowrap; min-width: 0; }
+.s-failed .trace-state { color: var(--danger); } .s-cancelled .trace-state { color: var(--warn); } .s-running .trace-state { color: var(--accent); }
+.s-failed .trace-label { color: var(--danger); }
+.trace-detail { padding: 4px 10px 10px calc(70px + var(--depth, 0) * 22px); display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.trace-chips { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.trace-chip { border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; font-size: 11.5px; color: var(--fg-muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-chip b { color: var(--fg); font-weight: 600; }
+.trace-section > summary { cursor: pointer; color: var(--fg-muted); font-size: 12px; padding: 2px 0; }
+.trace-section[open] > summary { color: var(--fg); }
+.trace-pre { margin: 4px 0 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg-raised); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; font-size: 12px; }
+.trace-messages { display: flex; flex-direction: column; gap: 2px; }
+.trace-table { font-size: 12px; }
+.trace-table td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-error { color: var(--danger); white-space: pre-wrap; }
+.trace-empty { color: var(--fg-muted); padding: 18px 8px; text-align: center; }
+
 /* ---------- 마크다운(경량) ---------- */
 .md-p { margin: 0 0 10px; white-space: pre-wrap; } .md-p:last-child { margin-bottom: 0; }
 .md-h { font-weight: 700; margin: 14px 0 7px; } .md-h:first-child { margin-top: 0; }
