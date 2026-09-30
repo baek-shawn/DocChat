@@ -35,6 +35,14 @@ def ocr_instruction(name: str, page_number: int | None) -> str:
     ])
 
 
+# 타일 모드 전용. 타일에는 글자가 하나도 없는 조각(도면의 빈 곳·선만 있는 곳)이 흔하다. 약속된 표식이 없으면
+# 모델이 그림을 설명하거나 글자를 지어내므로, "글자 없음"을 뜻하는 답을 하나 정해 둔다.
+NO_TEXT_MARK = "[NO TEXT]"
+TILE_OCR_NOTE = (
+    "This image is one tile cut from a larger page, so text at the tile edges may be cut off. Transcribe only what is "
+    f"visible inside this tile. If the tile shows no readable text at all, reply with exactly {NO_TEXT_MARK}"
+)
+
 GROUNDING_SYSTEM_PROMPT = (
     "You are a visual grounding engine. Look only at the complete attached image and reply with strict JSON in the "
     "requested schema and nothing else. Measure every bounding box on the full image with integer coordinates from "
@@ -48,11 +56,19 @@ GROUNDING_RETRY_NOTE = "Your previous reply was not valid structured grounding. 
 REGION_TYPES = ("text", "object", "table", "dimension", "stamp", "signature", "diagram", "other")
 
 
-def grounding_instruction(task: str, name: str) -> str:
+# 타일 모드 전용. 찾는 대상이 없는 타일이 대부분이므로 "없으면 빈 목록"을 분명히 해 둔다.
+TILE_GROUNDING_NOTE = (
+    "The attached image is one tile cut from a larger page. Treat this tile as the complete image and measure every "
+    "bbox in the 0 to 1000 frame of this tile. If nothing relevant to the task is visible in this tile, reply with "
+    '{"text":"","regions":[]}'
+)
+
+
+def grounding_instruction(task: str, name: str, *, tile: bool = False) -> str:
     # 허용 타입을 스키마 안에 "a|b|c"로 적으면 소형 모델이 그 문자열을 그대로 베낀다 → 예시와 목록을 분리한다.
     schema = ('{"text":"short findings or exact transcription","regions":[{"type":"stamp",'
               '"label":"visible content","bbox":[x1,y1,x2,y2],"confidence":0.0}]}')
-    return "\n".join([
+    lines = [
         f"Task: {task}",
         f"Source: {name}",
         f"Reply with JSON shaped like {schema}.",
@@ -60,7 +76,10 @@ def grounding_instruction(task: str, name: str) -> str:
         "Each bbox must hug the visible edges of its target with minimal padding and use the coordinate frame of the "
         "complete image. Use one box per physical text line or distinct object; never merge distant targets and never "
         "include surrounding blank space. Include only regions relevant to the task.",
-    ])
+    ]
+    if tile:
+        lines.append(TILE_GROUNDING_NOTE)
+    return "\n".join(lines)
 
 
 def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "") -> str:

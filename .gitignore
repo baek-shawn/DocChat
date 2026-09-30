@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 .pytest_tmp/
 
+# 로컬 설정(실험용 값). 양식은 .env.example
+.env
+
 # 사용자 데이터 (SQLite DB, 업로드 바이트)
 data/
 

@@ -1,14 +1,20 @@
 """SQLite(aiosqlite) 저장소 — 대화, 메시지, 첨부.
 
-참고 구현(vectra-web `history.mjs`)을 단순화했다: 프로젝트/공유 JSON 미러는 없고,
-첨부 바이트는 base64 문자열이 아니라 BLOB으로 저장한다(프론트로 되돌려 보내지 않기 위해).
+참고 구현(vectra-web `history.mjs`)을 단순화했다: 프로젝트/공유 JSON 미러는 없다.
 API key는 어떤 테이블에도 저장하지 않는다.
+
+첨부 바이트(Step 5-0): 새 첨부는 `data/files/{대화ID}/` 아래 **파일**로 쓰고 DB에는 상대 경로만 둔다.
+그 전에 저장된 첨부는 `data` BLOB 컬럼에 그대로 있고, 옮기지 않는다 → 읽을 때 "경로가 있으면 파일, 없으면 BLOB".
+어느 쪽이든 프론트로 base64를 되돌려 보내지 않고 `/api/attachments/{id}/content` URL로 참조한다.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -16,7 +22,11 @@ from typing import Any, Iterable
 
 import aiosqlite
 
+from . import config
 from .attachments import Attachment
+from .storage import FileStore, StorageError, extension_for, safe_filename
+
+logger = logging.getLogger("docchat.db")
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -38,6 +48,7 @@ CREATE TABLE IF NOT EXISTS messages (
   artifacts_json TEXT NOT NULL DEFAULT '[]',
   files_json TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
+  meta_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(conversation_id, position)
 );
 CREATE TABLE IF NOT EXISTS attachments (
@@ -51,6 +62,8 @@ CREATE TABLE IF NOT EXISTS attachments (
   text_content TEXT NOT NULL DEFAULT '',
   data BLOB,
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  file_path TEXT,
+  source_path TEXT,
   UNIQUE(conversation_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
@@ -58,8 +71,20 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id
 CREATE INDEX IF NOT EXISTS idx_attachments_conversation ON attachments(conversation_id, position);
 """
 
+# 이미 만들어진 DB에는 CREATE TABLE IF NOT EXISTS가 컬럼을 더해 주지 않는다 → 없는 컬럼만 덧붙인다.
+_ADDED_COLUMNS = (
+    ("attachments", "file_path", "TEXT"),            # 본 파일(모델 전송·뷰어용)의 상대 경로
+    ("attachments", "source_path", "TEXT"),          # 업로드 이미지 원본의 상대 경로(사본과 다를 때만)
+    ("messages", "meta_json", "TEXT NOT NULL DEFAULT '{}'"),   # 답변을 어떤 모드로 처리했는지
+)
+
 _ID_PATTERN = re.compile(r"^[a-zA-Z0-9-]{8,80}$")
 _BOX_KEYS = ("x", "y", "w", "h")
+_PAGE_IMAGE_NAME = re.compile(r"^(?P<root>.*) · page (?P<number>\d+)$")
+_META_COUNTERS = ("ocrCalls", "groundingCalls", "answerCalls", "tiledImages", "tiles", "blankTiles",
+                  "ocrLengthStops", "groundingLengthStops")
+_META_TILE_SETTINGS = ("tileSize", "overlap", "renderDpi", "minSourceEdge", "maxTiles")
+_META_THINKING_CALLS = ("answer", "grounding", "ocr")
 
 
 def valid_id(value: Any) -> bool:
@@ -142,6 +167,41 @@ def sanitize_files(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _bounded_number(value: Any, high: float) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return max(0, min(high, value))
+
+
+def sanitize_meta(value: Any) -> dict[str, Any]:
+    """답변 메타데이터: 어떤 이미지 처리 모드로, 비전 호출을 몇 번 써서 만든 답인지. 아는 항목만 남긴다."""
+    if not isinstance(value, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    if value.get("imageMode") in config.IMAGE_MODES:
+        meta["imageMode"] = value["imageMode"]
+    for key, names, high in (("tiling", _META_TILE_SETTINGS, 1_000_000), ("vision", _META_COUNTERS, 1_000_000_000)):
+        source = value.get(key)
+        if isinstance(source, dict):
+            numbers = {name: _bounded_number(source.get(name), high) for name in names}
+            numbers = {name: number for name, number in numbers.items() if number is not None}
+            if numbers:
+                meta[key] = numbers
+    elapsed = _bounded_number(value.get("elapsedMs"), 86_400_000)
+    if elapsed is not None:
+        meta["elapsedMs"] = int(elapsed)
+    # 호출 종류별로 추론을 끄고 보냈는지, 전사·bbox 호출의 출력 상한(Step 6-0)
+    thinking = value.get("thinkingDisabled")
+    if isinstance(thinking, dict):
+        flags = {name: thinking[name] for name in _META_THINKING_CALLS if isinstance(thinking.get(name), bool)}
+        if flags:
+            meta["thinkingDisabled"] = flags
+    limit = _bounded_number(value.get("visionMaxTokens"), 1_000_000)
+    if limit:
+        meta["visionMaxTokens"] = int(limit)
+    return meta
+
+
 def sanitize_messages(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -150,11 +210,13 @@ def sanitize_messages(value: Any) -> list[dict[str, Any]]:
         if not isinstance(message, dict):
             continue
         created = message.get("createdAt")
+        is_assistant = message.get("role") == "assistant"
         result.append({
-            "role": "assistant" if message.get("role") == "assistant" else "user",
+            "role": "assistant" if is_assistant else "user",
             "content": str(message.get("content") or "")[:4_000_000],
             "artifacts": sanitize_artifacts(message.get("artifacts")),
             "files": sanitize_files(message.get("files")),
+            "meta": sanitize_meta(message.get("meta")) if is_assistant else {},
             "createdAt": int(created) if isinstance(created, (int, float)) and created > 0 else now_ms(),
         })
     return result
@@ -183,12 +245,36 @@ def _json_dict(value: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def storage_names(attachment: Attachment) -> tuple[str, str | None]:
+    """(본 파일 이름, 원본 파일 이름 또는 None). 탐색기에서 바로 알아볼 수 있는 이름을 쓴다.
+
+      scan.pdf                 → scan.pdf
+      scan.pdf · page 2        → scan.pdf.page-0002.png
+      plan.tif (줄여서 전달)     → plan.model.png  +  plan.tif(원본)
+    """
+    extension = extension_for(attachment.mime)
+    page = _PAGE_IMAGE_NAME.match(attachment.name)
+    if page:
+        return f"{safe_filename(page['root'])}.page-{int(page['number']):04d}.{extension}", None
+    name = safe_filename(attachment.name)
+    stem, dot, _ = name.rpartition(".")
+    if not dot:
+        stem, name = name, f"{name}.{extension}"
+    if attachment.source_data is None:
+        return name, None
+    return f"{stem}.model.{extension}", name
+
+
 class ChatStore:
     """단일 연결을 공유한다. 여러 문장으로 이뤄진 쓰기는 `_write_lock`으로 묶어 트랜잭션이 섞이지 않게 한다."""
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, files_dir: Path | str | None = None):
         self.in_memory = str(path) == ":memory:"   # 테스트용. 연결 하나를 공유하므로 메모리 DB도 그대로 동작한다.
         self.path = Path(path)
+        # 메모리 DB는 닫으면 사라진다 → 폴더를 따로 지정하지 않았으면 파일도 임시 폴더에 두고 함께 지운다.
+        self._temporary_files = files_dir is None and self.in_memory
+        self._files_dir = Path(files_dir) if files_dir is not None else (None if self.in_memory else self.path.parent / "files")
+        self._files: FileStore | None = None
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         self._last_stamp = 0
@@ -209,20 +295,37 @@ class ChatStore:
         # (이 PC의 D: 드라이브에서 커밋 1회 182ms → 1ms. 정전 시 마지막 커밋 몇 개가 사라질 수 있을 뿐이다.)
         await self._db.execute("PRAGMA synchronous = NORMAL")
         await self._db.executescript(_SCHEMA)
+        for table, column, definition in _ADDED_COLUMNS:
+            cursor = await self._db.execute(f"PRAGMA table_info({table})")
+            if column not in {row["name"] for row in await cursor.fetchall()}:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         await self._db.execute("PRAGMA foreign_keys = ON")
         await self._db.commit()
+        if self._temporary_files:
+            self._files_dir = Path(tempfile.mkdtemp(prefix="docchat-files-"))
+        self._files = FileStore(self._files_dir)
         return self
 
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
             self._db = None
+        if self._temporary_files and self._files_dir is not None:
+            shutil.rmtree(self._files_dir, ignore_errors=True)
+            self._files_dir = None
+        self._files = None
 
     @property
     def db(self) -> aiosqlite.Connection:
         if self._db is None:
             raise RuntimeError("데이터베이스가 열려 있지 않습니다.")
         return self._db
+
+    @property
+    def files(self) -> FileStore:
+        if self._files is None:
+            raise RuntimeError("첨부 파일 저장소가 열려 있지 않습니다.")
+        return self._files
 
     # ------------------------------------------------------------------ 대화
     async def list_conversations(self, limit: Any = 100) -> list[dict[str, Any]]:
@@ -259,7 +362,7 @@ class ChatStore:
             return None
         conversation = dict(row)
         cursor = await self.db.execute(
-            "SELECT role, content, artifacts_json, files_json, created_at FROM messages "
+            "SELECT role, content, artifacts_json, files_json, meta_json, created_at FROM messages "
             "WHERE conversation_id = ? ORDER BY position",
             (conversation_id,),
         )
@@ -269,6 +372,7 @@ class ChatStore:
                 "content": item["content"],
                 "artifacts": _json_list(item["artifacts_json"]),
                 "files": _json_list(item["files_json"]),
+                "meta": _json_dict(item["meta_json"]),
                 "createdAt": item["created_at"],
             }
             for item in await cursor.fetchall()
@@ -313,12 +417,13 @@ class ChatStore:
                 if clean_messages is not None:
                     await self.db.execute("DELETE FROM messages WHERE conversation_id = ?", (identifier,))
                     await self.db.executemany(
-                        "INSERT INTO messages (conversation_id, position, role, content, artifacts_json, files_json, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO messages (conversation_id, position, role, content, artifacts_json, files_json, "
+                        "meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             (identifier, position, message["role"], message["content"],
                              json.dumps(message["artifacts"], ensure_ascii=False),
-                             json.dumps(message["files"], ensure_ascii=False), message["createdAt"])
+                             json.dumps(message["files"], ensure_ascii=False),
+                             json.dumps(message["meta"], ensure_ascii=False), message["createdAt"])
                             for position, message in enumerate(clean_messages)
                         ],
                     )
@@ -334,7 +439,11 @@ class ChatStore:
         async with self._write_lock:
             cursor = await self.db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
             await self.db.commit()
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+        if deleted:
+            # 폴더를 못 지워도(파일이 열려 있는 등) 대화 삭제는 끝난 것으로 본다. 실패는 저장소가 로그로 남긴다.
+            await asyncio.to_thread(self.files.remove_conversation, conversation_id)
+        return deleted
 
     async def delete_many(self, ids: Iterable[Any]) -> int:
         count = 0
@@ -345,15 +454,22 @@ class ChatStore:
 
     async def delete_all(self) -> int:
         async with self._write_lock:
+            cursor = await self.db.execute("SELECT id FROM conversations")
+            identifiers = [row["id"] for row in await cursor.fetchall()]
             cursor = await self.db.execute("DELETE FROM conversations")
             await self.db.commit()
-            return cursor.rowcount
+            deleted = cursor.rowcount
+        # DB에 있던 대화의 폴더만 지운다. 저장 폴더에 있는 그 밖의 것은 건드리지 않는다.
+        for identifier in identifiers:
+            await asyncio.to_thread(self.files.remove_conversation, identifier)
+        return deleted
 
     # ------------------------------------------------------------------ 첨부
     async def list_attachments(self, conversation_id: str) -> list[Attachment]:
         """메타데이터와 텍스트만 읽는다. 바이트는 필요할 때 `load_attachment_data`로 가져온다."""
         cursor = await self.db.execute(
-            "SELECT id, name, mime, kind, size, text_content, metadata_json, data IS NOT NULL AS has_data "
+            "SELECT id, name, mime, kind, size, text_content, metadata_json, file_path, source_path, "
+            "(data IS NOT NULL OR file_path IS NOT NULL) AS has_data "
             "FROM attachments WHERE conversation_id = ? ORDER BY position, id",
             (conversation_id,),
         )
@@ -361,45 +477,91 @@ class ChatStore:
             Attachment(
                 id=row["id"], name=row["name"], mime=row["mime"], kind=row["kind"], size=row["size"],
                 text=row["text_content"], has_data=bool(row["has_data"]),
+                file_path=row["file_path"], source_path=row["source_path"],
             ).apply_metadata(_json_dict(row["metadata_json"]))
             for row in await cursor.fetchall()
         ]
 
+    async def _read_file(self, relative: str, attachment_id: int) -> bytes | None:
+        try:
+            return await asyncio.to_thread(self.files.read, relative)
+        except StorageError as error:
+            # DB 값이 저장 폴더 밖을 가리킨다 → 읽지 않는다.
+            logger.warning("첨부 %s의 경로를 거부했습니다: %s", attachment_id, error)
+            return None
+
     async def load_attachment_data(self, attachment_id: int) -> bytes | None:
-        cursor = await self.db.execute("SELECT data FROM attachments WHERE id = ?", (attachment_id,))
+        """본 파일(모델 전송·뷰어용)의 바이트. 경로가 있으면 파일, 없으면 예전 방식의 BLOB."""
+        cursor = await self.db.execute("SELECT data, file_path FROM attachments WHERE id = ?", (attachment_id,))
         row = await cursor.fetchone()
-        return bytes(row["data"]) if row is not None and row["data"] is not None else None
+        if row is None:
+            return None
+        if row["file_path"]:
+            return await self._read_file(row["file_path"], attachment_id)
+        return bytes(row["data"]) if row["data"] is not None else None
+
+    async def load_attachment_source(self, attachment_id: int) -> tuple[bytes, str] | None:
+        """업로드 원본의 (바이트, MIME). 원본을 따로 두지 않은 첨부(사본과 같거나 예전 BLOB)는 본 파일을 돌려준다."""
+        cursor = await self.db.execute(
+            "SELECT mime, metadata_json, source_path FROM attachments WHERE id = ?", (attachment_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        if row["source_path"]:
+            data = await self._read_file(row["source_path"], attachment_id)
+            if data is not None:
+                return data, str(_json_dict(row["metadata_json"]).get("sourceMime") or row["mime"])
+        data = await self.load_attachment_data(attachment_id)
+        return (data, row["mime"]) if data is not None else None
 
     async def get_attachment_content(self, attachment_id: int) -> tuple[str, str, bytes] | None:
-        cursor = await self.db.execute("SELECT name, mime, data FROM attachments WHERE id = ?", (attachment_id,))
+        cursor = await self.db.execute("SELECT name, mime FROM attachments WHERE id = ?", (attachment_id,))
         row = await cursor.fetchone()
-        if row is None or row["data"] is None:
+        if row is None:
             return None
-        return row["name"], row["mime"], bytes(row["data"])
+        data = await self.load_attachment_data(attachment_id)
+        return (row["name"], row["mime"], data) if data is not None else None
+
+    async def _write_files(self, conversation_id: str, attachment: Attachment, written: list[str]) -> None:
+        """새 첨부의 바이트를 파일로 쓴다. 업로드 이미지는 원본과 모델 전송용 사본을 따로 둔다."""
+        primary, source = storage_names(attachment)
+        if source is not None and attachment.source_data is not None:
+            attachment.source_path = await asyncio.to_thread(
+                self.files.write, conversation_id, source, attachment.source_data)
+            written.append(attachment.source_path)
+        attachment.file_path = await asyncio.to_thread(self.files.write, conversation_id, primary, attachment.data)
+        written.append(attachment.file_path)
 
     async def save_attachments(self, conversation_id: str, attachments: list[Attachment]) -> None:
-        """목록 순서대로 position을 매긴다. 새 항목은 바이트와 함께 INSERT, 기존 항목은 텍스트·메타만 UPDATE."""
+        """목록 순서대로 position을 매긴다. 새 항목은 바이트를 파일로 쓰고 경로와 함께 INSERT, 기존 항목은 텍스트·메타만 UPDATE."""
+        written: list[str] = []
         async with self._write_lock:
             try:
                 for position, attachment in enumerate(attachments):
+                    if attachment.id is None and attachment.data is not None:
+                        await self._write_files(conversation_id, attachment, written)
                     metadata = json.dumps(attachment.metadata(), ensure_ascii=False)
                     if attachment.id is None:
                         cursor = await self.db.execute(
                             """
-                            INSERT INTO attachments (conversation_id, position, name, mime, kind, size, text_content, data, metadata_json)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO attachments (conversation_id, position, name, mime, kind, size, text_content,
+                                                     data, metadata_json, file_path, source_path)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                             ON CONFLICT(conversation_id, name) DO UPDATE SET position = excluded.position,
                               mime = excluded.mime, kind = excluded.kind, size = excluded.size,
-                              text_content = excluded.text_content, data = excluded.data,
-                              metadata_json = excluded.metadata_json
+                              text_content = excluded.text_content, data = NULL,
+                              metadata_json = excluded.metadata_json, file_path = excluded.file_path,
+                              source_path = excluded.source_path
                             RETURNING id
                             """,
                             (conversation_id, position, attachment.name, attachment.mime, attachment.kind,
-                             attachment.size, attachment.text or "", attachment.data, metadata),
+                             attachment.size, attachment.text or "", metadata, attachment.file_path,
+                             attachment.source_path),
                         )
                         row = await cursor.fetchone()
                         attachment.id = row["id"]
-                        attachment.has_data = attachment.data is not None
+                        attachment.has_data = attachment.file_path is not None
+                        attachment.source_data = None      # 원본은 디스크에 있다. 큰 바이트를 메모리에 붙들지 않는다.
                     else:
                         await self.db.execute(
                             "UPDATE attachments SET position = ?, mime = ?, kind = ?, size = ?, text_content = ?, metadata_json = ? "
@@ -413,6 +575,9 @@ class ChatStore:
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
+                # DB에 기록되지 못한 파일은 아무도 가리키지 않는다 → 이번 호출이 쓴 것만 되돌린다.
+                for relative in written:
+                    await asyncio.to_thread(self.files.discard, relative)
                 raise
 
     async def delete_attachments(self, conversation_id: str, attachment_ids: Iterable[int]) -> None:

@@ -4,10 +4,16 @@
       → 단일 tool-calling 루프(§6) → 거짓 거절 교정 → 대화 저장
 
 진행 상황은 `emit({"type": "progress", ...})`로 흘려보낸다. 전송 방식(동기 JSON / NDJSON)은 라우터가 정한다.
+
+이미지 처리 방식(전체/타일)은 요청마다 고른다. 전사와 bbox 호출에만 적용되고, 어떤 방식으로 처리했는지는
+답변의 메타데이터(`meta`)에 남긴다.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -19,11 +25,14 @@ from .attachments import Attachment, UploadError, sanitize_uploads
 from .db import ChatStore, now_ms, sanitize_messages, valid_id
 from .pipeline.evidence import (attachment_context_for_prompt, attachment_manifest, attachment_root_name, clip,
                                 is_visual_ocr, merge_attachment_sets)
-from .pipeline.images import ImageError, assemble_model_images
-from .pipeline.ocr import build_ocr_reader, prepare_visual_ocr_evidence
+from .pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
+from .pipeline.ocr import TileSink, build_ocr_reader, prepare_visual_ocr_evidence
 from .pipeline.pdf import PdfError
 from .pipeline.preprocess import preprocess_attachments
 from .providers import Provider, ProviderError, create_provider
+from .storage import StorageError, extension_for, safe_filename
+
+logger = logging.getLogger("docchat.chat")
 
 Emit = Callable[[dict[str, Any]], None]
 
@@ -56,9 +65,46 @@ class ChatRequest:
     model: str = ""
     conversation_id: str = ""
     context_size: int | None = None
-    disable_thinking: bool = True
+    disable_thinking: bool = True      # 모든 호출의 추론을 끈다
+    # 호출 종류별 추론 끄기(Step 6-0). None이면 서버 기본값(config). disable_thinking이 켜져 있으면 의미가 없다.
+    disable_thinking_grounding: bool | None = None
+    disable_thinking_ocr: bool | None = None
+    image_mode: str = ""      # "whole" | "tile". 비어 있으면 config.DEFAULT_IMAGE_MODE
     messages: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ThinkingPlan:
+    """이번 턴에서 호출 종류별로 추론을 끄고 보내는가. 추론을 끌 방법이 없는 provider면 controllable이 False다."""
+    answer: bool = False
+    grounding: bool = False
+    ocr: bool = False
+    controllable: bool = False
+
+    def to_public(self) -> dict[str, bool]:
+        return {"answer": self.answer, "grounding": self.grounding, "ocr": self.ocr}
+
+
+def plan_thinking(request: ChatRequest, provider: Provider) -> ThinkingPlan:
+    """"추론 끄기"(모든 호출)가 켜져 있으면 전부 끈다. 꺼져 있으면 bbox·전사만 각자의 선택을 따른다."""
+    if not provider.can_disable_thinking():
+        return ThinkingPlan()
+    everything = bool(request.disable_thinking)
+    return ThinkingPlan(
+        answer=everything,
+        grounding=everything or config.resolve_switch(request.disable_thinking_grounding, config.GROUNDING_DISABLE_THINKING),
+        ocr=everything or config.resolve_switch(request.disable_thinking_ocr, config.OCR_DISABLE_THINKING),
+        controllable=True,
+    )
+
+
+@dataclass
+class Answer:
+    text: str
+    artifacts: list[dict[str, Any]]
+    attachments: list[Attachment]
+    usage: VisionUsage
 
 
 def looks_like_false_attachment_refusal(text: str) -> bool:
@@ -141,6 +187,11 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
     if not messages or messages[-1]["role"] != "user":
         raise ChatError("마지막 메시지는 사용자 메시지여야 합니다.")
     try:
+        image_mode = config.resolve_image_mode(request.image_mode)
+    except ValueError as error:
+        raise ChatError(f"지원하지 않는 이미지 처리 방식입니다: {request.image_mode!r}. "
+                        "'whole'(전체) 또는 'tile'(타일) 중에서 고르세요.") from error
+    try:
         uploads = sanitize_uploads(request.attachments)
         provider = create_provider(request.provider, model=request.model, api_key=request.api_key,
                                    base_url=request.base_url, disable_thinking=request.disable_thinking)
@@ -152,40 +203,95 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         conversation_id=conversation_id or None, provider=request.provider, model=request.model, messages=messages)
     emit({"type": "conversation", "conversationId": conversation_id})
 
+    started = time.monotonic()
+    thinking = plan_thinking(request, provider)
     try:
-        text, artifacts, attachments = await _answer(store, provider, request, conversation_id, messages, uploads, emit)
-    except (ProviderError, UploadError, PdfError, ImageError) as error:
+        answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode, thinking)
+    except (ProviderError, UploadError, PdfError, ImageError, StorageError) as error:
         failure = ChatError(str(error), status=502 if isinstance(error, ProviderError) else 400)
-        await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [])
+        await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [], {})
         raise failure from error
     finally:
         await provider.aclose()
 
-    await _save_reply(store, request, conversation_id, messages, text, artifacts)
+    # 이 답을 어떤 방식으로 만들었는지 남긴다 — 모드를 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 알 수 있어야 한다.
+    meta: dict[str, Any] = {"imageMode": image_mode, "vision": answer.usage.to_public(),
+                            "elapsedMs": int((time.monotonic() - started) * 1000)}
+    if image_mode == "tile":
+        meta["tiling"] = config.tile_settings()
+    if thinking.controllable and provider.can_disable_thinking():
+        # 호출 종류별로 추론을 끄고 보냈는지. 서버가 그 요청을 거절했으면(can_disable_thinking이 False로 바뀐다) 적지 않는다.
+        meta["thinkingDisabled"] = thinking.to_public()
+    if provider.is_local and config.vision_max_tokens():
+        meta["visionMaxTokens"] = config.vision_max_tokens()
+    await _save_reply(store, request, conversation_id, messages, answer.text, answer.artifacts, meta)
     return {
         "type": "final",
         "conversationId": conversation_id,
-        "text": text,
-        "artifacts": artifacts,
-        "attachments": [item.to_public() for item in attachments],
+        "text": answer.text,
+        "artifacts": answer.artifacts,
+        "attachments": [item.to_public() for item in answer.attachments],
         "files": messages[-1].get("files") or [],
+        "meta": meta,
     }
 
 
-async def _save_reply(store: ChatStore, request: ChatRequest, conversation_id: str,
-                      messages: list[dict[str, Any]], text: str, artifacts: list[dict[str, Any]]) -> None:
-    reply = {"role": "assistant", "content": text, "artifacts": artifacts, "createdAt": now_ms()}
+async def _save_reply(store: ChatStore, request: ChatRequest, conversation_id: str, messages: list[dict[str, Any]],
+                      text: str, artifacts: list[dict[str, Any]], meta: dict[str, Any]) -> None:
+    reply = {"role": "assistant", "content": text, "artifacts": artifacts, "meta": meta, "createdAt": now_ms()}
     await store.save_conversation(conversation_id=conversation_id, provider=request.provider, model=request.model,
                                   messages=[*messages, reply])
 
 
+def _tile_source_loader(store: ChatStore, attachments: list[Attachment]):
+    """전사할 쪽 이미지 → 타일을 렌더할 원본 PDF. 같은 PDF는 한 요청 안에서 한 번만 읽는다."""
+    loaded: dict[str, bytes | None] = {}
+
+    async def load(page: Attachment) -> TileSource | None:
+        root = attachment_root_name(page.name)
+        if root not in loaded:
+            pdf = next((item for item in attachments if item.name == root and item.is_pdf), None)
+            data = pdf.data if pdf is not None else None
+            if data is None and pdf is not None and pdf.id is not None:
+                data = await store.load_attachment_data(pdf.id)
+            loaded[root] = data
+        data = loaded[root]
+        return TileSource(kind="pdf", data=data, page_number=page.page_number or 1) if data else None
+
+    return load
+
+
+def _tile_sink(store: ChatStore, conversation_id: str) -> TileSink | None:
+    """트레이스를 켰을 때만: 모델에 보낸 타일을 대화 폴더에 남긴다("모델이 실제로 본 이미지" 확인용).
+
+    같은 설정으로 만든 타일은 내용이 같으므로 이미 있으면 다시 쓰지 않는다.
+    """
+    if not config.debug_trace_enabled():
+        return None
+    settings = f"{config.TILE_SIZE}px-{config.TILE_RENDER_DPI}dpi-o{config.TILE_OVERLAP:g}"
+
+    async def save(name: str, purpose: str, images: list[ModelImage]) -> None:
+        folder = f"tiles/{safe_filename(name, max_length=60)}/{purpose}-{settings}"
+        for image in images:
+            row, col = image.tile or (1, 1)
+            target = f"{folder}/r{row:02d}c{col:02d}.{extension_for(image.mime, 'png')}"
+            try:
+                await asyncio.to_thread(store.files.write, conversation_id, target, image.data, keep_existing=True)
+            except StorageError as error:      # 확인용 파일이다. 못 써도 답변은 계속한다.
+                logger.warning("타일을 저장하지 못했습니다: %s (%s)", target, error)
+
+    return save
+
+
 async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, conversation_id: str,
-                  messages: list[dict[str, Any]], uploads: list[Attachment],
-                  emit: Emit) -> tuple[str, list[dict[str, Any]], list[Attachment]]:
+                  messages: list[dict[str, Any]], uploads: list[Attachment], emit: Emit,
+                  image_mode: str, thinking: ThinkingPlan) -> Answer:
     def progress(message: str) -> None:
         emit({"type": "progress", "message": message})
 
     progress("요청을 준비하는 중…")
+    usage = VisionUsage()
+    tile_sink = _tile_sink(store, conversation_id) if image_mode == "tile" else None
     attachments = await store.list_attachments(conversation_id)
 
     # 1) 새 업로드 전처리: 네이티브 텍스트 우선, 검사에서 탈락한 페이지만 이미지로 렌더
@@ -198,12 +304,18 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         _link_uploaded_files(messages[-1], uploads)
 
     # 2) 시각 OCR: needs_vlm 페이지만, 메인 답변 전에, 선택된 VLM에게 전사시킨다
+    #    (다른 방식 — 이미지 처리 방식·추론 여부 — 으로 전사해 둔 쪽은 이번 요청의 방식으로 다시 전사한다)
     attachments, transcribed = await prepare_visual_ocr_evidence(
         attachments,
-        read_image=build_ocr_reader(provider),
+        read_image=build_ocr_reader(provider, image_mode=image_mode, usage=usage, on_progress=progress,
+                                    load_tile_source=_tile_source_loader(store, attachments), on_tiles=tile_sink,
+                                    disable_thinking=thinking.ocr),
         load_data=lambda item: store.load_attachment_data(item.id) if item.id is not None else _none(),
         on_progress=progress,
         cache_namespace=provider.cache_namespace,
+        image_mode=image_mode,
+        # 추론을 끌 수 있는 provider인데 끄지 않고 보내는 경우만 따로 표시한다(그 밖에는 Step 6-0 이전과 같은 기록).
+        thinking=thinking.controllable and not thinking.ocr,
     )
     if transcribed:
         await store.save_attachments(conversation_id, attachments)
@@ -221,7 +333,9 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         if image.data is None and image.id is not None:
             image.data = await store.load_attachment_data(image.id)
         if image.data:
-            model_images += assemble_model_images(image.name, image.mime, image.data, purpose="analysis")
+            # 답변 호출의 이미지는 모드와 무관하게 전체 한 장이다(타일은 전사·bbox 호출에만 적용, Step 8에서 따로 다룬다).
+            model_images += await assemble_model_images(image.name, image.mime, image.data, purpose="analysis",
+                                                        mode=image_mode)
 
     tools = available_tools(attachments)
     history = compact_conversation_messages(messages[-config.MAX_HISTORY_MESSAGES:], history_budget)
@@ -237,6 +351,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     tool_context = ToolContext(
         provider=provider, attachments=attachments, store=store, conversation_id=conversation_id,
         default_read_chars=max(1000, min(16_000, attachment_budget // 3)), on_progress=progress,
+        image_mode=image_mode, usage=usage, on_tiles=tile_sink, disable_thinking=thinking.grounding,
     )
     progress("답변을 생성하는 중…")
     language_hint = reply_language_hint(latest_user)
@@ -246,10 +361,12 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         language_hint=language_hint,
     )
     text = result.text
+    usage.answer_calls += result.model_calls
 
     # 5) 내용을 이미 줬는데 "첨부를 볼 수 없다"고 하면 한 번만 바로잡는다
     if has_usable_attachment_content(attachments) and looks_like_false_attachment_refusal(text):
         progress("첨부 내용을 근거로 다시 답변하는 중…")
+        usage.answer_calls += 1
         retry = await provider.analyze(
             [*model_messages, {"role": "assistant", "content": text},
              {"role": "user", "content": f"{FALSE_REFUSAL_CORRECTION}\n{language_hint}".strip()}],
@@ -258,7 +375,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         text = retry.text.strip() or text
     if not text.strip():
         raise ProviderError("모델이 빈 응답을 돌려주었습니다. 다시 시도하거나 다른 모델을 선택하세요.")
-    return text, tool_context.artifacts, attachments
+    return Answer(text=text, artifacts=tool_context.artifacts, attachments=attachments, usage=usage)
 
 
 async def _none() -> None:

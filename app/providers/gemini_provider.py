@@ -71,7 +71,9 @@ class GeminiProvider(Provider):
         return contents
 
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
-                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2) -> ModelResponse:
+                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
+                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
+        # disable_thinking·max_tokens는 로컬 provider용이다. 여기서는 쓰지 않는다(실제 API로 확인한 적이 없다).
         try:
             return await self._complete(messages, images, tools, temperature)
         except ContextWindowError:

@@ -7,10 +7,17 @@
   vector_drawing.pdf    선·사각형뿐이고 글자가 거의 없는 도면 → vector-outlines → 비전 전사 대상
   mixed_3pages.pdf      1쪽 네이티브 / 2쪽 스캔 / 3쪽 벡터
   sheet_with_stamp.png  승인 도장·서명·치수선이 있는 이미지 → inspect_visual(bbox) 시험용
+
+타일링(Step 5) 비교용 — A1 @ 200 DPI(6622 x 4677px) 평면도. 작은 글자가 넓게 흩어져 있어 3072px로 줄이면 뭉개진다.
+  large_plan.png            업로드 이미지(원본에서 타일을 자른다)
+  large_scanned_plan.pdf    같은 그림을 A1 한 쪽에 박은 "스캔본"(타일 영역만 PDF에서 렌더한다)
+  large_plan.expect.txt     도면에 실제로 적힌 글자(한 줄에 하나) — 전사 결과와 대조
+  large_plan.truth.json     소화기 표시(빨간 원)의 정답 박스와 음성 대조(파란 사각형) — bbox IoU 계산
 """
 from __future__ import annotations
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -91,6 +98,69 @@ def stamped_sheet() -> Image.Image:
     return image
 
 
+PLAN_SIZE = (6622, 4677)       # A1 가로 @ 200 DPI
+PLAN_PAGE = (2384, 1684)       # A1 가로(pt)
+ROOM_USES = ("OFFICE", "STORAGE", "MEETING", "PANTRY", "SERVER", "LOBBY", "ARCHIVE", "LAB", "COPY", "LOUNGE", "WC", "PLANT")
+FINISHES = ("VINYL TILE", "CARPET", "EPOXY", "CERAMIC", "RAISED FLOOR")
+RED, BLUE = (215, 30, 30), (30, 70, 215)
+
+
+def floor_plan() -> tuple[Image.Image, list[str], dict]:
+    """(그림, 도면에 적힌 글자 목록, bbox 정답). 방 12개 · 방 이름·면적·치수 · 실내 마감표 · 표제란."""
+    width, height = PLAN_SIZE
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    written: list[str] = []
+    targets: list[dict] = []
+    distractors: list[dict] = []
+
+    def write(position: tuple[int, int], text: str, size: int) -> None:
+        draw.text(position, text, font=font(size), fill="black")
+        written.append(text)
+
+    draw.rectangle((60, 60, width - 60, height - 60), outline="black", width=6)
+    left, top, room_width, room_height = 300, 300, 1450, 1150
+    for index in range(12):
+        row, col = divmod(index, 4)
+        x0, y0 = left + col * room_width, top + row * room_height
+        x1, y1 = x0 + room_width, y0 + room_height
+        draw.rectangle((x0, y0, x1, y1), outline="black", width=10)                     # 벽
+        draw.arc((x0 - 130, y1 - 380, x0 + 130, y1 - 120), 270, 360, fill="black", width=3)   # 문
+        write((x0 + 80, y0 + 90), f"ROOM {101 + index} {ROOM_USES[index]}", 28)
+        write((x0 + 80, y0 + 140), f"AREA {16 + index}.{(index * 7) % 10} m2", 22)
+        draw.line((x0 + 60, y1 - 70, x1 - 60, y1 - 70), fill="black", width=2)             # 치수선
+        write((x0 + room_width // 2 - 40, y1 - 110), str(3600 + index * 125), 24)
+        # 소화기 표시(빨간 원) = 찾을 대상, 파란 사각형 = 음성 대조
+        if index in (0, 5, 6, 11):
+            cx, cy = x0 + 1100, y0 + 500
+            draw.ellipse((cx - 50, cy - 50, cx + 50, cy + 50), fill=RED)
+            targets.append({"label": f"fire extinguisher, room {101 + index}", "bbox": [cx - 50, cy - 50, cx + 50, cy + 50]})
+        if index in (2, 9):
+            bx, by = x0 + 1050, y0 + 450
+            draw.rectangle((bx, by, bx + 100, by + 100), fill=BLUE)
+            distractors.append({"label": f"blue square, room {101 + index}", "bbox": [bx, by, bx + 100, by + 100]})
+
+    # 실내 마감표(작은 글자)
+    table_left, table_top = 300, 3880
+    for line, cells in enumerate([("NO", "ROOM", "FLOOR FINISH", "CEILING HT")] + [
+            (str(101 + index), ROOM_USES[index], FINISHES[index % len(FINISHES)], f"{2400 + index * 50} mm")
+            for index in range(5)]):
+        y = table_top + line * 62
+        draw.rectangle((table_left, y, table_left + 2300, y + 62), outline="black", width=2)
+        for x, value in zip((20, 240, 760, 1600), cells):
+            draw.text((table_left + x, y + 16), value, font=font(24), fill="black")
+        written.append("  ".join(cells))
+
+    # 표제란
+    block_left, block_top = width - 1900, height - 700
+    draw.rectangle((block_left, block_top, width - 120, height - 120), outline="black", width=5)
+    for line, text in enumerate(("PROJECT: RIVERSIDE OFFICE BLOCK B", "TITLE: SECOND FLOOR PLAN", "DWG NO: AR-2044-C",
+                                 "REV: B   SCALE: 1:50   DATE: 2026-05-08", "DRAWN: J. MOON   CHECKED: Y. SEO")):
+        write((block_left + 50, block_top + 50 + line * 100), text, 36)
+    truth = {"image": {"width": width, "height": height}, "targets": targets, "distractors": distractors}
+    return image, written, truth
+
+
 def png_of(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -134,6 +204,19 @@ def main() -> int:
     save_pdf("vector_drawing.pdf", add_vector_page)
     save_pdf("mixed_3pages.pdf", add_native_page, add_scanned_page, add_vector_page)
     stamped_sheet().save(OUT / "sheet_with_stamp.png")
+
+    plan, written, truth = floor_plan()
+    plan_png = png_of(plan)
+    (OUT / "large_plan.png").write_bytes(plan_png)
+    document = pymupdf.open()
+    page = document.new_page(width=PLAN_PAGE[0], height=PLAN_PAGE[1])
+    page.insert_image(page.rect, stream=plan_png)
+    document.set_metadata({"title": "large_scanned_plan.pdf", "author": "DocChat sample generator"})
+    document.save(OUT / "large_scanned_plan.pdf", deflate=True)     # 압축하지 않으면 90MB라 업로드 한도(64MB)를 넘는다
+    document.close()
+    (OUT / "large_plan.expect.txt").write_text("\n".join(written) + "\n", encoding="utf-8")
+    (OUT / "large_plan.truth.json").write_text(json.dumps(truth, indent=2), encoding="utf-8")
+
     for path in sorted(OUT.iterdir()):
         print(f"{path.name:24s} {path.stat().st_size / 1024:8.1f} KB")
     print(f"\n샘플을 만들었습니다: {OUT}")

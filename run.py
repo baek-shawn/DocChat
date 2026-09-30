@@ -21,6 +21,7 @@ def main() -> None:
     if arguments.host not in ("127.0.0.1", "localhost", "::1"):
         print("경고: localhost가 아닌 주소에 바인딩합니다. 이 서버에는 인증이 없으니 신뢰할 수 있는 네트워크에서만 쓰세요.")
     print(f"DocChat: http://{arguments.host}:{arguments.port}")
+    print(f"설정 파일: {config.LOADED_ENV_FILE or '없음(.env.example을 .env로 복사해 쓸 수 있습니다)'}")
     print("API key는 요청마다 전달받아 사용하며 디스크에 저장하지 않습니다.")
     uvicorn.run("app.main:app", host=arguments.host, port=arguments.port, reload=arguments.reload, log_level="info")
 

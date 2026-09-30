@@ -4,13 +4,18 @@ handler(body) 반환값:
   - str                                   → assistant 본문
   - {"status": 400, "body": {...}}        → HTTP 오류
   - {"text": "...", "finish_reason": "length", "tool_calls": [{"name": "...", "arguments": {...}}]}
+  - {"text": "", "reasoning": "...", "finish_reason": "length"}   → 추론을 본문과 따로 주는 서버(vLLM의 reasoning_content)
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+
+from PIL import Image
 
 Handler = Callable[[dict[str, Any]], Any]
 
@@ -60,6 +65,8 @@ class MockOpenAIServer:
                     return
                 spec = outcome if isinstance(outcome, dict) else {"text": str(outcome)}
                 message: dict[str, Any] = {"role": "assistant", "content": spec.get("text") or ""}
+                if spec.get("reasoning"):
+                    message["reasoning_content"] = spec["reasoning"]
                 if spec.get("tool_calls"):
                     message["tool_calls"] = [
                         {"id": f"call_{index}", "type": "function",
@@ -120,6 +127,26 @@ def image_count(body: dict[str, Any]) -> int:
         for part in message["content"]
         if part.get("type") == "image_url"
     )
+
+
+def request_images(body: dict[str, Any]) -> list[Image.Image]:
+    """요청에 실린 이미지를 실제로 디코드한다 — 모델이 "무엇을 봤는지"(크기·내용)를 검사할 때 쓴다."""
+    images = []
+    for message in body.get("messages", []):
+        if not isinstance(message.get("content"), list):
+            continue
+        for part in message["content"]:
+            if part.get("type") == "image_url":
+                encoded = part["image_url"]["url"].split(",", 1)[1]
+                image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+                image.load()
+                images.append(image)
+    return images
+
+
+def thinking_disabled(body: dict[str, Any]) -> bool:
+    """이 요청이 추론을 끄고 왔는가(`chat_template_kwargs.enable_thinking == false`)."""
+    return (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False
 
 
 def is_ocr_call(body: dict[str, Any]) -> bool:

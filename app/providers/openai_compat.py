@@ -95,7 +95,12 @@ class OpenAICompatProvider(Provider):
         self._send_temperature = True
         # 추론형 모델(Qwen3 계열 등)은 "안녕" 한마디에도 수천 토큰을 생각한다(실측: vLLM Qwen3.5에서 0.3초 vs 90초 초과).
         # vLLM·llama.cpp는 chat_template_kwargs로 끌 수 있다. 이 필드를 거절하는 서버면 한 번 실패한 뒤 빼고 다시 보낸다.
+        # _disable_thinking은 모든 호출에 적용되는 설정이고, 호출 하나만 끄는 것은 analyze(disable_thinking=True)다.
         self._disable_thinking = disable_thinking and is_local
+        self._thinking_control = is_local      # 서버가 그 필드를 거절하면 False — 이후로는 보내지 않는다
+
+    def can_disable_thinking(self) -> bool:
+        return self._thinking_control
 
     async def aclose(self) -> None:
         await self._client.close()
@@ -117,41 +122,54 @@ class OpenAICompatProvider(Provider):
         return self._describe(error)
 
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
-                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2) -> ModelResponse:
+                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
+                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
+        # 출력 상한은 폭주가 확인된 로컬 서버에만 보낸다. 클라우드 API는 이름도 의미도 달라(예: max_completion_tokens)
+        # 실제로 확인하지 않고는 넣지 않는다.
+        limit = int(max_tokens) if max_tokens and max_tokens > 0 and self.is_local else None
         try:
-            return await self._complete(messages, images, tools, temperature)
+            return await self._complete(messages, images, tools, temperature, disable_thinking, limit)
         except ContextWindowError:
             pass
         # 로컬 서버는 예산을 넘긴 프롬프트를 잘라 주지 않는다 → 두 단계로 줄여 다시 보낸다.
         try:
-            return await self._complete(compact_messages(messages, 1), images, tools, temperature)
+            return await self._complete(compact_messages(messages, 1), images, tools, temperature, disable_thinking, limit)
         except ContextWindowError:
-            return await self._complete(compact_messages(messages, 2), (images or [])[:1] or None, tools, temperature)
+            return await self._complete(compact_messages(messages, 2), (images or [])[:1] or None, tools, temperature,
+                                        disable_thinking, limit)
 
     async def _complete(self, messages: list[Message], images: list[ModelImage] | None,
-                        tools: list[ToolSpec] | None, temperature: float) -> ModelResponse:
+                        tools: list[ToolSpec] | None, temperature: float, disable_thinking: bool = False,
+                        max_tokens: int | None = None) -> ModelResponse:
         request: dict[str, Any] = {"model": self.model, "messages": to_wire_messages(messages, images)}
         if self._send_temperature:
             request["temperature"] = temperature
         if tools:
             request["tools"] = to_wire_tools(tools)
             request["tool_choice"] = "auto"
-        if self._disable_thinking:
+        thinking_off = self._thinking_control and (self._disable_thinking or disable_thinking)
+        if thinking_off:
             request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        if max_tokens:
+            request["max_tokens"] = max_tokens
         try:
             completion = await self._client.chat.completions.create(**request)
         except openai.APIStatusError as error:
             detail = self._describe(error)
             if is_context_window_error(detail):
+                if max_tokens:
+                    # vLLM은 "입력 + 출력 상한"이 컨텍스트를 넘으면 생성하지 않고 거절한다. 남은 자리가 상한보다 작다는
+                    # 뜻이므로 상한을 빼고 보낸다 — 그래도 출력은 남은 자리(< 상한)를 넘지 못한다.
+                    return await self._complete(messages, images, tools, temperature, disable_thinking, None)
                 raise ContextWindowError(detail) from error
-            if self._disable_thinking and error.status_code in (400, 422) and re.search(
+            if thinking_off and error.status_code in (400, 422) and re.search(
                     r"chat_template_kwargs|enable_thinking|extra|unknown|unrecognized|unexpected", detail, re.IGNORECASE):
-                self._disable_thinking = False
-                return await self._complete(messages, images, tools, temperature)
+                self._thinking_control = False
+                return await self._complete(messages, images, tools, temperature, disable_thinking, max_tokens)
             if self._send_temperature and error.status_code == 400 and "temperature" in detail.lower():
                 # 일부 추론형 모델은 기본값 외의 temperature를 거절한다.
                 self._send_temperature = False
-                return await self._complete(messages, images, tools, temperature)
+                return await self._complete(messages, images, tools, temperature, disable_thinking, max_tokens)
             if tools and looks_like_tools_unsupported(error.status_code, detail):
                 raise ToolsUnsupportedError(detail) from error
             raise ProviderError(detail) from error
@@ -161,10 +179,15 @@ class OpenAICompatProvider(Provider):
         choice = completion.choices[0] if getattr(completion, "choices", None) else None
         if choice is None or choice.message is None:
             raise ProviderError("모델 엔드포인트가 assistant 메시지를 돌려주지 않았습니다.")
+        reasoning = getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None)
+        usage = getattr(completion, "usage", None)
         return ModelResponse(
             text=(choice.message.content or "").strip(),
             tool_calls=parse_tool_calls(getattr(choice.message, "tool_calls", None)),
             finish_reason=str(choice.finish_reason or ""),
+            reasoning=reasoning.strip() if isinstance(reasoning, str) else "",
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
         )
 
     @staticmethod

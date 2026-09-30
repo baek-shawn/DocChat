@@ -1,5 +1,11 @@
 """모델 연결의 단일 인터페이스: `analyze(messages, images=None, tools=None) -> ModelResponse`.
 
+호출마다 달라지는 선택 사항은 키워드 인자로 받는다.
+    temperature       : 표본 온도
+    disable_thinking  : 이 호출만 추론을 끈다(Step 6-0). provider를 만들 때 이미 껐다면 그대로 꺼져 있다.
+                        추론을 끄는 방법이 있는 로컬(OpenAI 호환) provider만 따르고 나머지는 무시한다
+    max_tokens        : 이 호출의 출력 토큰 상한(추론 토큰 포함). None이면 보내지 않는다. 역시 로컬 provider만 따른다
+
 내부 메시지 형식(모든 provider가 공유):
     {"role": "system",    "content": str}
     {"role": "user",      "content": str}
@@ -41,6 +47,12 @@ class ModelResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
     raw_assistant: Any = None  # provider가 다음 턴에 그대로 돌려받고 싶은 원본(예: Gemini Content)
+    # 서버가 본문과 따로 떼어 준 추론 글(vLLM·llama.cpp의 reasoning_content). 떼어 주지 않는 서버면 빈 문자열이다.
+    # 사용자에게 보여 주지 않는다 — 출력 한도에서 끊긴 본문이 추론인지 답인지 가릴 때만 쓴다.
+    reasoning: str = ""
+    # 서버가 알려 준 토큰 수(없으면 None). 출력 토큰에는 추론 토큰이 포함된다.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 class ProviderError(Exception):
@@ -128,9 +140,14 @@ class Provider(ABC):
     def cache_namespace(self) -> str:
         return f"{self.name}:{self.base_url}:{self.model}"
 
+    def can_disable_thinking(self) -> bool:
+        """이 provider가 추론을 끄라는 요청을 실제로 보내는가(답변 메타데이터에 적을 때 쓴다)."""
+        return False
+
     @abstractmethod
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
-                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2) -> ModelResponse:
+                      tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
+                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
         ...
 
     @abstractmethod

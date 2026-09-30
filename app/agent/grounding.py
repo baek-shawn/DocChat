@@ -27,11 +27,19 @@ class VisualInspection:
     text: str = ""
     boxes: list[dict[str, Any]] = field(default_factory=list)
     structured: bool = False
+    # 출력 상한에 닿아 끊긴 호출(Step 6-0). 끊긴 글은 추론이거나 미완성 JSON이라 결과로 쓰지 않는다 → text·boxes는 비어 있다.
+    cut_off: bool = False
 
 
 def _load_json(raw: str) -> Any:
+    """객체나 배열만 돌려준다. 그 밖의 JSON 값은 구조화된 답이 아니다.
+
+    `3600`, `"none"`, `true`처럼 값 하나만 온 응답도 JSON으로는 읽힌다 — 그대로 돌려주면 뒤에서 객체로 다루다 예외가 난다.
+    """
     try:
-        return json.loads(raw)
+        value = json.loads(raw)
+        if isinstance(value, (dict, list)):
+            return value
     except ValueError:
         pass
     decoder = json.JSONDecoder()
@@ -134,3 +142,59 @@ def map_box_to_source(box: dict[str, Any], source_box: tuple[float, float, float
     width, height = x1 - x0, y1 - y0
     return {**box, "x": x0 + box["x"] * width, "y": y0 + box["y"] * height,
             "w": box["w"] * width, "h": box["h"] * height}
+
+
+# --------------------------------------------------------------------------- 타일 박스 병합
+def _overlap(first: dict[str, Any], second: dict[str, Any]) -> tuple[float, float]:
+    """(IoU, 작은 박스가 겹친 비율)"""
+    width = min(first["x"] + first["w"], second["x"] + second["w"]) - max(first["x"], second["x"])
+    height = min(first["y"] + first["h"], second["y"] + second["h"]) - max(first["y"], second["y"])
+    if width <= 0 or height <= 0:
+        return 0.0, 0.0
+    shared = width * height
+    first_area, second_area = first["w"] * first["h"], second["w"] * second["h"]
+    smaller = min(first_area, second_area)
+    union = first_area + second_area - shared
+    return (shared / union if union > 0 else 0.0), (shared / smaller if smaller > 0 else 0.0)
+
+
+def _rank(box: dict[str, Any]) -> tuple[float, float]:
+    confidence = box.get("confidence")
+    return (float(confidence) if isinstance(confidence, (int, float)) else -1.0, box["w"] * box["h"])
+
+
+def _combine(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    """영역은 두 박스를 모두 덮는 사각형, 라벨·종류·신뢰도는 더 믿을 만한 쪽(신뢰도 → 넓이 순)의 것."""
+    x0, y0 = min(first["x"], second["x"]), min(first["y"], second["y"])
+    x1 = max(first["x"] + first["w"], second["x"] + second["w"])
+    y1 = max(first["y"] + first["h"], second["y"] + second["h"])
+    better = first if _rank(first) >= _rank(second) else second
+    return {**better, "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def merge_tile_boxes(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """타일별 박스 목록(이미 전체 좌표로 옮긴 것)을 한 목록으로 합친다.
+
+    타일은 서로 겹치므로 겹침 영역에 있는 대상은 두 타일에서 한 번씩, 모두 두 번 잡힌다. **서로 다른 타일**에서 나온
+    **같은 종류**의 박스가 아래 중 하나를 만족하면 같은 대상으로 보고 하나로 합친다.
+      - IoU ≥ TILE_BOX_MERGE_IOU                         (두 타일이 대상을 온전히 봤다)
+      - 작은 박스의 TILE_BOX_MERGE_CONTAINMENT 이상이 겹침  (한 타일은 가장자리에서 잘린 일부만 봤다)
+    같은 타일 안의 박스끼리는 합치지 않는다 — 모델이 한 이미지에서 따로 잡은 것은 전체 모드와 똑같이 그대로 둔다.
+    """
+    merged: list[tuple[set[int], dict[str, Any]]] = []
+    for index, boxes in enumerate(groups):
+        for box in boxes:
+            match = None
+            for position, (owners, existing) in enumerate(merged):
+                if index in owners or existing.get("type") != box.get("type"):
+                    continue
+                iou, contained = _overlap(existing, box)
+                if iou >= config.TILE_BOX_MERGE_IOU or contained >= config.TILE_BOX_MERGE_CONTAINMENT:
+                    match = position
+                    break
+            if match is None:
+                merged.append(({index}, dict(box)))
+            else:
+                owners, existing = merged[match]
+                merged[match] = (owners | {index}, _combine(existing, box))
+    return [box for _owners, box in merged]

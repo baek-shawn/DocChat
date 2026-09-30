@@ -26,6 +26,8 @@ for stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+from app import config as _config  # noqa: E402,F401 — `.env`를 먼저 읽는다(DOCCHAT_E2E_* 도 거기에 둘 수 있다)
+
 SAMPLES = ROOT / "samples"
 CONNECTION = {
     "provider": os.environ.get("DOCCHAT_E2E_PROVIDER", "openaiCompatible"),
@@ -42,8 +44,9 @@ def upload(name: str) -> dict:
     return {"name": name, "mime": MIMES[path.suffix], "size": len(data), "base64": base64.b64encode(data).decode("ascii")}
 
 
-def ask(client, text: str, files: list[str] | None = None, conversation_id: str = "", history: list[dict] | None = None) -> dict:
-    body = {**CONNECTION, "model": MODEL, "contextSize": 8192, "conversationId": conversation_id,
+def ask(client, text: str, files: list[str] | None = None, conversation_id: str = "", history: list[dict] | None = None,
+        mode: str = "") -> dict:
+    body = {**CONNECTION, "model": MODEL, "contextSize": 8192, "conversationId": conversation_id, "imageMode": mode,
             "messages": [*(history or []), {"role": "user", "content": text}],
             "attachments": [upload(name) for name in files or []]}
     started = time.time()
@@ -70,7 +73,10 @@ def main() -> int:
     if not (SAMPLES / "native_spec.pdf").exists():
         print("samples/ 가 없습니다. 먼저 `uv run python scripts/make_samples.py`를 실행하세요.")
         return 2
-    os.environ["DOCCHAT_DB_PATH"] = str(Path(tempfile.mkdtemp(prefix="docchat-e2e-")) / "e2e.sqlite")
+    scratch = Path(tempfile.mkdtemp(prefix="docchat-e2e-"))
+    # `.env`에 실제 위치가 적혀 있어도 점검은 임시 폴더에서만 한다(사용자 데이터를 건드리지 않는다).
+    os.environ["DOCCHAT_DB_PATH"] = str(scratch / "e2e.sqlite")
+    os.environ["DOCCHAT_FILES_DIR"] = str(scratch / "files")
     from fastapi.testclient import TestClient
 
     from app.main import create_app
@@ -135,6 +141,35 @@ def main() -> int:
                 print(f"            ↳ {str(reply.get('text', reply.get('error', ''))).strip().splitlines()[0][:90] if reply.get('text') or reply.get('error') else ''}")
         check("위치 질문에서 도구 호출 (기준 ≥2/3)", called["location"] >= 2, f"{called['location']}/3")
         check("비위치 질문에서 도구 미호출 (기준 오호출 ≤1/3)", called["plain"] <= 1, f"오호출 {called['plain']}/3")
+
+        # 7~8) 타일 모드(Step 5) — A1 크기 스캔 도면(6622 x 4677px, 작은 글자가 넓게 흩어져 있다).
+        #    타일 전용 안내문(TILE_OCR_NOTE, TILE_GROUNDING_NOTE)은 후보 1개씩이고, 아래 기준은 결과를 보기 전에 고정했다.
+        #    기준을 못 맞추면 문구를 바꿔 가며 다시 재지 않고 한계로 기록한다(CLAUDE.md 프롬프트 규율).
+        if not (SAMPLES / "large_scanned_plan.pdf").exists():
+            print("\n── 7~8) 타일 모드: samples/large_scanned_plan.pdf 가 없어 건너뜁니다(make_samples.py를 다시 실행하세요).")
+            check("타일 모드 샘플 있음", False, "scripts/make_samples.py 재실행 필요")
+        else:
+            data = ask(client, "이 도면의 DWG NO와 REV를 알려 줘.", ["large_scanned_plan.pdf"], mode="tile")
+            show("7) 타일 모드 전사 → 타일별 전사를 이어 붙인 글로 답변", data)
+            vision = data.get("meta", {}).get("vision", {})
+            attachments = client.portal.call(client.app.state.store.list_attachments, data.get("conversationId", ""))
+            evidence = "\n".join(item.text for item in attachments if item.name.endswith("visual OCR"))
+            print("   ▸ " + (evidence.splitlines()[2] if len(evidence.splitlines()) > 2 else "(전사 없음)")[:200])
+            check("타일로 나눠 전사", data.get("meta", {}).get("imageMode") == "tile" and vision.get("tiles", 0) > 1,
+                  f"타일 {vision.get('tiles')}장 · 전사 호출 {vision.get('ocrCalls')}회")
+            check("타일 전사에 도면 번호가 있음", "AR-2044-C" in evidence, "기대값 AR-2044-C")
+            unread = evidence.count("[OCR FAILED")
+            check("전사 실패 타일 (기준 ≤ 20%)", vision.get("tiles", 0) > 0 and unread <= vision["tiles"] * 0.2,
+                  f"{unread}/{vision.get('tiles')}장")
+            check("타일 모드 답변에 도면 번호", "AR-2044-C" in data.get("text", ""), "기대값 AR-2044-C")
+
+            data = ask(client, "소화기 표시(빨간 원)가 어디 있는지 이미지 위에 표시해 줘.", ["large_plan.png"], mode="tile")
+            show("8) 타일 모드 inspect_visual — 원본에서 자른 타일마다 분리된 bbox 호출", data)
+            vision = data.get("meta", {}).get("vision", {})
+            artifacts = data.get("artifacts", [])
+            check("타일 모드 inspect_visual 아티팩트 생성", bool(artifacts),
+                  f"타일 {vision.get('tiles')}장 · bbox 호출 {vision.get('groundingCalls')}회")
+            check("타일 모드 bbox 1개 이상 측정", any(a.get("boxes") for a in artifacts))
 
     failed = [name for name, passed, _ in results if not passed]
     print(f"\n결과: {len(results) - len(failed)}/{len(results)} 통과" + (f" · 실패: {', '.join(failed)}" if failed else ""))

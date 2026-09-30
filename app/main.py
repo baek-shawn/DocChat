@@ -27,7 +27,7 @@ def _ignore_client_disconnects(loop: asyncio.AbstractEventLoop, context: dict) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.get_running_loop().set_exception_handler(_ignore_client_disconnects)
-    app.state.store = await ChatStore(config.database_path()).open()
+    app.state.store = await ChatStore(config.database_path(), files_dir=config.files_dir()).open()
     try:
         yield
     finally:
@@ -74,6 +74,15 @@ def create_app() -> FastAPI:
                 "ocrConcurrency": config.OCR_CONCURRENCY,
                 "groundingRetryCount": config.GROUNDING_RETRY_COUNT,
                 "pdfVisualPageLimit": config.pdf_visual_page_limit(),
+            },
+            # 요청에 imageMode가 없을 때 쓰는 기본값과 지금 적용 중인 타일 설정(설정 화면 표시용)
+            "imageMode": config.DEFAULT_IMAGE_MODE,
+            "tiling": config.tile_settings(),
+            # 전사·bbox 호출의 폭주 막기(Step 6-0): 호출별 추론 끄기의 기본값과 출력 상한(0 = 상한 없음)
+            "vision": {
+                "disableThinkingGrounding": config.GROUNDING_DISABLE_THINKING,
+                "disableThinkingOcr": config.OCR_DISABLE_THINKING,
+                "maxTokens": config.VISION_MAX_TOKENS,
             },
         }
 
