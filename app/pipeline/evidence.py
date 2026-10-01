@@ -99,11 +99,47 @@ def clip_visual_ocr_coverage(text: str, max_chars: int) -> str:
 @dataclass
 class PromptContext:
     documents: list[Attachment]   # 텍스트가 예산에 맞게 잘린 복사본
-    images: list[Attachment]      # 메인 요청에 이미지로 직접 실을 첨부(바이트는 호출부에서 로드)
+    # 답변 호출에 이미지로 실을 첨부(바이트는 호출부에서 로드). 아직 렌더하지 않은 PDF 쪽은 자리표시(`pending_page_image`)다.
+    images: list[Attachment]
+    image_candidates: int = 0     # 모드상 실을 수 있었던 이미지 수. 상한 때문에 뺀 수 = image_candidates - len(images)
+
+
+def pending_page_image(root: str, page_number: int) -> Attachment:
+    """아직 렌더하지 않은 PDF 쪽의 자리표시 — id도 바이트도 없다. 호출부(chat_service)가 렌더해 채운다."""
+    return Attachment(name=page_image_name(root, page_number), mime="image/png", kind="image", page_number=page_number)
+
+
+def is_pending_page_image(item: Attachment) -> bool:
+    return item.is_image and item.id is None and item.data is None and not item.has_data and bool(item.page_number)
+
+
+def _answer_image_groups(candidates: list[Attachment], answer_images: str) -> dict[str, list[Attachment]]:
+    """답변 이미지 모드(Step 8)에 따라 실을 수 있는 이미지를 업로드 묶음별로 모은다.
+
+    off: 없음 · uploads: 업로드 이미지만(§5.4) · whole: 업로드 이미지 + PDF의 모든 쪽(렌더하지 않은 쪽은 자리표시).
+    """
+    groups: dict[str, list[Attachment]] = {}
+    if answer_images == "off":
+        return groups
+    for item in candidates:
+        if item.is_image and item.send_to_model:      # 업로드 이미지
+            groups.setdefault(attachment_root_name(item.name), []).append(item)
+    if answer_images != "whole":
+        return groups
+    for pdf in candidates:
+        if not pdf.is_pdf or pdf.kind != "pdf":
+            continue
+        rendered = {item.page_number: item for item in candidates
+                    if item.is_image and item.page_number and attachment_root_name(item.name) == pdf.name
+                    and (item.has_data or item.data)}
+        total = pdf.total_pages or max(rendered, default=0)
+        groups.setdefault(pdf.name, []).extend(
+            rendered.get(number) or pending_page_image(pdf.name, number) for number in range(1, total + 1))
+    return groups
 
 
 def attachment_context_for_prompt(prompt: str, attachments: list[Attachment], total_text_chars: int,
-                                  max_images: int) -> PromptContext:
+                                  max_images: int, *, answer_images: str = "uploads") -> PromptContext:
     if not attachments:
         return PromptContext([], [])
     lower = str(prompt or "").lower()
@@ -119,11 +155,8 @@ def attachment_context_for_prompt(prompt: str, attachments: list[Attachment], to
         clipped = clip_visual_ocr_coverage(text, per_file) if is_visual_ocr(item) else clip(text, per_file)
         documents.append(replace(item, text=clipped, data=None, source_data=None))
 
-    # 문서별로 한 장씩 돌아가며 뽑아, 긴 문서 하나가 다른 업로드를 밀어내지 못하게 한다.
-    groups: dict[str, list[Attachment]] = {}
-    for item in candidates:
-        if item.is_image and item.send_to_model:
-            groups.setdefault(attachment_root_name(item.name), []).append(item)
+    # 문서별로 한 장씩 돌아가며 뽑아, 긴 문서 하나가 다른 업로드를 밀어내지 못하게 한다(쪽은 쪽 순서).
+    groups = _answer_image_groups(candidates, answer_images)
     images: list[Attachment] = []
     round_index = 0
     while len(images) < max_images:
@@ -137,4 +170,4 @@ def attachment_context_for_prompt(prompt: str, attachments: list[Attachment], to
         if not added:
             break
         round_index += 1
-    return PromptContext(documents, images)
+    return PromptContext(documents, images, sum(len(group) for group in groups.values()))

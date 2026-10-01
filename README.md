@@ -47,13 +47,29 @@ uv run python run.py
 | 모델에 보내는 것 | 쪽·이미지 한 장(긴 변 3072px·800만 픽셀로 축소) | 원본을 겹치는 조각으로 나눠 조각마다 한 장(조각당 최대 1536px) |
 | A1 도면(200 DPI)의 글자 | 6622px → 3072px로 줄어 작은 글자가 뭉개짐 | 줄이지 않음 |
 | 호출 수 | 쪽당 1회 | 쪽당 타일 수만큼(A1 20회, A0 35회). 내용이 없는 타일은 보내지 않음 |
-| 적용 대상 | — | **전사(OCR)와 bbox(`inspect_visual`) 호출만.** 답변 호출의 이미지는 어느 방식이든 전체 한 장 |
+| 적용 대상 | — | **전사(OCR)와 bbox(`inspect_visual`) 호출만.** 답변 호출의 이미지는 어느 방식이든 전체 한 장(무엇을 실을지는 아래 "답변 호출 이미지"가 따로 정함) |
 
 - PDF는 쪽 전체를 고해상도로 만든 뒤 자르지 않고 **타일 영역만 바로 렌더**합니다. 스캔 PDF는 박힌 이미지의 원래 해상도까지만 올립니다.
 - 업로드 이미지는 보관해 둔 **원본**에서 자릅니다(모델 전송용 3072px 사본이 아니라).
 - 원본의 긴 변이 2048px 이하면 타일로 골라도 전체와 똑같이 처리합니다.
 - 같은 대화에서 방식을 바꾸면 이미 전사한 쪽도 **새 방식으로 다시 전사**합니다(이전 결과가 섞이면 비교가 무의미하므로).
 - 어느 쪽이 나은지는 문서와 모델에 따라 다릅니다. 본문이 쪽 너비를 가득 채우는 문서는 타일 경계에서 줄이 잘려 오히려 나빠질 수 있습니다 → `scripts/compare_tiling.py`로 재 보세요(3.3절).
+
+### 답변(추론) 호출 이미지: 끔 / 업로드 이미지만 / 전체
+
+답변을 만드는 호출이 **그림을 볼 수 있게 할지**를 요청마다 고릅니다(⚙ 모델 설정 → "답변(추론) 호출 이미지"). 위의 전체/타일과는 별개의 설정입니다.
+
+| | 끔(`off`) | 업로드 이미지만(`uploads`, 기본) | 전체(`whole`) |
+|---|---|---|---|
+| 업로드 이미지 | 싣지 않음 | 전체 한 장 | 전체 한 장 |
+| PDF 쪽 | 싣지 않음 | 싣지 않음(텍스트만) | **모든 쪽**을 한 장씩 — 글자가 충분해 전사하지 않은 쪽도 |
+| 답변 모델이 보는 것 | 네이티브 텍스트 + 전사 글 + 위치 확인 도구 | 위 + 업로드 이미지 | 위 + 쪽 그림(형상·심볼·배치) |
+
+- 기본값은 지금까지의 동작입니다(계획서 §5.3·§5.4). "전체"는 그림에만 있는 것(벽·창 형상, 무엇의 치수인지, 심볼 개수)을 답하게 하려는 실험용 모드입니다 — 효과는 모델·도면으로 직접 재 보세요.
+- "전체"에서 전처리 때 렌더하지 않은 쪽은 답변 직전에 렌더해 첨부로 저장합니다(뷰어에서 열리고, 다음 턴에 다시 그리지 않습니다). 한 번에 최대 `DOCCHAT_MAX_MODEL_IMAGES`(기본 12)장, 넘치면 **쪽 순서로 앞에서부터** 싣고 뺀 수를 답변 아래에 적습니다. 실을 쪽만 렌더합니다.
+- 쪽 이미지가 실릴 때는 질문 끝에 `[PAGE IMAGES: 1: a.pdf · page 1; …]` 한 줄이 붙어 모델이 몇 번째 이미지가 어느 쪽인지 알 수 있습니다. 기본 모드의 프롬프트는 바뀌지 않습니다.
+- 비용: 이미지는 도구 루프의 **호출마다** 다시 갑니다(3072px 도면 한 장 ≈ Qwen3.5 입력 6,500토큰). 이미지 토큰은 예산 계산에 넣지 않으므로 컨텍스트가 작은 로컬 모델(8192)은 "전체"에서 넘쳐 오류가 날 수 있습니다.
+- 답변 아래에 `답변 호출 이미지: 전체 2장 (scan.pdf · page 1, scan.pdf · page 2)`처럼 표시되고, 답변의 `meta.answerImageMode`·`meta.answerImages`에 남습니다. 트레이스(아래)에서는 실제로 보낸 이미지를 첨부 ID로 볼 수 있습니다.
 
 ### 추론(thinking) 끄기 — 호출 종류별로
 
@@ -104,6 +120,8 @@ Copy-Item .env.example .env
 | `DOCCHAT_DB_PATH` | `data/docchat.sqlite` | 대화·메시지 저장 위치 |
 | `DOCCHAT_FILES_DIR` | DB 파일 옆의 `files/` (= `data/files`) | 첨부 파일(PDF·이미지 원본·페이지 렌더) 저장 폴더. DB와 짝으로 옮겨야 합니다 |
 | `DOCCHAT_IMAGE_MODE` | `whole` | 요청에 `imageMode`가 없을 때의 이미지 처리 방식(`whole` / `tile`) |
+| `DOCCHAT_ANSWER_IMAGE_MODE` | `uploads` | 요청에 `answerImageMode`가 없을 때 답변 호출에 실을 이미지(`off` / `uploads` / `whole`) |
+| `DOCCHAT_MAX_MODEL_IMAGES` | `12` | 답변 호출 한 번에 싣는 이미지 수 상한(업로드 이미지 + `whole`의 PDF 쪽) |
 | `DOCCHAT_TILE_SIZE` | `1536` | 타일 한 변의 상한(px) |
 | `DOCCHAT_TILE_OVERLAP` | `0.125` | 이웃 타일과 겹치는 비율(타일 크기 대비) |
 | `DOCCHAT_TILE_RENDER_DPI` | `200` | PDF 타일 렌더 DPI(스캔 쪽은 박힌 이미지 해상도가 상한) |
@@ -126,7 +144,7 @@ Copy-Item .env.example .env
 
 ## 3. 테스트
 
-### 3.1 자동 테스트 (모델 불필요, 약 35초, 267개)
+### 3.1 자동 테스트 (모델 불필요, 약 35초, 276개)
 
 ```powershell
 uv run pytest
@@ -148,6 +166,7 @@ uv run pytest
 | `tests/test_runaway_guards.py` | 호출별 추론 끄기·출력 상한이 요청에 실리는지, 상한에 닿은 호출은 다시 보내지 않는지, 끊긴 추론 글·미완성 JSON을 쓰지 않는지, 전사의 추론 선택을 바꾸면 다시 전사하는지 |
 | `tests/test_env_file.py` | `.env` 읽기, 셸 환경변수 우선, `.env.example`이 모든 설정과 실제 기본값을 담고 있는지 |
 | `tests/test_trace.py` | 턴 트레이스: 꺼져 있으면 아무것도 기록하지 않음, 한 턴의 입력→전처리→전사→증거→모델 호출→도구→답변 기록, 도구 아래 자식 호출, 진행 중인 턴의 `running` 호출과 취소 시 `cancelled`, API key·base64 미기록, 대화 삭제 시 함께 삭제 |
+| `tests/test_answer_images.py` | 답변 호출 이미지(Step 8): 기본값은 이전 동작 그대로, 전체 모드는 전사 뒤 쪽 이미지를 쪽 순서로 싣고 네이티브 쪽을 렌더해 저장, 상한 안에서만 렌더, 루프의 매 호출에 실림, 끔 모드에서도 bbox 도구 동작, 렌더한 쪽이 기본 모드로 새지 않음, 트레이스 기록 |
 
 특정 테스트만: `uv run pytest tests/test_pdf_pipeline.py -k classification -v`
 
@@ -158,7 +177,7 @@ uv run python scripts/make_samples.py     # samples/ 에 시험용 PDF·이미�
 uv run python scripts/e2e_check.py        # 기본: Ollama의 gemma3:latest
 ```
 
-트레이스를 켠 채 돌아가며(`DOCCHAT_DEBUG_TRACE=1`) 기존 항목에 더해 트레이스 항목 T1~T4를 확인합니다(STEPS.md "Step 7 실모델 확인 기준").
+트레이스를 켠 채 돌아가며(`DOCCHAT_DEBUG_TRACE=1`) 기존 항목에 더해 트레이스 항목 T1~T4(STEPS.md "Step 7 실모델 확인 기준")와 답변 호출 이미지 항목 A1~A4(STEPS.md "Step 8 1차 실모델 확인 기준")를 확인합니다.
 
 다른 모델로: `$env:DOCCHAT_E2E_BASE_URL="http://127.0.0.1:8080/v1"; $env:DOCCHAT_E2E_MODEL="qwen2.5-vl"; uv run python scripts/e2e_check.py`
 클라우드로: `$env:DOCCHAT_E2E_PROVIDER="gemini"; $env:DOCCHAT_E2E_API_KEY="…"; $env:DOCCHAT_E2E_MODEL="gemini-2.5-flash"`
@@ -225,8 +244,8 @@ curl -X POST http://127.0.0.1:8000/api/test-connection -H "Content-Type: applica
 
 | 메서드 · 경로 | 설명 |
 |---|---|
-| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
-| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 트레이스 켬 여부(`debugTrace`) |
+| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`(답변 호출에 실을 이미지, 비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
+| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 트레이스 켬 여부(`debugTrace`) |
 | `GET /api/traces/{id}` | 턴 트레이스 JSON(진행 중이면 그때까지의 기록). `?download=1`이면 파일로 |
 | `GET /api/sessions/{id}/traces` | 그 대화의 트레이스 목록(id·시각·상태) |
 | `GET /api/sessions` · `POST /api/sessions` · `DELETE /api/sessions` | 목록 · 생성 · 선택/전체 삭제(`{ids}` 또는 `{all:true}`) |

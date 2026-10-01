@@ -7,6 +7,7 @@
 
 이미지 처리 방식(전체/타일)은 요청마다 고른다. 전사와 bbox 호출에만 적용되고, 어떤 방식으로 처리했는지는
 답변의 메타데이터(`meta`)에 남긴다.
+답변(추론) 호출에 어떤 이미지를 실을지(끔 / 업로드 이미지만 / 전체, Step 8)도 요청마다 고르고 메타데이터에 남긴다.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from . import config, trace
@@ -24,11 +25,11 @@ from .agent.tools import ToolContext, available_tools, describe_tool_call, execu
 from .attachments import Attachment, UploadError, sanitize_uploads
 from .db import ChatStore, now_ms, sanitize_messages, valid_id
 from .pipeline.evidence import (attachment_context_for_prompt, attachment_manifest, attachment_root_name, clip,
-                                is_visual_ocr, merge_attachment_sets)
+                                is_pending_page_image, is_visual_ocr, merge_attachment_sets)
 from .pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
 from .pipeline.ocr import TileSink, build_ocr_reader, prepare_visual_ocr_evidence
 from .pipeline.pdf import PdfError
-from .pipeline.preprocess import preprocess_attachments
+from .pipeline.preprocess import preprocess_attachments, render_page_attachment
 from .providers import Provider, ProviderError, create_provider
 from .providers.traced import TracedProvider
 from .storage import StorageError, extension_for, safe_filename
@@ -71,6 +72,8 @@ class ChatRequest:
     disable_thinking_grounding: bool | None = None
     disable_thinking_ocr: bool | None = None
     image_mode: str = ""      # "whole" | "tile". 비어 있으면 config.DEFAULT_IMAGE_MODE
+    # 답변 호출의 이미지(Step 8): "off" | "uploads" | "whole". 비어 있으면 config.DEFAULT_ANSWER_IMAGE_MODE
+    answer_image_mode: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
 
@@ -106,6 +109,8 @@ class Answer:
     artifacts: list[dict[str, Any]]
     attachments: list[Attachment]
     usage: VisionUsage
+    image_names: list[str] = field(default_factory=list)   # 답변 호출에 실은 이미지(순서대로)
+    image_candidates: int = 0                              # 모드상 실을 수 있었던 이미지 수(상한 때문에 뺀 수를 알 수 있게)
 
 
 def looks_like_false_attachment_refusal(text: str) -> bool:
@@ -165,7 +170,8 @@ def reply_language_hint(text: str) -> str:
             "Keep identifiers and values from the documents exactly as written.]")
 
 
-def _user_content(text: str, documents: list[Attachment], has_visual_ocr: bool) -> str:
+def _user_content(text: str, documents: list[Attachment], has_visual_ocr: bool,
+                  images: list[Attachment] | None = None) -> str:
     parts = [text or "Please analyze the attached files."]
     for document in documents:
         if document.text:
@@ -175,6 +181,14 @@ def _user_content(text: str, documents: list[Attachment], has_visual_ocr: bool) 
             "[EVIDENCE NOTE: pages without enough native text were transcribed from whole-page images; see the "
             '"visual OCR" attachment. Account for every visual source, keep the page order, and do not invent '
             "values that are unreadable.]"
+        )
+    # PDF 쪽 이미지를 실을 때(Step 8 전체 모드)만: 이미지가 여러 장이면 몇 번째가 어느 쪽인지 알려 줘야 한다.
+    # 업로드 이미지만 실리는 기본 모드에서는 붙지 않는다(Step 8 이전과 같은 프롬프트).
+    if images and any(image.page_number for image in images):
+        listing = "; ".join(f"{index}: {image.name}" for index, image in enumerate(images, start=1))
+        parts.append(
+            f"[PAGE IMAGES: attached to this message in this order - {listing}. They show the drawings, symbols "
+            "and layout that the extracted text cannot convey.]"
         )
     return "\n\n".join(parts)
 
@@ -192,6 +206,11 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
     except ValueError as error:
         raise ChatError(f"지원하지 않는 이미지 처리 방식입니다: {request.image_mode!r}. "
                         "'whole'(전체) 또는 'tile'(타일) 중에서 고르세요.") from error
+    try:
+        answer_image_mode = config.resolve_answer_image_mode(request.answer_image_mode)
+    except ValueError as error:
+        raise ChatError(f"지원하지 않는 답변 이미지 방식입니다: {request.answer_image_mode!r}. "
+                        "'off'(끔), 'uploads'(업로드 이미지만), 'whole'(전체) 중에서 고르세요.") from error
     try:
         uploads = sanitize_uploads(request.attachments)
         provider = create_provider(request.provider, model=request.model, api_key=request.api_key,
@@ -213,9 +232,10 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         turn.activate()
     thinking = plan_thinking(request, provider)
     if turn is not None:
-        _record_input(turn, request, messages, uploads, image_mode, thinking, provider)
+        _record_input(turn, request, messages, uploads, image_mode, answer_image_mode, thinking, provider)
     try:
-        answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode, thinking)
+        answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode,
+                               answer_image_mode, thinking)
     except (ProviderError, UploadError, PdfError, ImageError, StorageError) as error:
         failure = ChatError(str(error), status=502 if isinstance(error, ProviderError) else 400)
         await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [], trace_meta)
@@ -240,6 +260,10 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
                             "elapsedMs": int((time.monotonic() - started) * 1000), **trace_meta}
     if image_mode == "tile":
         meta["tiling"] = config.tile_settings()
+    # 답변 호출에 실은 이미지(Step 8): 모드, 실은 수·이름, 모드상 실을 수 있었던 수(상한 때문에 뺀 것이 있는지)
+    meta["answerImageMode"] = answer_image_mode
+    meta["answerImages"] = {"sent": len(answer.image_names), "candidates": answer.image_candidates,
+                            "names": answer.image_names}
     if thinking.controllable and provider.can_disable_thinking():
         # 호출 종류별로 추론을 끄고 보냈는지. 서버가 그 요청을 거절했으면(can_disable_thinking이 False로 바뀐다) 적지 않는다.
         meta["thinkingDisabled"] = thinking.to_public()
@@ -263,12 +287,13 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
 
 
 def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[dict[str, Any]], uploads: list[Attachment],
-                  image_mode: str, thinking: ThinkingPlan, provider: Provider) -> None:
+                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, provider: Provider) -> None:
     """턴의 입력: 질문, 새 첨부, 이번 턴의 설정. API key는 넣지 않는다."""
     turn.note(
         "input", "입력", question=trace.clip(messages[-1]["content"]), historyMessages=len(messages) - 1,
         attachments=[{"name": item.name, "kind": item.kind, "mime": item.mime, "size": item.size} for item in uploads],
         provider=request.provider, model=request.model, baseUrl=request.base_url or None, imageMode=image_mode,
+        answerImageMode=answer_image_mode, maxModelImages=config.MAX_MODEL_IMAGES,
         contextSize=request.context_size, thinkingDisabled=thinking.to_public() if thinking.controllable else None,
         thinkingControl=provider.can_disable_thinking(), visionMaxTokens=config.vision_max_tokens(),
         tiling=config.tile_settings() if image_mode == "tile" else None,
@@ -324,9 +349,46 @@ def _tile_sink(store: ChatStore, conversation_id: str) -> TileSink | None:
     return save
 
 
+async def _render_pending_pages(store: ChatStore, attachments: list[Attachment], images: list[Attachment],
+                                progress: Callable[[str], None]) -> int:
+    """전체 모드(Step 8)에서 아직 렌더하지 않은 PDF 쪽(자리표시)을 원본 PDF에서 그려 첨부 목록에 넣는다.
+
+    자리표시는 그 자리에서 렌더된 첨부로 바뀐다. 그리지 못한 쪽(원본이 없거나 PDF 오류)은 자리표시로 남아
+    호출부가 걸러 낸다 — 쪽 하나 때문에 턴 전체를 실패시키지 않는다. 그린 수를 돌려준다.
+    """
+    pending = [index for index, image in enumerate(images) if is_pending_page_image(image)]
+    if not pending:
+        return 0
+    loaded: dict[str, bytes | None] = {}      # 같은 PDF는 한 번만 읽는다. pdf.data에 붙들어 두지 않는다(메모리).
+    rendered = 0
+    for count, index in enumerate(pending, start=1):
+        progress(f"답변 호출에 실을 쪽 이미지를 렌더하는 중… ({count}/{len(pending)})")
+        placeholder = images[index]
+        root = attachment_root_name(placeholder.name)
+        pdf = next((item for item in attachments if item.name == root and item.is_pdf), None)
+        if pdf is None:
+            continue
+        if root not in loaded:
+            loaded[root] = pdf.data if pdf.data else (await store.load_attachment_data(pdf.id) if pdf.id is not None else None)
+        if not loaded[root]:
+            trace.note("evidence", f"{placeholder.name}을(를) 렌더하지 못함 · 원본 PDF 바이트 없음")
+            continue
+        try:
+            page = await render_page_attachment(replace(pdf, data=loaded[root]), placeholder.page_number or 1,
+                                                why="답변 호출에 실음", trace_kind="evidence")
+        except PdfError as error:
+            logger.warning("답변 호출용 쪽 렌더 실패: %s (%s)", placeholder.name, error)
+            trace.note("evidence", f"{placeholder.name}을(를) 렌더하지 못함", error=str(error))
+            continue
+        images[index] = page
+        attachments.append(page)
+        rendered += 1
+    return rendered
+
+
 async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, conversation_id: str,
                   messages: list[dict[str, Any]], uploads: list[Attachment], emit: Emit,
-                  image_mode: str, thinking: ThinkingPlan) -> Answer:
+                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan) -> Answer:
     def progress(message: str) -> None:
         emit({"type": "progress", "message": message})
         trace.note("progress", message)      # 화면에 보인 진행 단계가 트레이스의 시간축에도 남는다
@@ -371,31 +433,41 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         if item.id is not None and not item.send_to_model:
             item.data = None
 
-    # 3) 프롬프트 예산 안에서 증거 선택
+    # 3) 프롬프트 예산 안에서 증거 선택. 답변 호출에 실을 이미지는 요청의 답변 이미지 모드(Step 8)가 정한다.
     char_budget, attachment_budget, history_budget = _budgets(provider, request.context_size)
     latest_user = messages[-1]["content"]
-    context = attachment_context_for_prompt(latest_user, attachments, attachment_budget, config.MAX_MODEL_IMAGES)
+    context = attachment_context_for_prompt(latest_user, attachments, attachment_budget, config.MAX_MODEL_IMAGES,
+                                            answer_images=answer_image_mode)
+    # 전체 모드: 전처리에서 렌더하지 않은 쪽(네이티브 글자가 충분한 쪽)은 실을 것만 지금 그려 첨부로 저장한다.
+    if await _render_pending_pages(store, attachments, context.images, progress):
+        await store.save_attachments(conversation_id, attachments)
+        if turn is not None:
+            turn.register_attachments(attachments)
+    context.images = [image for image in context.images if not is_pending_page_image(image)]
     model_images = []
     for image in context.images:
         if image.data is None and image.id is not None:
             image.data = await store.load_attachment_data(image.id)
         if image.data:
-            # 답변 호출의 이미지는 모드와 무관하게 전체 한 장이다(타일은 전사·bbox 호출에만 적용, Step 8에서 따로 다룬다).
+            # 답변 호출의 이미지는 모드와 무관하게 전체 한 장이다(타일은 전사·bbox 호출에만 적용, Step 8 나머지에서 다룬다).
             model_images += await assemble_model_images(image.name, image.mime, image.data, purpose="analysis",
                                                         mode=image_mode)
+    context.images = [image for image in context.images if image.data]
 
     tools = available_tools(attachments)
     history = compact_conversation_messages(messages[-config.MAX_HISTORY_MESSAGES:], history_budget)
     if not history or history[-1]["role"] != "user":
         history.append({"role": "user", "content": latest_user})
     has_visual_ocr = any(is_visual_ocr(item) for item in attachments)
-    history[-1] = {"role": "user", "content": _user_content(history[-1]["content"], context.documents, has_visual_ocr)}
+    history[-1] = {"role": "user", "content": _user_content(history[-1]["content"], context.documents, has_visual_ocr,
+                                                            context.images)}
     model_messages = [{"role": "system", "content": system_prompt(attachment_manifest(attachments),
                                                                  tools_enabled=bool(tools),
                                                                  model_name=request.model)}, *history]
     if turn is not None:
         _record_evidence(turn, attachments, context, model_images, tools, history, model_messages[0]["content"],
-                         budgets=(char_budget, attachment_budget, history_budget), has_visual_ocr=has_visual_ocr)
+                         budgets=(char_budget, attachment_budget, history_budget), has_visual_ocr=has_visual_ocr,
+                         answer_image_mode=answer_image_mode)
 
     # 4) 단일 tool-calling 루프
     tool_context = ToolContext(
@@ -426,12 +498,13 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         text = retry.text.strip() or text
     if not text.strip():
         raise ProviderError("모델이 빈 응답을 돌려주었습니다. 다시 시도하거나 다른 모델을 선택하세요.")
-    return Answer(text=text, artifacts=tool_context.artifacts, attachments=attachments, usage=usage)
+    return Answer(text=text, artifacts=tool_context.artifacts, attachments=attachments, usage=usage,
+                  image_names=[image.name for image in model_images], image_candidates=context.image_candidates)
 
 
 def _record_evidence(turn: trace.TurnTrace, attachments: list[Attachment], context: Any, model_images: list[ModelImage],
                      tools: list[Any], history: list[dict[str, Any]], system: str, *, budgets: tuple[int, int, int],
-                     has_visual_ocr: bool) -> None:
+                     has_visual_ocr: bool, answer_image_mode: str) -> None:
     """증거 조립: 어떤 텍스트를 얼마나 실었고 무엇이 잘렸는지, 어떤 이미지를 보냈는지, 예산은 얼마였는지."""
     full = {item.name: len(item.text or "") for item in attachments}
     documents = []
@@ -442,6 +515,7 @@ def _record_evidence(turn: trace.TurnTrace, attachments: list[Attachment], conte
     turn.note(
         "evidence", "증거 조립", budgets={"chars": budgets[0], "attachmentText": budgets[1], "history": budgets[2]},
         documents=documents, images=turn.describe_images(model_images), tools=trace.describe_tools(tools),
+        answerImageMode=answer_image_mode, imageCandidates=context.image_candidates, maxModelImages=config.MAX_MODEL_IMAGES,
         historyMessages=len(history), visualOcrNote=has_visual_ocr, systemPrompt=trace.clip(system),
         manifest=attachment_manifest(attachments),
     )

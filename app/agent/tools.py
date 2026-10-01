@@ -16,7 +16,8 @@ from ..attachments import Attachment
 from ..db import ChatStore
 from ..pipeline.evidence import attachment_root_name, page_image_name
 from ..pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
-from ..pipeline.pdf import PdfError, render_pdf_page_image, run_pdf
+from ..pipeline.pdf import PdfError
+from ..pipeline.preprocess import render_page_attachment
 from ..providers.base import Provider, ToolCall, ToolSpec, is_output_length_stop
 from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
                         valid_box)
@@ -177,16 +178,7 @@ async def _resolve_visual_surface(context: ToolContext, record: Attachment, page
     if existing is not None and await _bytes_of(context, existing):
         return existing
     # 네이티브 텍스트로 충분해 미리 렌더하지 않았던 페이지도 요청이 오면 원본 PDF에서 바로 그린다.
-    rendered = await run_pdf(render_pdf_page_image, pdf.data, page_number=page_number, dpi=config.PDF_RENDER_DPI)
-    trace.note("tool", f"{page_image_name(pdf.name, page_number)}을(를) 요청 시점에 렌더", width=rendered.width,
-               height=rendered.height, dpi=config.PDF_RENDER_DPI, classification=rendered.page_classification)
-    surface = Attachment(
-        name=page_image_name(pdf.name, page_number), mime=rendered.mime, kind="image", size=rendered.size,
-        data=rendered.data, has_data=True, width=rendered.width, height=rendered.height,
-        page_number=page_number, page_classification=rendered.page_classification,
-        ocr_required=False, send_to_model=False,
-        text=f"Rendered on demand for visual inspection: {rendered.width} x {rendered.height} px.",
-    )
+    surface = await render_page_attachment(pdf, page_number, why="inspect_visual 요청", trace_kind="tool")
     context.attachments.append(surface)
     if context.store is not None and context.conversation_id:
         await context.store.save_attachments(context.conversation_id, context.attachments)

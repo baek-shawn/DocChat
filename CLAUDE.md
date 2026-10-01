@@ -27,7 +27,7 @@
 웹검색 / web_fetch / 논문 검색, deepagents·langchain 멀티 서브에이전트, 문서 생성(PDF/DOCX/PPTX)·차트 도구, 정식 SSE·WebSocket.
 → 필요해 보여도 **먼저 사용자에게 묻는다.**
 - 타일링은 원래 제외 항목이었으나 **2026-09-29 사용자 결정으로 해제**됐다(STEPS.md Step 5, 구현됨). 계획서에 없던 항목은 STEPS.md의 Step·Experiments에 적힌 범위까지만 한다.
-  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출의 이미지는 Step 8의 범위다.
+  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출에 **어떤 이미지를 실을지**는 별개의 축 `answerImageMode`(끔 / 업로드 이미지만 / 전체, Step 8 1차)로 고른다. 답변 호출의 이미지는 어느 모드든 전체 한 장이다 — 타일 계열(타일 / 타일+전체 / 개요+확대)은 Step 8 나머지의 범위다.
   - 타일 경계에서 잘린 대상을 하나로 잇는 것(분할 박스 병합)은 범위 밖이다 — 겹침 영역의 **중복**만 합친다.
 
 ### 3.3 구조 원칙
@@ -80,6 +80,17 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 - 출력 상한에 닿은(`finish_reason=length`) 전사·bbox 호출은 **다시 보내지 않는다.** bbox는 끊긴 글·미완성 JSON을 결과로 쓰지 않는다. 전사는 읽은 데까지 남기되 끊긴 자리를 표시하고, 끊긴 글이 추론일 수 있으면(`ocr.cut_off_transcription`) 버린다.
 - 추론 끄기와 출력 상한은 **로컬(OpenAI 호환) provider에만** 보낸다. 답변 호출에는 출력 상한을 붙이지 않는다(Step 6의 범위).
 - 전사 호출의 추론 여부는 `image_mode_variant(mode, thinking=…)`로 OCR 캐시 키와 쪽 기록에 들어간다.
+
+답변(추론) 호출의 이미지(Step 8 1차) — 요청의 `answerImageMode`, 없으면 아래 기본값.
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `DEFAULT_ANSWER_IMAGE_MODE` | `uploads` | `off`(이미지 없음) / `uploads`(업로드 이미지만 — 계획서 §5.3·§5.4, Step 8 이전과 같은 동작) / `whole`(업로드 이미지 + PDF 모든 쪽) (`DOCCHAT_ANSWER_IMAGE_MODE`) |
+| `MAX_MODEL_IMAGES` | 12 | 답변 호출 한 번에 싣는 이미지 수 상한. `whole`에서 넘치면 쪽 순서로 앞에서부터 |
+
+- 어떤 첨부를 실을지는 `evidence.attachment_context_for_prompt(answer_images=…)` **한 곳**에서 정한다. 아직 렌더하지 않은 PDF 쪽은 자리표시(`pending_page_image`)로 나오고 `chat_service._render_pending_pages`가 실을 것만 그려 첨부로 저장한다(bbox 도구의 즉석 렌더와 같은 `preprocess.render_page_attachment`).
+- 쪽 이미지(`send_to_model=False`)는 어느 모드에서도 스스로 답변 호출에 실리지 않는다 — `send_to_model=True`는 업로드 이미지에만 있다. 렌더해 둔 쪽이 기본 모드로 새면 안 된다(`tests/test_answer_images.py`).
+- 쪽 이미지가 실릴 때만 질문 끝에 `[PAGE IMAGES: …]` 한 줄이 붙는다. 기본 모드의 프롬프트는 바꾸지 않는다. 이미지 토큰은 예산에 넣지 않는다(모델마다 달라 추정하지 않음).
 
 개발용 턴 트레이스(Step 7) — `DOCCHAT_DEBUG_TRACE=1`일 때만 기록한다(`config.debug_trace_enabled()`, 요청마다 읽는다).
 
@@ -166,7 +177,7 @@ app/
   providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현, traced(트레이스용 겉싸개)
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)
-                     / preprocess / ocr(전사·타일 전사 병합) / evidence
+                     / preprocess(업로드 펼치기, 쪽 즉석 렌더) / ocr(전사·타일 전사 병합) / evidence(증거 예산·답변 호출 이미지 선택)
   agent/             prompts / tools / grounding(bbox 파싱·타일 박스 병합) / loop(단일 tool-calling 루프)
 static/              index.html, styles.css, js/app.js
 tests/               pytest (mock_openai.py = OpenAI 호환 mock 서버, pdf_factory.py = 합성 PDF·큰 도면)

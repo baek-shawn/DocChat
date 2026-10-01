@@ -136,6 +136,15 @@
       </select>
     </label>
     <p id="imageModeHelp" class="help">전사(OCR)와 위치 확인(bbox) 호출에 적용됩니다. 타일은 작은 글자·심볼을 더 크게 보여 주지만 호출 수가 늘어 느려집니다. 요청마다 적용되므로 같은 문서를 두 방식으로 비교할 수 있습니다.</p>
+
+    <label>답변(추론) 호출 이미지
+      <select id="answerImageMode">
+        <option value="off">끔 — 텍스트와 위치 확인 도구만 (업로드 이미지도 싣지 않음)</option>
+        <option value="uploads">업로드 이미지만 — PDF 쪽은 싣지 않음 (지금까지의 동작)</option>
+        <option value="whole">전체 — 업로드 이미지 + PDF 모든 쪽을 한 장씩</option>
+      </select>
+    </label>
+    <p id="answerImageHelp" class="help"></p>
     <p id="traceHelp" class="help"></p>
 
     <div class="dialog-foot">

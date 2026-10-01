@@ -193,7 +193,7 @@ def test_a_page_rendered_on_demand_is_referenced_by_id_and_size(traced, mock_llm
     (image,) = grounding["data"]["images"]
     page = next(item for item in data["attachments"] if item["name"] == "spec.pdf · page 1")
     assert image["attachmentId"] == page["id"] and (image["width"], image["height"]) == (page["width"], page["height"])
-    assert any(event["label"].endswith("요청 시점에 렌더") for event in events_of(document, "tool"))
+    assert any("지금 렌더 · inspect_visual 요청" in event["label"] for event in events_of(document, "tool"))
 
 
 def test_the_json_fallback_and_the_stop_reasons_are_recorded(traced, mock_llm):

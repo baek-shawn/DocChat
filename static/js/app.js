@@ -9,6 +9,8 @@
   const PROVIDER_LABELS = { openaiCompatible: '로컬 API', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini' };
   const TYPE_LABELS = { text: '텍스트', object: '객체', table: '표', dimension: '치수', stamp: '도장', signature: '서명', diagram: '다이어그램', other: '기타' };
   const IMAGE_MODE_LABELS = { whole: '전체', tile: '타일' };
+  // 답변(추론) 호출에 싣는 이미지(Step 8) — app/config.py의 ANSWER_IMAGE_MODES와 짝이다.
+  const ANSWER_IMAGE_LABELS = { off: '끔', uploads: '업로드 이미지만', whole: '전체' };
   // 턴 트레이스(Step 7)의 이벤트 종류·상태 — app/trace.py의 KINDS·STATUSES와 짝이다.
   const TRACE_KINDS = { input: '입력', preprocess: '전처리', ocr: '전사', evidence: '증거', model: '모델', tool: '도구', loop: '루프', cleanup: '정리', progress: '진행', files: '파일', answer: '답변' };
   const TRACE_STATUS = { running: '진행 중', done: '완료', failed: '실패', cancelled: '취소', interrupted: '중단됨' };
@@ -40,6 +42,9 @@
     imageMode: store.get('imageMode', ''),   // '' = 고른 적 없음 → 서버 기본값(DOCCHAT_IMAGE_MODE)을 따른다
     serverImageMode: 'whole',
     tiling: null,                            // 서버에 적용 중인 타일 설정(/api/health)
+    answerImageMode: store.get('answerImageMode', ''),   // '' = 고른 적 없음 → 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE)
+    serverAnswerImageMode: 'uploads',
+    maxModelImages: 12,                      // 답변 호출 한 번에 싣는 이미지 수 상한(/api/health)
     // 호출 종류별 추론 끄기. 'true' | 'false' | ''(고른 적 없음 → 서버 기본값)
     disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
@@ -50,6 +55,7 @@
   };
   if (!PROVIDER_LABELS[state.provider]) state.provider = LOCAL_PROVIDER;
   if (!IMAGE_MODE_LABELS[state.imageMode]) state.imageMode = '';
+  if (!ANSWER_IMAGE_LABELS[state.answerImageMode]) state.answerImageMode = '';
 
   const $ = (id) => document.getElementById(id);
   const els = Object.fromEntries([
@@ -59,7 +65,7 @@
     'toggleLabels', 'zoomOut', 'zoomReset', 'zoomIn', 'viewerDownload', 'viewerClose', 'viewerStage', 'viewerRegions',
     'settingsDialog', 'providerSelect', 'baseUrlField', 'baseUrl', 'apiKey', 'apiKeyLabel', 'modelName', 'modelOptions',
     'contextField', 'contextSize', 'disableThinking', 'callThinking', 'disableThinkingGrounding', 'disableThinkingOcr', 'callThinkingHelp',
-    'imageMode', 'imageModeHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
+    'imageMode', 'imageModeHelp', 'answerImageMode', 'answerImageHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
     'traceDialog', 'traceStatus', 'traceRefresh', 'traceFoldAll', 'traceUnfoldAll', 'traceDownload', 'traceClose', 'traceSummary', 'traceBody'
   ].map((id) => [id, $(id)]));
 
@@ -216,12 +222,14 @@
   function persistSettings() {
     store.set('provider', state.provider); store.set('baseUrl', state.baseUrl);
     store.set('model', state.model); store.set('contextSize', state.contextSize); store.set('disableThinking', state.disableThinking);
-    store.set('imageMode', state.imageMode);
+    store.set('imageMode', state.imageMode); store.set('answerImageMode', state.answerImageMode);
     store.set('disableThinkingGrounding', state.disableThinkingGrounding); store.set('disableThinkingOcr', state.disableThinkingOcr);
   }
 
   // 요청에 실을 이미지 처리 방식. 사용자가 고른 적이 없으면 서버 기본값.
   const imageMode = () => state.imageMode || state.serverImageMode;
+  // 요청에 실을 답변 호출 이미지 모드(Step 8). 고른 적이 없으면 서버 기본값.
+  const answerImageMode = () => state.answerImageMode || state.serverAnswerImageMode;
   // 요청에 실을 호출별 추론 끄기(kind: 'disableThinkingGrounding' | 'disableThinkingOcr'). 고른 적이 없으면 서버 기본값.
   const callThinkingOff = (kind) => state[kind] === '' ? state.serverVision[kind] !== false : state[kind] === 'true';
 
@@ -230,6 +238,8 @@
       const health = await request('/api/health');
       if (IMAGE_MODE_LABELS[health.imageMode]) state.serverImageMode = health.imageMode;
       state.tiling = health.tiling || null;
+      if (ANSWER_IMAGE_LABELS[health.answerImageMode]) state.serverAnswerImageMode = health.answerImageMode;
+      if (Number(health.maxModelImages) > 0) state.maxModelImages = Number(health.maxModelImages);
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
       state.serverDebugTrace = health.debugTrace === true;
     } catch { /* 기본값(전체)으로 둔다 */ }
@@ -293,6 +303,10 @@
     const tiling = state.tiling;
     els.imageModeHelp.textContent = '전사(OCR)와 위치 확인(bbox) 호출에 적용됩니다. 타일은 작은 글자·심볼을 더 크게 보여 주지만 호출 수가 늘어 느려집니다. 요청마다 적용되므로 같은 문서를 두 방식으로 비교할 수 있습니다.'
       + (tiling ? ` 현재 타일 설정: ${tiling.tileSize}px · 겹침 ${Math.round(tiling.overlap * 1000) / 10}% · ${tiling.renderDpi}DPI · 긴 변 ${tiling.minSourceEdge}px 이하는 나누지 않음 · 장당 최대 ${tiling.maxTiles}타일.` : '');
+    els.answerImageMode.value = answerImageMode();
+    els.answerImageHelp.textContent = '답변(추론) 호출에 어떤 이미지를 실을지입니다. "끔"은 텍스트(네이티브·전사)와 위치 확인 도구만 씁니다. "업로드 이미지만"은 지금까지의 동작입니다(PDF 쪽은 텍스트만). '
+      + '"전체"는 PDF의 모든 쪽(글자가 충분한 쪽도)을 한 장씩 실어 그림에만 있는 것(형상·심볼·배치)을 볼 수 있게 하지만, 도구 루프의 호출마다 이미지 토큰이 들고 컨텍스트가 작은 로컬 모델은 넘칠 수 있습니다. '
+      + `한 번에 최대 ${state.maxModelImages}장(.env의 DOCCHAT_MAX_MODEL_IMAGES), 넘치면 쪽 순서로 앞에서부터. 요청마다 적용되므로 같은 질문을 방식별로 비교할 수 있습니다.`;
     els.traceHelp.textContent = state.serverDebugTrace
       ? '턴 과정 기록(개발용)이 켜져 있습니다. 답변마다 "과정 보기"로 전처리·전사·모델 호출·도구 실행을 시간순으로 볼 수 있습니다(.env의 DOCCHAT_DEBUG_TRACE).'
       : '턴 과정 기록(개발용)은 꺼져 있습니다. 켜려면 .env에 DOCCHAT_DEBUG_TRACE=1을 적고 서버를 다시 띄우세요.';
@@ -335,6 +349,7 @@
     state.disableThinkingGrounding = String(els.disableThinkingGrounding.checked);
     state.disableThinkingOcr = String(els.disableThinkingOcr.checked);
     state.imageMode = IMAGE_MODE_LABELS[els.imageMode.value] ? els.imageMode.value : '';
+    state.answerImageMode = ANSWER_IMAGE_LABELS[els.answerImageMode.value] ? els.answerImageMode.value : '';
     store.setKey(form.provider, form.apiKey);
     persistSettings();
     els.settingsDialog.close();
@@ -382,8 +397,11 @@
           item.status = report.visualPages > 0 ? `${pages} · ${report.visualPages}쪽은 비전 전사 필요` : `${pages} · 네이티브 텍스트 ${report.parsedCharacters.toLocaleString()}자`;
           item.tone = report.visualPages > 0 ? 'warn' : '';
           if (report.truncated) item.status += ` (앞 ${report.processedPages}쪽만 검사)`;
+          // 답변 호출 이미지 "전체"(Step 8)면 글자가 충분한 쪽도 이미지로 실린다.
+          if (answerImageMode() === 'whole') item.status += ` · 답변 호출에 쪽 이미지 포함(최대 ${state.maxModelImages}장)`;
         } else {
           item.status = report.resized ? `${report.sourceWidth}×${report.sourceHeight} → ${report.width}×${report.height}로 축소해 전달` : `${report.width}×${report.height} 원본 그대로 전달`;
+          if (answerImageMode() === 'off') item.status += ' · 답변 호출에는 싣지 않음(끔)';
           // 타일 모드에서도 답변 호출에는 위의 한 장이 간다. 위치 확인(bbox)만 원본을 타일로 나눠 본다.
           const longEdge = Math.max(report.sourceWidth || 0, report.sourceHeight || 0);
           if (imageMode() === 'tile' && state.tiling && longEdge > Math.max(state.tiling.minSourceEdge, state.tiling.tileSize)) item.status += ' · 위치 확인은 원본을 타일로';
@@ -428,7 +446,7 @@
       const final = await streamChat({
         ...connection(), model: state.model, contextSize: state.contextSize, disableThinking: state.disableThinking,
         disableThinkingGrounding: callThinkingOff('disableThinkingGrounding'), disableThinkingOcr: callThinkingOff('disableThinkingOcr'),
-        imageMode: imageMode(), conversationId: state.currentId, stream: true,
+        imageMode: imageMode(), answerImageMode: answerImageMode(), conversationId: state.currentId, stream: true,
         // meta(답변을 어떤 방식으로 처리했는지)도 되돌려 보내야 서버가 대화를 다시 저장할 때 지워지지 않는다.
         messages: history.map(({ role, content, files: sent, artifacts, meta, createdAt }) => ({ role, content, files: sent, artifacts, meta, createdAt })),
         attachments: files.map(({ name, mime, size, base64 }) => ({ name, mime, size, base64 }))
@@ -560,13 +578,26 @@
     return wrap;
   }
 
-  // 이 답을 어떤 이미지 처리 방식으로 만들었는지. 비전 호출이 없었던 전체 모드 답변(일반 대화)에는 표시하지 않는다.
+  // 답변(추론) 호출에 실은 이미지(Step 8): 모드, 장 수(이름), 상한 때문에 뺀 장 수.
+  function describeAnswerImages(mode, info) {
+    const dropped = Math.max(0, (info.candidates || 0) - (info.sent || 0));
+    let text = `답변 호출 이미지: ${ANSWER_IMAGE_LABELS[mode] || mode}`;
+    if (info.sent) text += ` ${info.sent}장` + (info.names?.length && info.names.length <= 4 ? ` (${info.names.join(', ')})` : '');
+    if (dropped) text += ` · 상한 때문에 ${dropped}장 제외`;
+    return text;
+  }
+
+  // 이 답을 어떤 방식으로 만들었는지. 비전 호출도 답변 호출 이미지도 없었던 기본 설정의 답변(일반 대화)에는 표시하지 않는다.
   function describeProcessing(meta) {
     if (!meta || !IMAGE_MODE_LABELS[meta.imageMode]) return '';
     const vision = meta.vision || {};
     const calls = (vision.ocrCalls || 0) + (vision.groundingCalls || 0);
-    if (meta.imageMode !== 'tile' && !calls) return '';
+    const answerImages = meta.answerImages || null;
+    // 기본이 아닌 모드(끔·전체)를 골랐으면 이미지가 없어도 적는다 — 방식을 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 보이게.
+    const showAnswerImages = !!answerImages && (answerImages.sent > 0 || answerImages.candidates > 0 || (!!meta.answerImageMode && meta.answerImageMode !== 'uploads'));
+    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages) return '';
     const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
+    if (showAnswerImages) parts.push(describeAnswerImages(meta.answerImageMode, answerImages));
     if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
     // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다)
     const detail = (kind, stops) => {

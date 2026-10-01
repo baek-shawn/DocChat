@@ -107,6 +107,7 @@ def test_example_file_shows_the_real_defaults():
     }
     assert {name: float(example[name]) for name in defaults} == {name: float(value) for name, value in defaults.items()}
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST
+    assert example["DOCCHAT_ANSWER_IMAGE_MODE"] == config.DEFAULT_ANSWER_IMAGE_MODE == "uploads"
 
 
 def test_runaway_guards_can_be_set_from_the_file(tmp_path):

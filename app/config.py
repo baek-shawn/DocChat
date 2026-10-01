@@ -197,6 +197,27 @@ def resolve_image_mode(requested: str | None) -> str:
     return value
 
 
+# --------------------------------------------------------------------------- 답변(추론) 호출의 이미지 (Step 8)
+# 답변 호출에 어떤 이미지를 싣는가. 위의 이미지 처리 방식(전사·bbox 호출의 전체/타일)과는 별개의 축이다.
+#   off     : 이미지 없음 — 텍스트(네이티브·전사)와 bbox 도구만
+#   uploads : 업로드 이미지는 전체 한 장, PDF 쪽은 싣지 않는다 — 계획서 §5.3·§5.4의 동작(Step 8 이전과 같다)
+#   whole   : 업로드 이미지와 PDF의 모든 쪽(네이티브 쪽 포함)을 전체 한 장씩. MAX_MODEL_IMAGES 안에서 쪽 순서로
+# 요청마다 고를 수 있고(`answerImageMode`), 요청에 없으면 아래 기본값을 쓴다. 답변 호출은 캐시하지 않으므로 캐시 키는 없다.
+ANSWER_IMAGE_MODES = ("off", "uploads", "whole")
+_configured_answer_mode = str(os.environ.get("DOCCHAT_ANSWER_IMAGE_MODE") or "").strip().lower()
+DEFAULT_ANSWER_IMAGE_MODE = _configured_answer_mode if _configured_answer_mode in ANSWER_IMAGE_MODES else "uploads"
+
+
+def resolve_answer_image_mode(requested: str | None) -> str:
+    """요청 값이 비어 있으면 기본값. 모르는 값이면 ValueError(호출부가 사용자 오류로 바꾼다)."""
+    value = str(requested or "").strip().lower()
+    if not value:
+        return DEFAULT_ANSWER_IMAGE_MODE
+    if value not in ANSWER_IMAGE_MODES:
+        raise ValueError(value)
+    return value
+
+
 def tile_settings() -> dict[str, float | int]:
     """지금 적용 중인 타일 설정 — 답변 메타데이터, /api/health, 비교 스크립트가 같은 값을 본다."""
     return {
