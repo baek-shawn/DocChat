@@ -12,7 +12,7 @@ from .. import config, trace
 from ..attachments import Attachment
 from .evidence import page_image_name
 from .images import prepare_uploaded_image
-from .pdf import PdfInspection, render_pdf_for_vision, run_pdf
+from .pdf import PdfInspection, RenderedPage, render_pdf_for_vision, render_pdf_page_image, run_pdf
 
 _PREPROCESS_CONCURRENCY = 2
 
@@ -101,23 +101,37 @@ def _describe_pdf(upload: Attachment, inspection: PdfInspection) -> Attachment:
 
 
 def _page_attachments(root: str, inspection: PdfInspection) -> list[Attachment]:
-    return [
-        Attachment(
-            name=page_image_name(root, page.page_number),
-            mime=page.mime,
-            kind="image",
-            size=page.size,
-            data=page.data,
-            has_data=True,
-            width=page.width,
-            height=page.height,
-            page_number=page.page_number,
-            page_classification=page.page_classification,
-            ocr_required=True,
-            send_to_model=False,
-            text=(f"Page classification: {page.page_classification}. "
-                  f"Page dimensions: {page.width_points:.2f} x {page.height_points:.2f} points; "
-                  f"normalized whole-page image: {page.width} x {page.height} px."),
-        )
-        for page in inspection.pages
-    ]
+    return [_page_attachment(root, page, ocr_required=True) for page in inspection.pages]
+
+
+def _page_attachment(root: str, page: RenderedPage, *, ocr_required: bool) -> Attachment:
+    # 쪽 이미지는 업로드 이미지가 아니므로 send_to_model=False — 답변 호출에 실을지는 요청의 답변 이미지 모드가 정한다.
+    return Attachment(
+        name=page_image_name(root, page.page_number),
+        mime=page.mime,
+        kind="image",
+        size=page.size,
+        data=page.data,
+        has_data=True,
+        width=page.width,
+        height=page.height,
+        page_number=page.page_number,
+        page_classification=page.page_classification,
+        ocr_required=ocr_required,
+        send_to_model=False,
+        text=(f"Page classification: {page.page_classification}. "
+              f"Page dimensions: {page.width_points:.2f} x {page.height_points:.2f} points; "
+              f"normalized whole-page image: {page.width} x {page.height} px."),
+    )
+
+
+async def render_page_attachment(pdf: Attachment, page_number: int, *, why: str, trace_kind: str = "preprocess") -> Attachment:
+    """전처리 때 렌더하지 않은 쪽(네이티브 글자가 충분한 쪽)을 원본 PDF에서 지금 그려 첨부로 만든다.
+
+    bbox 도구가 임의 쪽을 볼 때(`inspect_visual`)와 답변 호출에 쪽 이미지를 실을 때(Step 8 전체 모드)가 같이 쓴다.
+    전사 대상은 아니다(ocr_required=False) — 네이티브 글자가 충분해서 전사를 건너뛴 쪽이다. `pdf.data`가 있어야 한다.
+    """
+    rendered = await run_pdf(render_pdf_page_image, pdf.data, page_number=page_number, dpi=config.PDF_RENDER_DPI)
+    trace.note(trace_kind, f"{page_image_name(pdf.name, page_number)}을(를) 지금 렌더 · {why}", width=rendered.width,
+               height=rendered.height, dpi=config.PDF_RENDER_DPI, classification=rendered.page_classification)
+    return _page_attachment(pdf.name, rendered, ocr_required=False)

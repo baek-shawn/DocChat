@@ -36,6 +36,9 @@ class ChatBody(BaseModel):
     disableThinkingOcr: bool | None = None
     # 이미지 처리 방식: "whole"(전체) | "tile"(타일). 비우면 서버 기본값(DOCCHAT_IMAGE_MODE).
     imageMode: str = ""
+    # 답변(추론) 호출의 이미지(Step 8): "off"(끔) | "uploads"(업로드 이미지만) | "whole"(전체, PDF 쪽 포함).
+    # 비우면 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE).
+    answerImageMode: str = ""
     stream: bool = False
     messages: list[dict[str, Any]] = Field(default_factory=list)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
@@ -46,7 +49,8 @@ def _to_request(body: ChatBody) -> ChatRequest:
         provider=body.provider, api_key=body.apiKey, base_url=body.baseUrl, model=body.model,
         conversation_id=body.conversationId, context_size=body.contextSize, disable_thinking=body.disableThinking,
         disable_thinking_grounding=body.disableThinkingGrounding, disable_thinking_ocr=body.disableThinkingOcr,
-        image_mode=body.imageMode, messages=body.messages, attachments=body.attachments,
+        image_mode=body.imageMode, answer_image_mode=body.answerImageMode, messages=body.messages,
+        attachments=body.attachments,
     )
 
 

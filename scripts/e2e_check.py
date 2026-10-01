@@ -47,8 +47,9 @@ def upload(name: str) -> dict:
 
 
 def ask(client, text: str, files: list[str] | None = None, conversation_id: str = "", history: list[dict] | None = None,
-        mode: str = "") -> dict:
+        mode: str = "", answer_images: str = "") -> dict:
     body = {**CONNECTION, "model": MODEL, "contextSize": 8192, "conversationId": conversation_id, "imageMode": mode,
+            "answerImageMode": answer_images,
             "messages": [*(history or []), {"role": "user", "content": text}],
             "attachments": [upload(name) for name in files or []]}
     started = time.time()
@@ -226,6 +227,54 @@ def main() -> int:
             check("타일 모드 inspect_visual 아티팩트 생성", bool(artifacts),
                   f"타일 {vision.get('tiles')}장 · bbox 호출 {vision.get('groundingCalls')}회")
             check("타일 모드 bbox 1개 이상 측정", any(a.get("boxes") for a in artifacts))
+
+        # 9) 답변 호출 이미지(Step 8 1차) — 기준 A1~A4는 STEPS.md "Step 8 1차 실모델 확인 기준"에 결과를 보기 전에 고정했다.
+        #    기본 모드(uploads)는 위 1)~8)이 그대로 확인한다(A5).
+        def answer_images_of(document: dict | None) -> list[dict]:
+            calls = model_events(document, "answer") if document else []
+            return calls[0]["data"].get("images", []) if calls else []
+
+        data = ask(client, "이 도면의 DWG NO와 REV를 알려 줘. 그리고 도면에 그려진 형상을 한 줄로 설명해 줘.",
+                   ["scanned_drawing.pdf"], answer_images="whole")
+        show("9-A1) 답변 호출 이미지 전체 — 스캔 PDF: 전사한 쪽 이미지를 답변 호출에도 실음", data)
+        sent = (data.get("meta") or {}).get("answerImages", {})
+        document = trace_of(client, data)
+        images = answer_images_of(document)
+        # 전사는 호출이든 캐시든 답변 전에 끝나 있어야 한다. 같은 쪽을 3)에서 이미 전사했으면 캐시로 온다(첫 실행에서 이 검사가
+        # 호출 수만 보고 ✘를 냈다 — 앱은 맞았고 검사가 틀렸다).
+        ocr_calls = (data.get("meta") or {}).get("vision", {}).get("ocrCalls", 0)
+        ocr_cached = any(event["kind"] == "ocr" and event["label"].startswith("전사 캐시 사용") for event in (document or {}).get("events", []))
+        evidence = next((a for a in data.get("attachments", []) if a["name"].endswith("visual OCR")), None)
+        check("A1: 전사 후 답변 호출에 쪽 이미지가 실림",
+              (ocr_calls >= 1 or ocr_cached) and evidence is not None and evidence["parsedCharacters"] > 0
+              and sent.get("sent", 0) >= 1 and any("· page" in image.get("name", "") for image in images),
+              f"전사 호출 {ocr_calls}회{' (캐시 사용)' if ocr_cached else ''} · 실은 이미지 {sent.get('sent')}장 · 트레이스 {[image.get('name') for image in images]}")
+        check("A1: 전체 모드에서도 도면 번호 추출", "FA-7731" in data.get("text", ""), "기대값 FA-7731-B")
+
+        data = ask(client, "이 문서의 도면 번호(DRAWING NO)를 알려 줘.", ["native_spec.pdf"], answer_images="whole")
+        show("9-A2) 답변 호출 이미지 전체 — 네이티브 PDF: 전처리에서 만들지 않던 쪽을 지금 렌더해 실음", data)
+        sent = (data.get("meta") or {}).get("answerImages", {})
+        names = [a["name"] for a in data.get("attachments", [])]
+        check("A2: 네이티브 쪽이 렌더돼 첨부에 추가되고 답변 호출에 실림",
+              "native_spec.pdf · page 1" in names and sent.get("names") == ["native_spec.pdf · page 1"], f"{names} · {sent}")
+        check("A2: 전체 모드에서도 도면 번호 추출", "PS-2210-A" in data.get("text", ""), "기대값 PS-2210-A")
+
+        data = ask(client, "승인 도장(APPROVED)이 어디 있는지 이미지 위에 표시해 줘.", ["sheet_with_stamp.png"], answer_images="off")
+        show("9-A3) 답변 호출 이미지 끔 — 이미지를 싣지 않아도 위치 확인 도구는 그대로", data)
+        sent = (data.get("meta") or {}).get("answerImages", {})
+        document = trace_of(client, data)
+        grounding = model_events(document, "grounding") if document else []
+        check("A3: 답변 호출 이미지 0장이어도 bbox 도구 호출(위치 확인 호출에는 이미지 1장)",
+              sent.get("sent") == 0 and bool(data.get("artifacts")) and grounding
+              and all(len(call["data"].get("images", [])) == 1 for call in grounding),
+              f"실은 이미지 {sent.get('sent')}장 · 아티팩트 {len(data.get('artifacts', []))}건 · 위치 확인 호출 {len(grounding)}회")
+
+        data = ask(client, "도면 번호(DRAWING NO)가 적힌 위치를 이미지 위에 표시해 줘.", ["native_spec.pdf"], answer_images="whole")
+        show("9-A4) 답변 호출 이미지 전체 + 위치 요청 — [PAGE IMAGES] 줄이 붙어도 도구를 부르는지", data)
+        sent = (data.get("meta") or {}).get("answerImages", {})
+        check("A4: 쪽 이미지와 [PAGE IMAGES] 줄이 있는 상태에서 위치 요청에 도구 호출",
+              sent.get("sent", 0) >= 1 and bool(data.get("artifacts")),
+              f"실은 이미지 {sent.get('sent')}장 · 아티팩트 {len(data.get('artifacts', []))}건")
 
     failed = [name for name, passed, _ in results if not passed]
     print(f"\n결과: {len(results) - len(failed)}/{len(results)} 통과" + (f" · 실패: {', '.join(failed)}" if failed else ""))

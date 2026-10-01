@@ -208,6 +208,18 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
     limit = _bounded_number(value.get("visionMaxTokens"), 1_000_000)
     if limit:
         meta["visionMaxTokens"] = int(limit)
+    # 답변 호출에 실은 이미지(Step 8): 모드, 실은 수·이름, 모드상 실을 수 있었던 수
+    if value.get("answerImageMode") in config.ANSWER_IMAGE_MODES:
+        meta["answerImageMode"] = value["answerImageMode"]
+    images = value.get("answerImages")
+    if isinstance(images, dict):
+        counts = {name: _bounded_number(images.get(name), 1_000_000) for name in ("sent", "candidates")}
+        if all(number is not None for number in counts.values()):
+            names = images.get("names")
+            meta["answerImages"] = {
+                **{name: int(number) for name, number in counts.items()},
+                "names": [str(item)[:300] for item in names[:200] if isinstance(item, str)] if isinstance(names, list) else [],
+            }
     # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
     if valid_id(value.get("traceId")):
         meta["traceId"] = value["traceId"]
