@@ -25,10 +25,10 @@ class ScriptedProvider(Provider):
         self.replies, self.calls = list(replies), []
 
     async def analyze(self, messages, images=None, tools=None, *, temperature=0.2, disable_thinking=False,
-                      max_tokens=None, reasoning_budget=None, on_reasoning=None):
+                      max_tokens=None, reasoning_budget=None, on_reasoning=None, reasoning_effort=None):
         self.calls.append({"messages": messages, "images": images, "tools": tools, "temperature": temperature,
                            "disable_thinking": disable_thinking, "max_tokens": max_tokens,
-                           "reasoning_budget": reasoning_budget})
+                           "reasoning_budget": reasoning_budget, "reasoning_effort": reasoning_effort})
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply

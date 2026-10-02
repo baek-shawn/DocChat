@@ -209,6 +209,17 @@ def thinking_disabled(body: dict[str, Any]) -> bool:
     return (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False
 
 
+def reasoning_effort(body: dict[str, Any]) -> str | None:
+    """이 요청에 실려 온 추론 수준(`chat_template_kwargs.reasoning_effort`, Step 6 2차). 없으면 None."""
+    return (body.get("chat_template_kwargs") or {}).get("reasoning_effort")
+
+
+def is_effort_probe(body: dict[str, Any]) -> bool:
+    """추론 수준이 거절의 원인인지 가리려고 앱이 보내는 1토큰짜리 확인 요청인가(Step 6 2차)."""
+    messages = body.get("messages") or []
+    return body.get("max_tokens") == 1 and len(messages) == 1 and messages[0].get("content") == "ping"
+
+
 def is_ocr_call(body: dict[str, Any]) -> bool:
     return "transcription engine" in system_text(body)
 

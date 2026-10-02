@@ -31,6 +31,7 @@ from .pipeline.ocr import TileSink, build_ocr_reader, prepare_visual_ocr_evidenc
 from .pipeline.pdf import PdfError
 from .pipeline.preprocess import preprocess_attachments, render_page_attachment
 from .providers import Provider, ProviderError, create_provider
+from .providers.base import ReasoningEffortError
 from .providers.reasoning import describe_reasoning_progress
 from .providers.traced import TracedProvider
 from .storage import StorageError, extension_for, safe_filename
@@ -75,6 +76,11 @@ class ChatRequest:
     image_mode: str = ""      # "whole" | "tile". 비어 있으면 config.DEFAULT_IMAGE_MODE
     # 답변 호출의 이미지(Step 8): "off" | "uploads" | "whole". 비어 있으면 config.DEFAULT_ANSWER_IMAGE_MODE
     answer_image_mode: str = ""
+    # 호출 종류별 추론 수준(Step 6 2차). None이면 서버 기본값(config), 빈 문자열이면 보내지 않는다(모델 기본 수준).
+    # 추론을 켠 로컬 호출에만 실린다.
+    reasoning_effort_answer: str | None = None
+    reasoning_effort_grounding: str | None = None
+    reasoning_effort_ocr: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
 
@@ -102,6 +108,36 @@ def plan_thinking(request: ChatRequest, provider: Provider) -> ThinkingPlan:
         ocr=everything or config.resolve_switch(request.disable_thinking_ocr, config.OCR_DISABLE_THINKING),
         controllable=True,
     )
+
+
+@dataclass
+class EffortPlan:
+    """이번 턴에서 호출 종류별로 실어 보낼 추론 수준(Step 6 2차). 빈 문자열이면 보내지 않는다."""
+    answer: str = ""
+    grounding: str = ""
+    ocr: str = ""
+
+    def to_public(self) -> dict[str, str]:
+        """실제로 실어 보내는 것만(빈 값은 뺀다)."""
+        return {kind: value for kind, value in (("answer", self.answer), ("grounding", self.grounding), ("ocr", self.ocr))
+                if value}
+
+
+def plan_effort(request: ChatRequest, provider: Provider, thinking: ThinkingPlan) -> EffortPlan:
+    """추론 수준은 추론을 켠 호출에만 의미가 있다 → 추론을 끄고 보내는 호출 종류와, 수준을 보내지 않는 provider는 비운다.
+
+    요청 값의 모양이 틀리면 ValueError(호출부가 사용자 오류로 바꾼다). 값이 모델에 맞는지는 서버만 안다.
+    """
+    wanted = EffortPlan(
+        answer=config.resolve_reasoning_effort(request.reasoning_effort_answer, "answer"),
+        grounding=config.resolve_reasoning_effort(request.reasoning_effort_grounding, "grounding"),
+        ocr=config.resolve_reasoning_effort(request.reasoning_effort_ocr, "ocr"),
+    )
+    if not provider.can_set_reasoning_effort():
+        return EffortPlan()
+    return EffortPlan(answer="" if thinking.answer else wanted.answer,
+                      grounding="" if thinking.grounding else wanted.grounding,
+                      ocr="" if thinking.ocr else wanted.ocr)
 
 
 @dataclass
@@ -213,6 +249,13 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         raise ChatError(f"지원하지 않는 답변 이미지 방식입니다: {request.answer_image_mode!r}. "
                         "'off'(끔), 'uploads'(업로드 이미지만), 'whole'(전체) 중에서 고르세요.") from error
     try:
+        for kind, value in (("answer", request.reasoning_effort_answer), ("grounding", request.reasoning_effort_grounding),
+                            ("ocr", request.reasoning_effort_ocr)):
+            config.resolve_reasoning_effort(value, kind)
+    except ValueError as error:
+        raise ChatError(f"추론 수준 값이 올바르지 않습니다: {str(error)!r}. 영문 소문자·숫자·'-'·'_'로 24자까지 적거나 "
+                        "비워 두세요(예: low, medium, xhigh — 모델이 받는 값만).") from error
+    try:
         uploads = sanitize_uploads(request.attachments)
         provider = create_provider(request.provider, model=request.model, api_key=request.api_key,
                                    base_url=request.base_url, disable_thinking=request.disable_thinking)
@@ -232,13 +275,16 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         provider = TracedProvider(provider, turn)
         turn.activate()
     thinking = plan_thinking(request, provider)
+    effort = plan_effort(request, provider, thinking)
     if turn is not None:
-        _record_input(turn, request, messages, uploads, image_mode, answer_image_mode, thinking, provider)
+        _record_input(turn, request, messages, uploads, image_mode, answer_image_mode, thinking, provider, effort)
     try:
         answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode,
-                               answer_image_mode, thinking)
+                               answer_image_mode, thinking, effort)
     except (ProviderError, UploadError, PdfError, ImageError, StorageError) as error:
-        failure = ChatError(str(error), status=502 if isinstance(error, ProviderError) else 400)
+        # 서버가 추론 수준을 받지 않은 것은 설정이 틀린 것이다(모델 서버의 장애가 아니다) → 400.
+        upstream = isinstance(error, ProviderError) and not isinstance(error, ReasoningEffortError)
+        failure = ChatError(str(error), status=502 if upstream else 400)
         await _save_reply(store, request, conversation_id, messages, f"{ERROR_PREFIX}{error}", [], trace_meta)
         if turn is not None:
             await turn.close("failed", reason=str(error))
@@ -273,6 +319,10 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
     if provider.is_local:
         # 추론 제어(Step 6)의 설정. 소프트·하드 조치 횟수는 vision 카운터(…ReasoningForced / …ReasoningStops)에 있다.
         meta["reasoning"] = config.reasoning_settings()
+        if effort.to_public():
+            # 호출 종류별로 실어 보낸 추론 수준(Step 6 2차). 서버가 받지 않았으면 턴이 오류로 끝나므로 여기 오지 않는다.
+            # 단, 수준이 없는 모델은 값을 무시할 뿐 거절하지 않는다 — "받았다"이지 "적용됐다"가 아니다.
+            meta["reasoningEffort"] = effort.to_public()
         if answer.usage.reasoning_actions:
             # 어느 호출(타일)이 왜 끊겼는지 — 화면 표시용. 도구 결과에는 넣지 않는다(답변 모델이 다시 부르지 않게).
             meta["reasoningActions"] = answer.usage.reasoning_actions[:config.MAX_REASONING_ACTIONS_IN_META]
@@ -294,7 +344,8 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
 
 
 def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[dict[str, Any]], uploads: list[Attachment],
-                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, provider: Provider) -> None:
+                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, provider: Provider,
+                  effort: EffortPlan) -> None:
     """턴의 입력: 질문, 새 첨부, 이번 턴의 설정. API key는 넣지 않는다."""
     turn.note(
         "input", "입력", question=trace.clip(messages[-1]["content"]), historyMessages=len(messages) - 1,
@@ -304,6 +355,7 @@ def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[di
         contextSize=request.context_size, thinkingDisabled=thinking.to_public() if thinking.controllable else None,
         thinkingControl=provider.can_disable_thinking(), visionMaxTokens=config.vision_max_tokens(),
         reasoning=config.reasoning_settings() if provider.is_local else None,
+        reasoningEffort=effort.to_public() or None,
         tiling=config.tile_settings() if image_mode == "tile" else None,
     )
 
@@ -396,7 +448,7 @@ async def _render_pending_pages(store: ChatStore, attachments: list[Attachment],
 
 async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, conversation_id: str,
                   messages: list[dict[str, Any]], uploads: list[Attachment], emit: Emit,
-                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan) -> Answer:
+                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, effort: EffortPlan) -> Answer:
     def progress(message: str, *, live: bool = False) -> None:
         # live: "추론 중… n토큰"처럼 1초마다 갱신되는 문구. 화면은 같은 줄을 바꿔 쓰고, 트레이스에는 적지 않는다
         # (호출 이벤트가 추론 토큰 수를 직접 갖는다). 단계 알림은 그대로 트레이스의 시간축에 남는다.
@@ -425,18 +477,19 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         turn.register_attachments(attachments)      # 모델에 보낸 이미지를 첨부 ID로 가리키기 위해
 
     # 2) 시각 OCR: needs_vlm 페이지만, 메인 답변 전에, 선택된 VLM에게 전사시킨다
-    #    (다른 방식 — 이미지 처리 방식·추론 여부 — 으로 전사해 둔 쪽은 이번 요청의 방식으로 다시 전사한다)
+    #    (다른 방식 — 이미지 처리 방식·추론 여부·추론 수준 — 으로 전사해 둔 쪽은 이번 요청의 방식으로 다시 전사한다)
     attachments, transcribed = await prepare_visual_ocr_evidence(
         attachments,
         read_image=build_ocr_reader(provider, image_mode=image_mode, usage=usage, on_progress=progress,
                                     load_tile_source=_tile_source_loader(store, attachments), on_tiles=tile_sink,
-                                    disable_thinking=thinking.ocr, on_live=live),
+                                    disable_thinking=thinking.ocr, on_live=live, reasoning_effort=effort.ocr),
         load_data=lambda item: store.load_attachment_data(item.id) if item.id is not None else _none(),
         on_progress=progress,
         cache_namespace=provider.cache_namespace,
         image_mode=image_mode,
         # 추론을 끌 수 있는 provider인데 끄지 않고 보내는 경우만 따로 표시한다(그 밖에는 Step 6-0 이전과 같은 기록).
         thinking=thinking.controllable and not thinking.ocr,
+        reasoning_effort=effort.ocr,
     )
     if transcribed:
         await store.save_attachments(conversation_id, attachments)
@@ -488,13 +541,14 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         provider=provider, attachments=attachments, store=store, conversation_id=conversation_id,
         default_read_chars=max(1000, min(16_000, attachment_budget // 3)), on_progress=progress,
         image_mode=image_mode, usage=usage, on_tiles=tile_sink, disable_thinking=thinking.grounding, on_live=live,
+        reasoning_effort=effort.grounding,
     )
     progress("답변을 생성하는 중…")
     language_hint = reply_language_hint(latest_user)
     result = await run_tool_loop(
         provider, model_messages, images=model_images or None, tools=tools,
         execute=lambda call: execute_tool(tool_context, call), on_progress=progress, describe=describe_tool_call,
-        language_hint=language_hint, on_live=live,
+        language_hint=language_hint, on_live=live, reasoning_effort=effort.answer,
     )
     text = result.text
     usage.answer_calls += result.model_calls
@@ -510,7 +564,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
             [*model_messages, {"role": "assistant", "content": text},
              {"role": "user", "content": f"{FALSE_REFUSAL_CORRECTION}\n{language_hint}".strip()}],
             images=model_images or None, reasoning_budget=config.reasoning_budget("answer"),
-            on_reasoning=lambda info: live(describe_reasoning_progress(info)),
+            on_reasoning=lambda info: live(describe_reasoning_progress(info)), reasoning_effort=effort.answer or None,
         )
         usage.count_reasoning("answer", retry)
         text = retry.text.strip() or text

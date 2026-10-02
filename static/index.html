@@ -127,6 +127,28 @@
         <label class="check"><input id="disableThinkingOcr" type="checkbox" /> 전사(OCR) 호출은 추론 끄기 — 권장</label>
         <p id="callThinkingHelp" class="help"></p>
       </div>
+      <!-- 추론 수준(Step 6 2차): 모델의 채팅 템플릿이 받는 값. 추론을 켠 호출에만 실린다. 모델 이름별로 저장한다. -->
+      <div id="effortField" class="effort-field">
+        <div class="effort-title">추론 수준 <span class="muted">(reasoning_effort — 추론을 켠 호출에만 · 모델 이름별로 저장)</span></div>
+        <div class="effort-row">
+          <label>답변
+            <input id="effortAnswer" type="text" list="effortOptions" autocomplete="off" spellcheck="false" maxlength="24" placeholder="모델 기본값" />
+          </label>
+          <label>위치 확인(bbox)
+            <input id="effortGrounding" type="text" list="effortOptions" autocomplete="off" spellcheck="false" maxlength="24" placeholder="모델 기본값" />
+          </label>
+          <label>전사(OCR)
+            <input id="effortOcr" type="text" list="effortOptions" autocomplete="off" spellcheck="false" maxlength="24" placeholder="모델 기본값" />
+          </label>
+        </div>
+        <datalist id="effortOptions">
+          <option value="low"></option>
+          <option value="medium"></option>
+          <option value="high"></option>
+          <option value="xhigh"></option>
+        </datalist>
+        <p id="effortHelp" class="help"></p>
+      </div>
     </div>
 
     <label>이미지 처리

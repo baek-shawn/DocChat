@@ -29,7 +29,8 @@ from typing import Awaitable, Callable
 from .. import config, trace
 from ..agent.prompts import OCR_RETRY_NOTE, OCR_SYSTEM_PROMPT, TILE_OCR_NOTE, ocr_instruction
 from ..attachments import Attachment
-from ..providers.base import ModelResponse, Provider, is_output_length_stop, is_reasoning_runaway
+from ..providers.base import (ModelResponse, Provider, ReasoningEffortError, is_output_length_stop,
+                              is_reasoning_runaway)
 from ..providers.reasoning import describe_reasoning_progress
 from .evidence import attachment_root_name, visual_ocr_evidence_name
 from .images import ModelImage, TileSource, VisionUsage, assemble_model_images
@@ -285,26 +286,28 @@ def merge_tile_transcriptions(parts: list[TileText], *, rows: int, cols: int, bl
 def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile_source: LoadTileSource | None = None,
                      usage: VisionUsage | None = None, on_progress: Progress | None = None,
                      on_tiles: TileSink | None = None, disable_thinking: bool = False,
-                     on_live: Progress | None = None) -> ReadImage:
+                     on_live: Progress | None = None, reasoning_effort: str = "") -> ReadImage:
     """전사 전용 호출(temperature 0, 전용 시스템 프롬프트)을 재시도와 함께 감싼다.
 
     전체 모드는 쪽마다 한 번, 타일 모드는 타일마다 한 번 호출한다. 어느 쪽이든 동시에 나가는 호출은
     OCR_CONCURRENCY개를 넘지 않는다.
     disable_thinking: 전사 호출의 추론을 끈다(요청마다 고른다). 출력 상한은 `config.VISION_MAX_TOKENS`.
     on_live: 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6). 단계 알림(on_progress)과 다르다.
+    reasoning_effort: 추론을 켠 전사 호출에 실을 추론 수준(Step 6 2차). 비어 있으면 보내지 않는다.
     """
     usage = usage if usage is not None else VisionUsage()
     notify = on_progress or (lambda _message: None)
     limiter = asyncio.Semaphore(config.OCR_CONCURRENCY)
     # 추론을 켠 전사 호출의 추론 예산(Step 6). 넘거나 반복하면 provider가 추론을 끊고 답만 이어 쓰게 한다.
     budget = config.reasoning_budget("ocr") if not disable_thinking else None
+    effort = (reasoning_effort or None) if not disable_thinking else None
     watch = (lambda info: on_live(describe_reasoning_progress(info))) if on_live is not None else None
 
     async def transcribe(image: ModelImage, instruction: str) -> tuple[str, str]:
         """이미지 한 장(쪽 전체 또는 타일)을 전사한다. (상태, 글)을 돌려준다."""
         async with trace.scope("ocr", f"전사 · {image.name}", image=image.name, tile=list(image.tile) if image.tile else None,
                                disableThinking=disable_thinking, maxTokens=config.vision_max_tokens(),
-                               reasoningBudget=budget) as span:
+                               reasoningBudget=budget, reasoningEffort=effort) as span:
             status, text = await _transcribe(image, instruction)
             span.set(result=status, text=trace.clip(text), chars=len(text))
             if status == "failed":
@@ -322,6 +325,7 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
                         [{"role": "system", "content": OCR_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
                         images=[image], temperature=0.0, disable_thinking=disable_thinking,
                         max_tokens=config.vision_max_tokens(), reasoning_budget=budget, on_reasoning=watch,
+                        reasoning_effort=effort,
                     )
                 usage.count_reasoning("ocr", response, image.name)
                 if is_reasoning_runaway(response.finish_reason):
@@ -349,7 +353,8 @@ def build_ocr_reader(provider: Provider, *, image_mode: str = "whole", load_tile
                 if is_usable_ocr_response(text):
                     return "ok", text
                 last_error = "empty or non-transcription OCR response"
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, ReasoningEffortError):
+                # 취소, 그리고 서버가 추론 수준을 받지 않은 경우(설정 오류 — 다시 보내도 같다)는 재시도·쪽 실패로 다루지 않는다.
                 raise
             except Exception as error:  # 한 페이지의 실패가 전체 답변을 막지 않게 한다.
                 last_error = error
@@ -429,15 +434,17 @@ async def prepare_visual_ocr_evidence(
     image_mode: str = "whole",
     thinking: bool = False,
     reasoning_budget: int | None = None,
+    reasoning_effort: str = "",
 ) -> tuple[list[Attachment], bool]:
     """(갱신된 첨부 목록, 전사를 수행했는지)를 돌려준다.
 
     전사 대상: 아직 전사하지 않은 쪽 + **다른 방식으로 전사해 둔 쪽**(이번 요청의 방식으로 다시 전사한다).
-    "방식"은 이미지 처리 방식(전체/타일), 전사 호출의 추론 여부(thinking), 추론을 켰을 때의 추론 예산(Step 6)이다.
+    "방식"은 이미지 처리 방식(전체/타일), 전사 호출의 추론 여부(thinking), 추론을 켰을 때의 추론 예산(Step 6)과
+    추론 수준(reasoning_effort, Step 6 2차)이다.
     """
     cache = cache if cache is not None else OCR_CACHE
     budget = config.reasoning_budget("ocr") if reasoning_budget is None else int(reasoning_budget)
-    variant = config.image_mode_variant(image_mode, thinking=thinking, budget=budget)
+    variant = config.image_mode_variant(image_mode, thinking=thinking, budget=budget, effort=reasoning_effort)
 
     def pending(item: Attachment) -> bool:
         if not item.is_image or not (item.data or item.has_data):

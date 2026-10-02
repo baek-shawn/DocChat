@@ -8,6 +8,8 @@
     reasoning_budget  : 이 호출의 추론 토큰 예산(Step 6). 추론을 켠 로컬 호출만 스트리밍으로 받으며 센다 — 넘거나 반복이
                         보이면 추론을 끊고 답만 이어 쓰게 한 뒤(소프트), 그래도 안 되면 finish_reason="reasoning_runaway"(하드)
     on_reasoning      : 추론 진행(토큰 수·초)과 소프트/하드 조치를 알리는 콜백(`reasoning.ReasoningProgress`)
+    reasoning_effort  : 이 호출의 추론 수준(Step 6 2차, 예: Qwen3.8의 "low" / "medium" / "xhigh"). 추론을 켠 로컬 호출에만
+                        실린다. 비어 있으면 보내지 않는다(모델 기본 수준). 서버가 값을 받지 않으면 `ReasoningEffortError`
 
 내부 메시지 형식(모든 provider가 공유):
     {"role": "system",    "content": str}
@@ -76,6 +78,14 @@ class ToolsUnsupportedError(ProviderError):
 
 class ContextWindowError(ProviderError):
     """프롬프트가 모델 컨텍스트를 넘었다."""
+
+
+class ReasoningEffortError(ProviderError):
+    """서버(모델의 채팅 템플릿)가 요청한 추론 수준을 받지 않았다(Step 6 2차).
+
+    설정이 틀린 것이라 다시 보내도 같은 결과다 → 전사 재시도·도구 오류·타일의 "일부 실패"로 다루지 않고
+    턴의 오류로 올린다. 값을 빼고 다시 보내지도 않는다(요청한 수준과 다른 수준으로 돈 답이 기록에 섞인다).
+    """
 
 
 _CONTEXT_PATTERN = re.compile(
@@ -164,11 +174,16 @@ class Provider(ABC):
         """"추론 끄기 — 모든 호출"로 만들어졌는가. 그러면 `analyze(disable_thinking=False)`여도 추론을 끄고 보낸다."""
         return False
 
+    def can_set_reasoning_effort(self) -> bool:
+        """이 provider가 추론 수준(`reasoning_effort`)을 실어 보내는가(Step 6 2차). 로컬(OpenAI 호환)만 그렇다."""
+        return False
+
     @abstractmethod
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
                       disable_thinking: bool = False, max_tokens: int | None = None,
-                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None,
+                      reasoning_effort: str | None = None) -> ModelResponse:
         ...
 
     @abstractmethod

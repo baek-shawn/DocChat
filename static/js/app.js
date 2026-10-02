@@ -15,6 +15,9 @@
   const TRACE_KINDS = { input: '입력', preprocess: '전처리', ocr: '전사', evidence: '증거', model: '모델', tool: '도구', loop: '루프', cleanup: '정리', progress: '진행', files: '파일', answer: '답변' };
   const TRACE_STATUS = { running: '진행 중', done: '완료', failed: '실패', cancelled: '취소', interrupted: '중단됨' };
   const MODEL_KIND_LABELS = { answer: '답변', ocr: '전사', grounding: '위치 확인' };
+  // 추론 수준(Step 6 2차) 입력 칸: 호출 종류 → 입력 요소 id. 값의 모양은 app/config.py의 _EFFORT_PATTERN과 짝이다.
+  const EFFORT_INPUTS = { answer: 'effortAnswer', grounding: 'effortGrounding', ocr: 'effortOcr' };
+  const EFFORT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 
   const store = {
     get(key, fallback = '') { try { return localStorage.getItem(`docchat.${key}`) ?? fallback; } catch { return fallback; } },
@@ -50,6 +53,7 @@
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
     serverVision: { disableThinkingGrounding: true, disableThinkingOcr: true, maxTokens: 4096 },
     serverReasoning: null,                   // 추론 제어(Step 6) 설정: 호출 종류별 추론 예산·반복 기준(/api/health)
+    serverReasoningEffort: { answer: '', grounding: '', ocr: '' },   // 추론 수준의 서버 기본값(/api/health). 고른 값은 모델별로 localStorage에
     serverDebugTrace: false,                 // 서버가 턴 트레이스를 기록하는지(/api/health)
     trace: { id: '', doc: null, timer: 0, open: new Set(), sections: new Map(), collapsed: new Set() },   // 열려 있는 "턴 과정" 창(펼친 행·접이식·접은 가지 기억)
     models: []
@@ -66,6 +70,7 @@
     'toggleLabels', 'zoomOut', 'zoomReset', 'zoomIn', 'viewerDownload', 'viewerClose', 'viewerStage', 'viewerRegions',
     'settingsDialog', 'providerSelect', 'baseUrlField', 'baseUrl', 'apiKey', 'apiKeyLabel', 'modelName', 'modelOptions',
     'contextField', 'contextSize', 'disableThinking', 'callThinking', 'disableThinkingGrounding', 'disableThinkingOcr', 'callThinkingHelp',
+    'effortField', 'effortAnswer', 'effortGrounding', 'effortOcr', 'effortHelp',
     'imageMode', 'imageModeHelp', 'answerImageMode', 'answerImageHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
     'traceDialog', 'traceStatus', 'traceRefresh', 'traceFoldAll', 'traceUnfoldAll', 'traceDownload', 'traceClose', 'traceSummary', 'traceBody'
   ].map((id) => [id, $(id)]));
@@ -233,6 +238,11 @@
   const answerImageMode = () => state.answerImageMode || state.serverAnswerImageMode;
   // 요청에 실을 호출별 추론 끄기(kind: 'disableThinkingGrounding' | 'disableThinkingOcr'). 고른 적이 없으면 서버 기본값.
   const callThinkingOff = (kind) => state[kind] === '' ? state.serverVision[kind] !== false : state[kind] === 'true';
+  // 추론 수준(Step 6 2차)은 **모델 이름별로** 저장한다 — 값이 모델마다 달라서(Qwen3.8의 xhigh를 다른 모델에 보내면 거절될 수 있다)
+  // 모델을 바꾸면 그 모델에서 고른 값이 따라온다. 그 모델로 고른 적이 없으면 null → 요청에 싣지 않아 서버 기본값을 쓴다.
+  const effortKey = (kind, model) => `reasoningEffort.${kind}.${model}`;
+  const storedEffort = (kind, model = state.model) => { const value = store.get(effortKey(kind, model), null); return value === null ? null : String(value); };
+  const effortFor = (kind, model = state.model) => storedEffort(kind, model) ?? (state.serverReasoningEffort[kind] || '');
 
   async function loadServerDefaults() {
     try {
@@ -243,6 +253,7 @@
       if (Number(health.maxModelImages) > 0) state.maxModelImages = Number(health.maxModelImages);
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
       state.serverReasoning = health.reasoning || null;
+      if (health.reasoningEffort) state.serverReasoningEffort = { ...state.serverReasoningEffort, ...health.reasoningEffort };
       state.serverDebugTrace = health.debugTrace === true;
     } catch { /* 기본값(전체)으로 둔다 */ }
   }
@@ -264,6 +275,20 @@
       + (limit > 0
         ? ` 위치 확인·전사 호출의 출력 상한은 ${fmt(limit)}토큰(.env의 DOCCHAT_VISION_MAX_TOKENS)이고, 추론을 켠 호출에는 추론 예산이 더해집니다. 상한에 닿은 호출은 다시 보내지 않습니다.`
         : ' 위치 확인·전사 호출의 출력 상한이 꺼져 있습니다(.env의 DOCCHAT_VISION_MAX_TOKENS=0).');
+    // 추론 수준은 추론을 켠 호출에만 실린다 → 그 호출의 추론이 꺼져 있으면 칸을 잠근다(값은 그대로 둔다).
+    els.effortAnswer.disabled = everything;
+    els.effortGrounding.disabled = everything || els.disableThinkingGrounding.checked;
+    els.effortOcr.disabled = everything || els.disableThinkingOcr.checked;
+    const defaults = Object.entries(state.serverReasoningEffort).filter(([, value]) => value).map(([kind, value]) => `${MODEL_KIND_LABELS[kind]} ${value}`);
+    els.effortHelp.textContent = '모델의 채팅 템플릿이 받는 값만 넣습니다(예: Qwen3.8은 low · medium · xhigh). 비우면 보내지 않습니다 — 모델의 기본 수준으로 추론합니다(Qwen3.8은 가장 길게 추론하는 xhigh). '
+      + '서버가 받지 않는 값이면 답 대신 오류로 알려 줍니다. 수준이 없는 모델(Qwen3.5 등)은 값을 그냥 무시하므로, 효과는 "과정 보기"의 추론 토큰 수로 확인하세요. '
+      + '추론을 끈 호출에는 실리지 않고(칸이 잠깁니다), 전사의 수준을 바꾸면 그 쪽은 다시 전사합니다.'
+      + (defaults.length ? ` 이 모델로 고른 적이 없으면 서버 기본값(${defaults.join(' · ')}, .env의 DOCCHAT_REASONING_EFFORT_*)을 씁니다.` : '');
+  }
+
+  // 설정 창의 추론 수준 칸을 그 모델에 저장된 값(없으면 서버 기본값)으로 채운다.
+  function fillEffortInputs(model) {
+    for (const [kind, id] of Object.entries(EFFORT_INPUTS)) els[id].value = effortFor(kind, model);
   }
 
   function renderModelBar() {
@@ -295,6 +320,7 @@
     els.modelName.value = provider === state.provider ? state.model : '';
     els.modelOptions.replaceChildren();
     if (provider === state.provider) state.models.forEach((id) => els.modelOptions.append(new Option(id, id)));
+    fillEffortInputs(els.modelName.value.trim());
     setTestResult('idle', '테스트 전');
   }
 
@@ -348,9 +374,22 @@
     const form = formConnection();
     if (form.provider === LOCAL_PROVIDER && !/^https?:\/\/.+/i.test(form.baseUrl)) { setTestResult('fail', 'http:// 또는 https://로 시작하는 서버 주소를 입력하세요.'); els.baseUrl.focus(); return; }
     if (form.provider !== LOCAL_PROVIDER && !form.apiKey) { setTestResult('fail', 'API key를 입력하세요.'); els.apiKey.focus(); return; }
+    // 추론 수준: 모양만 검사한다(모델이 받는 값인지는 서버만 안다). 로컬 provider일 때만 칸이 보인다.
+    const efforts = {};
+    for (const [kind, id] of Object.entries(EFFORT_INPUTS)) {
+      const value = els[id].value.trim().toLowerCase();
+      if (form.provider === LOCAL_PROVIDER && value && !EFFORT_PATTERN.test(value)) {
+        setTestResult('fail', `추론 수준 "${value}"은(는) 쓸 수 없는 값입니다. 영문 소문자·숫자·-·_로 24자까지 적거나 비워 두세요.`);
+        els[id].focus(); return;
+      }
+      efforts[kind] = value;
+    }
     state.provider = form.provider;
     if (form.provider === LOCAL_PROVIDER) state.baseUrl = form.baseUrl;
     state.model = els.modelName.value.trim();
+    if (form.provider === LOCAL_PROVIDER && state.model) {
+      for (const [kind, value] of Object.entries(efforts)) store.set(effortKey(kind, state.model), value);
+    }
     state.contextSize = Math.max(1024, Number(els.contextSize.value) || 8192);
     state.disableThinking = els.disableThinking.checked;
     state.disableThinkingGrounding = String(els.disableThinkingGrounding.checked);
@@ -454,6 +493,8 @@
         ...connection(), model: state.model, contextSize: state.contextSize, disableThinking: state.disableThinking,
         disableThinkingGrounding: callThinkingOff('disableThinkingGrounding'), disableThinkingOcr: callThinkingOff('disableThinkingOcr'),
         imageMode: imageMode(), answerImageMode: answerImageMode(), conversationId: state.currentId, stream: true,
+        // 추론 수준(Step 6 2차): 이 모델로 고른 값. 고른 적이 없으면 null → 서버 기본값. 추론을 켠 호출에만 실린다.
+        reasoningEffortAnswer: storedEffort('answer'), reasoningEffortGrounding: storedEffort('grounding'), reasoningEffortOcr: storedEffort('ocr'),
         // meta(답변을 어떤 방식으로 처리했는지)도 되돌려 보내야 서버가 대화를 다시 저장할 때 지워지지 않는다.
         messages: history.map(({ role, content, files: sent, artifacts, meta, createdAt }) => ({ role, content, files: sent, artifacts, meta, createdAt })),
         attachments: files.map(({ name, mime, size, base64 }) => ({ name, mime, size, base64 }))
@@ -611,7 +652,9 @@
     const showAnswerImages = !!answerImages && (answerImages.sent > 0 || answerImages.candidates > 0 || (!!meta.answerImageMode && meta.answerImageMode !== 'uploads'));
     // 추론 제어(Step 6)의 조치가 있었으면 일반 대화 답변에도 적는다.
     const answerActions = (vision.answerReasoningForced || 0) + (vision.answerReasoningStops || 0);
-    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !answerActions && !vision.reasoningTokens) return '';
+    // 추론 수준(Step 6 2차): 호출 종류별로 실어 보낸 값. 답변 호출에 실었으면 일반 대화 답변에도 적는다(수준별 비교용).
+    const effort = meta.reasoningEffort || {};
+    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !answerActions && !vision.reasoningTokens && !effort.answer) return '';
     const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
     if (showAnswerImages) parts.push(describeAnswerImages(meta.answerImageMode, answerImages));
     if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
@@ -621,12 +664,13 @@
       const notes = [];
       const off = meta.thinkingDisabled?.[kind];
       if (typeof off === 'boolean') notes.push(off ? '추론 끔' : '추론 끄지 않음');
+      if (effort[kind]) notes.push(`추론 수준 ${effort[kind]}`);
       if (stops) notes.push(`출력 상한${meta.visionMaxTokens ? ` ${Number(meta.visionMaxTokens).toLocaleString()}토큰` : ''} 도달 ${stops}회`);
       if (forced) notes.push(`추론을 끊고 답으로 넘김 ${forced}회${reasoningWhere(meta.reasoningActions, kind, false)}`);
       if (runaways) notes.push(`추론이 끝나지 않아 중단 ${runaways}회${reasoningWhere(meta.reasoningActions, kind, true)}`);
       return notes.length ? ` (${notes.join(', ')})` : '';
     };
-    if (answerActions) parts.push(`답변 호출 ${vision.answerCalls || 0}회${detail('answer', 0, vision.answerReasoningForced, vision.answerReasoningStops)}`);
+    if (answerActions || effort.answer) parts.push(`답변 호출 ${vision.answerCalls || 0}회${detail('answer', 0, vision.answerReasoningForced, vision.answerReasoningStops)}`);
     if (vision.ocrCalls) parts.push(`전사 호출 ${vision.ocrCalls}회${detail('ocr', vision.ocrLengthStops, vision.ocrReasoningForced, vision.ocrReasoningStops)}`);
     if (vision.groundingCalls) parts.push(`위치 확인 호출 ${vision.groundingCalls}회${detail('grounding', vision.groundingLengthStops, vision.groundingReasoningForced, vision.groundingReasoningStops)}`);
     if (!calls) parts.push('이번 턴에는 전사·위치 확인 호출 없음');
@@ -821,7 +865,7 @@
         ['추론 끄기', data.thinkingControl === false ? '서버가 지원하지 않음' : (data.disableThinking ? '예' : '아니오')],
         ['출력 상한', data.maxTokens], ['종료 사유', data.finishReason], ['입력 토큰', data.promptTokens], ['출력 토큰', data.completionTokens],
         // 추론 제어(Step 6): 예산, 센 추론 토큰·시간, 추론을 끊고 답으로 넘겼는지(소프트), 끝내 중단했는지(하드)
-        ['추론 예산', data.reasoningBudget], ['추론 토큰', data.reasoningTokens],
+        ['추론 수준', data.reasoningEffort], ['추론 예산', data.reasoningBudget], ['추론 토큰', data.reasoningTokens],
         ['추론 시간', typeof data.reasoningSeconds === 'number' ? `${data.reasoningSeconds}s` : undefined],
         ['추론 조치', data.forced ? `${data.forced === 'repeat' ? '반복' : '예산 초과'} → 추론을 끊고 답으로` : undefined],
         ['되풀이된 줄', data.forcedCycle],
@@ -1097,6 +1141,10 @@
   els.openSettings.addEventListener('click', openSettings);
   els.providerSelect.addEventListener('change', syncSettingsForm);
   els.disableThinking.addEventListener('change', syncCallThinking);
+  // 호출별 추론 끄기를 바꾸면 그 호출의 추론 수준 칸이 잠기거나 풀린다. 모델 이름을 바꾸면 그 모델에 저장된 수준을 보여 준다.
+  els.disableThinkingGrounding.addEventListener('change', syncCallThinking);
+  els.disableThinkingOcr.addEventListener('change', syncCallThinking);
+  els.modelName.addEventListener('change', () => fillEffortInputs(els.modelName.value.trim()));
   els.settingsTest.addEventListener('click', () => void testFromSettings());
   els.saveSettings.addEventListener('click', saveSettings);
   els.testConnection.addEventListener('click', () => void testConnection());

@@ -12,6 +12,7 @@ API key는 여기에 두지 않는다 — 요청마다 받아서 쓰고 저장�
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,8 @@ def parse_env_file(text: str) -> dict[str, str]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        elif value.startswith("#"):
+            value = ""                                    # 값 없이 주석만 있는 줄(`NAME=   # 설명`)
         elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()      # 값 뒤에 붙인 주석
         if name:
@@ -226,15 +229,18 @@ def tile_settings() -> dict[str, float | int]:
     }
 
 
-def image_mode_variant(mode: str, *, thinking: bool = False, budget: int = 0) -> str:
+def image_mode_variant(mode: str, *, thinking: bool = False, budget: int = 0, effort: str = "") -> str:
     """전사 결과가 어떤 방식·설정으로 만들어졌는지 나타내는 문자열(OCR 캐시 키와 첨부 메타데이터에 쓴다).
 
     모드나 타일 설정이 바뀌면 값이 달라지므로 이전 결과가 섞여 재사용되지 않는다.
     thinking: 전사 호출의 추론을 끄지 않고 보냈는가(Step 6-0). 추론을 끈 쪽이 기본이라 그때는 아무것도 붙이지 않는다
     — Step 6-0 이전에 전사해 둔 쪽의 기록(`whole`, `tile:…`)과 같은 값이 되어 다시 전사하지 않는다.
     budget: 추론을 켠 전사의 추론 예산(Step 6). 예산을 바꾸면 끊기는 자리가 달라 결과가 달라지므로 키에 넣는다(0이면 안 붙인다).
+    effort: 추론을 켠 전사에 실어 보낸 추론 수준(Step 6 2차). 비어 있으면 안 붙인다(1차의 기록과 같은 값).
     """
-    suffix = ("+thinking" + (f":b{int(budget)}" if thinking and budget else "")) if thinking else ""
+    suffix = ""
+    if thinking:
+        suffix = "+thinking" + (f":b{int(budget)}" if budget else "") + (f":e{effort}" if effort else "")
     if mode != "tile":
         return f"whole{suffix}"
     return ":".join(["tile", *(f"{value:g}" for value in (
@@ -295,6 +301,53 @@ def reasoning_settings() -> dict[str, int | dict[str, int]]:
         "repeatLines": REASONING_REPEAT_LINES, "repeatCount": REASONING_REPEAT_COUNT,
         "repeatMinChars": REASONING_REPEAT_MIN_CHARS,
     }
+
+
+# --------------------------------------------------------------------------- 추론 수준 (Step 6 2차)
+# 모델이 추론의 "정도"를 받는 경우(예: Qwen3.8의 chat_template이 받는 reasoning_effort = low / medium / xhigh)에 실어 보낼 값.
+# 호출 종류별로 따로이고 요청마다 고를 수 있다(`reasoningEffortAnswer` 등). 요청에 없으면 아래 값을 쓴다.
+# 빈 값이면 보내지 않는다 = 모델의 기본 수준(Qwen3.8은 xhigh — 가장 길게 추론한다).
+# 값은 모델마다 달라(Qwen3.8에는 high가 없다) 목록으로 묶지 않고 글자 모양만 검사한다. 서버가 받지 않는 값이면
+# 그 턴은 오류로 끝난다(빼고 다시 보내지 않는다 — 요청한 수준과 다른 수준으로 돈 답이 기록에 섞이면 안 된다).
+# 추론을 켠 로컬(OpenAI 호환) 호출에만 실린다.
+_EFFORT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
+
+
+def normalize_reasoning_effort(value: str | None) -> str:
+    """추론 수준 값을 다듬는다(앞뒤 공백 제거, 소문자). 빈 값은 그대로 빈 값. 모양이 틀리면 ValueError."""
+    text = str(value or "").strip().lower()
+    if text and not _EFFORT_PATTERN.match(text):
+        raise ValueError(text)
+    return text
+
+
+def _effort(name: str) -> str:
+    """환경변수의 추론 수준. 알아볼 수 없는 값이면 빈 값(보내지 않음)."""
+    try:
+        return normalize_reasoning_effort(os.environ.get(name))
+    except ValueError:
+        return ""
+
+
+REASONING_EFFORT_ANSWER = _effort("DOCCHAT_REASONING_EFFORT_ANSWER")
+REASONING_EFFORT_GROUNDING = _effort("DOCCHAT_REASONING_EFFORT_GROUNDING")
+REASONING_EFFORT_OCR = _effort("DOCCHAT_REASONING_EFFORT_OCR")
+
+
+def reasoning_effort(kind: str) -> str:
+    """호출 종류별 추론 수준의 서버 기본값. 빈 문자열이면 보내지 않는다."""
+    return {"answer": REASONING_EFFORT_ANSWER, "grounding": REASONING_EFFORT_GROUNDING,
+            "ocr": REASONING_EFFORT_OCR}.get(kind, "")
+
+
+def resolve_reasoning_effort(requested: str | None, kind: str) -> str:
+    """요청에 값이 없으면(None) 서버 기본값, 있으면 그 값(빈 문자열 = 보내지 않음). 모양이 틀리면 ValueError."""
+    return reasoning_effort(kind) if requested is None else normalize_reasoning_effort(requested)
+
+
+def reasoning_effort_settings() -> dict[str, str]:
+    """요청에 추론 수준이 없을 때 쓰는 값 — /api/health가 화면에 알려 준다."""
+    return {kind: reasoning_effort(kind) for kind in REASONING_KINDS}
 
 
 # --------------------------------------------------------------------------- §5.3 OCR 전사

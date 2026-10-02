@@ -6,6 +6,9 @@
 예산을 넘거나 반복이 보이면 스트림을 끊고, 쓴 추론 뒤에 `</think>`를 붙인 assistant 메시지로 **같은 요청을 이어 쓰기**
 (`continue_final_message`)로 다시 보낸다 — 답은 잘리지 않고 추론만 잘린다(소프트). 이어 쓰기도 걸리거나 빈 답이면
 `finish_reason="reasoning_runaway"`로 끝낸다(하드). 추론을 끈 호출은 Step 6 이전 경로(비스트리밍) 그대로다.
+
+추론 수준(Step 6 2차): 추론을 켠 로컬 호출에 `chat_template_kwargs.reasoning_effort`를 싣는다(모델의 채팅 템플릿이 받는 값 —
+Qwen3.8은 low / medium / xhigh). 서버가 그 값을 받지 않으면 빼고 다시 보내지 않고 `ReasoningEffortError`로 끝낸다.
 """
 from __future__ import annotations
 
@@ -19,9 +22,9 @@ from openai import AsyncOpenAI
 
 from .. import config
 from ..pipeline.images import ModelImage
-from .base import (REASONING_RUNAWAY, ContextWindowError, Message, ModelResponse, Provider, ProviderError, ToolCall,
-                   ToolSpec, ToolsUnsupportedError, compact_messages, is_context_window_error, image_anchor_index,
-                   looks_like_tools_unsupported)
+from .base import (REASONING_RUNAWAY, ContextWindowError, Message, ModelResponse, Provider, ProviderError,
+                   ReasoningEffortError, ToolCall, ToolSpec, ToolsUnsupportedError, compact_messages,
+                   is_context_window_error, image_anchor_index, looks_like_tools_unsupported)
 from .reasoning import FORCED_END_NOTE, InlineThinkSplitter, OnReasoning, ReasoningMonitor
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -113,12 +116,17 @@ class OpenAICompatProvider(Provider):
         # _disable_thinking은 모든 호출에 적용되는 설정이고, 호출 하나만 끄는 것은 analyze(disable_thinking=True)다.
         self._disable_thinking = disable_thinking and is_local
         self._thinking_control = is_local      # 서버가 그 필드를 거절하면 False — 이후로는 보내지 않는다
+        # 서버가 받지 않은 추론 수준 → 서버의 오류 글(Step 6 2차). 같은 값을 다시 보내지 않고 바로 같은 오류를 낸다.
+        self._rejected_efforts: dict[str, str] = {}
 
     def can_disable_thinking(self) -> bool:
         return self._thinking_control
 
     def thinking_off_for_every_call(self) -> bool:
         return self._disable_thinking
+
+    def can_set_reasoning_effort(self) -> bool:
+        return self.is_local
 
     def _thinking_off(self, disable_thinking: bool) -> bool:
         """이 호출이 실제로 추론을 끄고 나가는가."""
@@ -146,7 +154,8 @@ class OpenAICompatProvider(Provider):
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
                       disable_thinking: bool = False, max_tokens: int | None = None,
-                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None,
+                      reasoning_effort: str | None = None) -> ModelResponse:
         # 출력 상한은 폭주가 확인된 로컬 서버에만 보낸다. 클라우드 API는 이름도 의미도 달라(예: max_completion_tokens)
         # 실제로 확인하지 않고는 넣지 않는다.
         limit = int(max_tokens) if max_tokens and max_tokens > 0 and self.is_local else None
@@ -155,8 +164,12 @@ class OpenAICompatProvider(Provider):
         budget = max(0, int(reasoning_budget or 0)) if watch else 0
         if watch and limit and budget:
             limit += budget      # 상한 = 추론 예산 + 출력 몫. 이어 쓰기 호출은 출력 몫만 받는다
+        # 추론 수준도 추론을 켠 로컬 호출에만 싣는다(Step 6 2차). 추론을 끈 호출의 요청은 이전과 같다.
+        effort = str(reasoning_effort or "").strip() if watch else ""
+        if effort in self._rejected_efforts:
+            raise ReasoningEffortError(self._effort_refusal(effort, self._rejected_efforts[effort]))
         options: dict[str, Any] = dict(temperature=temperature, disable_thinking=disable_thinking, max_tokens=limit,
-                                       watch=watch, budget=budget, on_reasoning=on_reasoning)
+                                       watch=watch, budget=budget, on_reasoning=on_reasoning, effort=effort)
         try:
             return await self._complete(messages, images, tools, **options)
         except ContextWindowError:
@@ -168,7 +181,7 @@ class OpenAICompatProvider(Provider):
             return await self._complete(compact_messages(messages, 2), (images or [])[:1] or None, tools, **options)
 
     def _request(self, messages: list[Message], images: list[ModelImage] | None, tools: list[ToolSpec] | None,
-                 temperature: float, disable_thinking: bool, max_tokens: int | None) -> dict[str, Any]:
+                 temperature: float, disable_thinking: bool, max_tokens: int | None, effort: str = "") -> dict[str, Any]:
         request: dict[str, Any] = {"model": self.model, "messages": to_wire_messages(messages, images)}
         if self._send_temperature:
             request["temperature"] = temperature
@@ -177,6 +190,10 @@ class OpenAICompatProvider(Provider):
             request["tool_choice"] = "auto"
         if self._thinking_off(disable_thinking):
             request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        elif effort:
+            # 모델의 채팅 템플릿이 받는 추론 수준(Step 6 2차). 추론을 끊고 이어 쓰는 요청도 이 extra_body를 그대로 물려받는다
+            # — 템플릿이 넣는 지시문이 같아야 앞의 요청과 접두가 같다.
+            request["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": effort}}
         if max_tokens:
             request["max_tokens"] = max_tokens
         return request
@@ -184,10 +201,10 @@ class OpenAICompatProvider(Provider):
     async def _complete(self, messages: list[Message], images: list[ModelImage] | None,
                         tools: list[ToolSpec] | None, *, temperature: float, disable_thinking: bool = False,
                         max_tokens: int | None = None, watch: bool = False, budget: int = 0,
-                        on_reasoning: OnReasoning | None = None) -> ModelResponse:
-        request = self._request(messages, images, tools, temperature, disable_thinking, max_tokens)
+                        on_reasoning: OnReasoning | None = None, effort: str = "") -> ModelResponse:
+        request = self._request(messages, images, tools, temperature, disable_thinking, max_tokens, effort)
         again = dict(temperature=temperature, disable_thinking=disable_thinking, max_tokens=max_tokens, watch=watch,
-                     budget=budget, on_reasoning=on_reasoning)
+                     budget=budget, on_reasoning=on_reasoning, effort=effort)
         try:
             if watch:
                 return await self._watched(request, messages, images, budget, on_reasoning, max_tokens)
@@ -200,6 +217,11 @@ class OpenAICompatProvider(Provider):
                     # 뜻이므로 상한을 빼고 보낸다 — 그래도 출력은 남은 자리(< 상한)를 넘지 못한다.
                     return await self._complete(messages, images, tools, **{**again, "max_tokens": None})
                 raise ContextWindowError(detail) from error
+            if effort and error.status_code in (400, 422, 500) and await self._effort_is_refused(effort):
+                # 서버(모델의 채팅 템플릿)가 이 추론 수준을 받지 않는다. 빼고 다시 보내지 않는다(Step 6 2차) — 아래의
+                # "도구 미지원 → JSON 폴백" 판정(400이면 무엇이든 해당)보다 먼저 가려야 엉뚱한 전환이 일어나지 않는다.
+                self._rejected_efforts[effort] = detail
+                raise ReasoningEffortError(self._effort_refusal(effort, detail)) from error
             thinking_off = self._thinking_off(disable_thinking)
             if thinking_off and error.status_code in (400, 422) and re.search(
                     r"chat_template_kwargs|enable_thinking|extra|unknown|unrecognized|unexpected", detail, re.IGNORECASE):
@@ -215,6 +237,35 @@ class OpenAICompatProvider(Provider):
         except openai.APIError as error:  # 시간 초과·연결 실패 포함
             raise ProviderError(self._explain(error)) from error
         return self._parse_completion(completion)
+
+    # ------------------------------------------------------------------ 추론 수준(Step 6 2차)
+    async def _effort_is_refused(self, effort: str) -> bool:
+        """거절된 요청의 원인이 추론 수준인가. 1토큰짜리 확인 요청 둘로 가린다: 수준을 실은 것은 거절되고 뺀 것은 통과하는가.
+
+        서버의 오류 문구로 판단하지 않는다 — 템플릿이 던지는 예외의 문구는 모델마다 다르고, 400은 다른 이유(도구 미지원,
+        temperature 거절)로도 온다. 확인 요청은 거절된 뒤에만 나가므로 정상 경로의 호출 수는 그대로다.
+        """
+        async def accepted(extra_body: dict[str, Any] | None) -> bool | None:
+            probe: dict[str, Any] = {"model": self.model, "messages": [{"role": "user", "content": "ping"}],
+                                     "max_tokens": 1}
+            if extra_body:
+                probe["extra_body"] = extra_body
+            try:
+                await self._client.chat.completions.create(**probe)
+            except openai.APIStatusError:
+                return False
+            except openai.APIError:      # 연결 실패·시간 초과 → 가릴 수 없다
+                return None
+            return True
+
+        if await accepted({"chat_template_kwargs": {"reasoning_effort": effort}}) is not False:
+            return False
+        return await accepted(None) is True
+
+    @staticmethod
+    def _effort_refusal(effort: str, detail: str) -> str:
+        return (f"모델 서버가 추론 수준 \"{effort}\"을(를) 받지 않았습니다. 설정의 \"추론 수준\"을 이 모델이 받는 값으로 "
+                f"바꾸거나 비워 두세요(예: Qwen3.8은 low · medium · xhigh). 서버 응답: {detail[:400]}")
 
     @staticmethod
     def _parse_completion(completion: Any) -> ModelResponse:

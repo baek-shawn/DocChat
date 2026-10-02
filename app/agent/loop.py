@@ -18,8 +18,8 @@ from typing import Any, Awaitable, Callable
 
 from .. import config, trace
 from ..pipeline.images import ModelImage
-from ..providers.base import (Message, ModelResponse, Provider, ToolCall, ToolSpec, ToolsUnsupportedError,
-                              is_output_length_stop, is_reasoning_runaway, last_user_index)
+from ..providers.base import (Message, ModelResponse, Provider, ReasoningEffortError, ToolCall, ToolSpec,
+                              ToolsUnsupportedError, is_output_length_stop, is_reasoning_runaway, last_user_index)
 from ..providers.reasoning import describe_reasoning_progress
 from .prompts import (AFTER_TOOL_RESULT, CONTINUE_ANSWER, FORCE_FINAL_ANSWER, RESEND_VALID_TOOL_JSON,
                       json_tool_protocol, json_tool_reminder)
@@ -225,9 +225,11 @@ async def run_tool_loop(
     temperature: float = 0.2,
     language_hint: str = "",
     on_live: Progress | None = None,
+    reasoning_effort: str = "",
 ) -> LoopResult:
     """language_hint: "최종 답변을 한국어로" 같은 한 줄. 메시지에 미리 박지 않고 루프가 상황을 보고 붙인다.
     on_live: 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6).
+    reasoning_effort: 답변 호출에 실을 추론 수준(Step 6 2차). 비어 있으면 보내지 않는다.
 
     gemma3 실측(각 6회): JSON 폴백에서 도구를 제공하는 호출의 user 턴에 언어 지시가 **어디에든** 있으면
     도구 호출이 0/6으로 죽고, 빼면 위치 질문 6/6 · 비위치 질문 오호출 0/6이었다. 그래서
@@ -262,7 +264,8 @@ async def run_tool_loop(
         nonlocal model_calls, reasoning_forced
         model_calls += 1
         reply = await provider.analyze(request, images, offered, temperature=temperature,
-                                       reasoning_budget=config.reasoning_budget("answer"), on_reasoning=watch)
+                                       reasoning_budget=config.reasoning_budget("answer"), on_reasoning=watch,
+                                       reasoning_effort=reasoning_effort or None)
         if reply.forced:
             reasoning_forced += 1
         responses.append(reply)
@@ -365,6 +368,9 @@ async def run_tool_loop(
                                    arguments=call.arguments, step=steps) as span:
                 try:
                     result = await execute(call)  # type: ignore[misc]
+                except ReasoningEffortError:
+                    # 설정(추론 수준)이 틀린 것이라 모델이 고칠 수 없다 → 도구 오류로 되돌려 주지 않고 턴의 오류로 올린다.
+                    raise
                 except Exception as error:  # 도구의 예기치 못한 실패도 모델에게 알려 스스로 복구하게 한다.
                     result = f"ERROR: {error}"
                     span.status = "failed"
