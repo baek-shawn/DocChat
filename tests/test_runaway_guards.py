@@ -139,11 +139,18 @@ async def test_reasoning_split_off_by_the_server_never_becomes_the_answer_text(m
     mock_llm.reset(lambda body: {"text": "", "reasoning": RUNAWAY_REASONING, "finish_reason": "length"})
     provider = local(mock_llm)
     try:
+        # 추론을 끈 호출(Step 6 이전 경로 그대로): 서버가 떼어 준 추론은 reasoning에, 본문은 비어 있다.
+        response = await provider.analyze(QUESTION, disable_thinking=True, max_tokens=4096)
+        assert response.text == "" and response.finish_reason == "length"
+        assert response.reasoning == RUNAWAY_REASONING
+        # 추론을 켠 호출(Step 6): 스트리밍으로 받다가 같은 묶음의 되풀이를 잡아 추론을 끊고 이어 쓰기를 시키는데,
+        # 이 서버는 이어 쓰기에서도 같은 반복을 내놓는다 → 하드 중단. 어느 쪽이든 추론 글이 답이 되지는 않는다.
         response = await provider.analyze(QUESTION, max_tokens=4096)
+        assert response.text == "" and response.finish_reason == "reasoning_runaway"
+        assert response.forced == "repeat" and response.runaway == "repeat"
+        assert response.reasoning.startswith("The user wants me to identify") and len(response.reasoning) < len(RUNAWAY_REASONING)
     finally:
         await provider.aclose()
-    assert response.text == "" and response.finish_reason == "length"
-    assert response.reasoning == RUNAWAY_REASONING
 
 
 # --------------------------------------------------------------------------- bbox 호출
@@ -375,7 +382,10 @@ async def test_pages_transcribed_with_another_thinking_choice_are_transcribed_ag
     assert [item.ocr_variant for item in output[:2]] == ["whole", "whole"] and len(calls) == 2
     output, processed = await prepare_visual_ocr_evidence(output, read_image=read, cache=OcrCache(), thinking=True,
                                                           on_progress=progress.append)
-    assert processed and len(calls) == 4 and [item.ocr_variant for item in output[:2]] == ["whole+thinking"] * 2
+    # 추론을 켠 전사의 기록에는 추론 예산도 들어간다(Step 6): 예산을 바꾸면 끊기는 자리가 달라 다시 전사해야 한다.
+    with_budget = config.image_mode_variant("whole", thinking=True, budget=config.REASONING_BUDGET_OCR)
+    assert with_budget == f"whole+thinking:b{config.REASONING_BUDGET_OCR}"
+    assert processed and len(calls) == 4 and [item.ocr_variant for item in output[:2]] == [with_budget] * 2
     assert progress[0] == "전사 호출의 추론 설정이 바뀌어 2쪽을 다시 전사하는 중…"
     _, processed = await prepare_visual_ocr_evidence(output, read_image=read, cache=OcrCache(), thinking=True)
     assert not processed and len(calls) == 4
@@ -384,6 +394,13 @@ async def test_pages_transcribed_with_another_thinking_choice_are_transcribed_ag
     await prepare_visual_ocr_evidence(output, read_image=read, cache=OcrCache(), image_mode="tile", thinking=True,
                                       on_progress=progress.append)
     assert progress[0] == "이미지 처리 방식이 바뀌어 2쪽을 다시 전사하는 중…"
+
+    # 예산만 바꿔도(Step 6) 추론을 켠 전사는 다시 한다 — 끊기는 자리가 달라 결과가 달라진다.
+    progress.clear()
+    _, processed = await prepare_visual_ocr_evidence(output, read_image=read, cache=OcrCache(), image_mode="tile",
+                                                     thinking=True, reasoning_budget=1234, on_progress=progress.append)
+    assert processed and len(calls) == 8 and progress[0] == "전사 호출의 추론 설정이 바뀌어 2쪽을 다시 전사하는 중…"
+    assert all(item.ocr_variant.endswith("+thinking:b1234") for item in output[:2])
 
 
 # --------------------------------------------------------------------------- 요청 → 호출별 추론 계획
@@ -454,7 +471,9 @@ def test_thinking_for_bbox_calls_is_chosen_per_request(client, mock_llm):
         data = client.post("/api/chat", json=chat_body(mock_llm, "빨간 사각형 위치를 표시해줘", [image], **options)).json()
         grounding = [request for request in mock_llm.requests if is_grounding_call(request)]
         answers = [request for request in mock_llm.requests if not is_grounding_call(request)]
-        assert all(request["max_tokens"] == 4096 for request in grounding)
+        # 추론을 켠 bbox 호출의 상한은 출력 몫 + 추론 예산이다(Step 6). 추론을 끈 호출은 출력 몫만.
+        assert all(request["max_tokens"] == 4096 + (0 if thinking_disabled(request) else config.REASONING_BUDGET_GROUNDING)
+                   for request in grounding)
         assert all("max_tokens" not in request for request in answers)
         return (data["meta"]["thinkingDisabled"], [thinking_disabled(request) for request in grounding],
                 [thinking_disabled(request) for request in answers])
@@ -476,7 +495,7 @@ def test_defaults_for_the_per_call_choice_and_the_limit_come_from_config(client,
     body = chat_body(mock_llm, "위치 표시", [plan_upload([(3000, 1500, 3200, 1700, "red")])], disableThinking=False)
     data = client.post("/api/chat", json=body).json()
     (grounding,) = [request for request in mock_llm.requests if is_grounding_call(request)]
-    assert not thinking_disabled(grounding) and grounding["max_tokens"] == 9000
+    assert not thinking_disabled(grounding) and grounding["max_tokens"] == 9000 + config.REASONING_BUDGET_GROUNDING
     assert data["meta"]["thinkingDisabled"] == {"answer": False, "grounding": False, "ocr": True}
     assert data["meta"]["visionMaxTokens"] == 9000
 
@@ -527,15 +546,29 @@ def test_the_tile_bbox_request_that_never_finished_now_ends_after_one_call_per_t
     data = client.post("/api/chat", json=body).json()
 
     grounding = [request for request in mock_llm.requests if is_grounding_call(request)]
-    assert len(grounding) == 4                                        # 타일마다 한 번. 예전 규칙이면 2 + 2 x 3 = 8번
-    assert all(not thinking_disabled(request) and request["max_tokens"] == 4096 for request in grounding)
+    first = [request for request in grounding if not request.get("continue_final_message")]
+    follow = [request for request in grounding if request.get("continue_final_message")]
+    assert len(first) == 4                                            # 타일마다 한 번. 예전 규칙이면 2 + 2 x 3 = 8번
+    # Step 6: 맴도는 두 타일은 추론 반복이 잡혀 "추론을 끊고 답만 이어 쓰기" 요청을 한 번씩 더 받는다(재시도가 아니라
+    # 소프트 조치). 이 서버는 이어 쓰기에서도 같은 반복을 내놓아 하드 중단된다 — 역시 다시 묻지 않는다.
+    assert len(follow) == 2 and all(request["messages"][-1]["content"].endswith("</think>\n\n") for request in follow)
+    assert all(not thinking_disabled(request) and request["max_tokens"] == 4096 + config.REASONING_BUDGET_GROUNDING
+               for request in first)
+    assert all(request["max_tokens"] == 4096 for request in follow)   # 이어 쓰기는 출력 몫만
     assert data["text"] == "표시했습니다."
     assert [box["label"] for box in data["artifacts"][0]["boxes"]] == ["green"]
     vision = data["meta"]["vision"]
-    assert (vision["tiles"], vision["groundingCalls"], vision["groundingLengthStops"]) == (4, 4, 2)
+    assert (vision["tiles"], vision["groundingCalls"], vision["groundingLengthStops"]) == (4, 4, 0)
+    assert (vision["groundingReasoningForced"], vision["groundingReasoningStops"]) == (2, 2)
+    # 어느 타일이 왜 끊겼는지는 화면용 메타에만 남는다(도구 결과에는 타일 이름을 넣지 않는다 — 아래 told).
+    actions = data["meta"]["reasoningActions"]
+    assert sorted(item["image"].split(" · tile ")[1] for item in actions) == ["r1c1", "r2c3"]
+    assert all(item == {"kind": "grounding", "image": item["image"], "reason": "repeat", "stopped": True} for item in actions)
+    saved = client.get(f"/api/sessions/{data['conversationId']}").json()["messages"]
+    assert saved[1]["meta"]["reasoningActions"] == actions
     assert data["meta"]["thinkingDisabled"]["grounding"] is False
 
     # 답변 모델은 어느 타일을 재지 못했는지 안다. 추론 글은 넘어가지 않는다.
     told = all_text(mock_llm.requests[-1])
-    assert "2 of 4 tiles stopped at the output limit of 4096 tokens before answering and were not retried" in told
+    assert "2 of 4 tiles were stopped because the model's reasoning did not finish" in told
     assert "door symbols" not in told and "door symbols" not in json.dumps(data, ensure_ascii=False)

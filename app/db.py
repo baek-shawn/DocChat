@@ -91,7 +91,10 @@ _ID_PATTERN = re.compile(r"^[a-zA-Z0-9-]{8,80}$")
 _BOX_KEYS = ("x", "y", "w", "h")
 _PAGE_IMAGE_NAME = re.compile(r"^(?P<root>.*) · page (?P<number>\d+)$")
 _META_COUNTERS = ("ocrCalls", "groundingCalls", "answerCalls", "tiledImages", "tiles", "blankTiles",
-                  "ocrLengthStops", "groundingLengthStops")
+                  "ocrLengthStops", "groundingLengthStops",
+                  "answerReasoningForced", "groundingReasoningForced", "ocrReasoningForced",
+                  "answerReasoningStops", "groundingReasoningStops", "ocrReasoningStops", "reasoningTokens")
+_META_REASONING_SETTINGS = ("repeatLines", "repeatCount", "repeatMinChars")
 _META_TILE_SETTINGS = ("tileSize", "overlap", "renderDpi", "minSourceEdge", "maxTiles")
 _META_THINKING_CALLS = ("answer", "grounding", "ocr")
 
@@ -208,6 +211,24 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
     limit = _bounded_number(value.get("visionMaxTokens"), 1_000_000)
     if limit:
         meta["visionMaxTokens"] = int(limit)
+    # 추론 제어 설정(Step 6): 호출 종류별 추론 예산과 반복 감지 기준
+    reasoning = value.get("reasoning")
+    if isinstance(reasoning, dict):
+        budget = reasoning.get("budget")
+        budgets = {kind: _bounded_number((budget or {}).get(kind), 10_000_000) for kind in config.REASONING_KINDS} \
+            if isinstance(budget, dict) else {}
+        settings = {name: _bounded_number(reasoning.get(name), 10_000) for name in _META_REASONING_SETTINGS}
+        if all(number is not None for number in budgets.values()) and all(number is not None for number in settings.values()):
+            meta["reasoning"] = {"budget": {kind: int(number) for kind, number in budgets.items()},
+                                 **{name: int(number) for name, number in settings.items()}}
+    actions = value.get("reasoningActions")
+    if isinstance(actions, list):
+        kept = [{"kind": item["kind"], "image": str(item.get("image") or "")[:300],
+                 "reason": str(item.get("reason") or "")[:40], "stopped": bool(item.get("stopped"))}
+                for item in actions[:config.MAX_REASONING_ACTIONS_IN_META]
+                if isinstance(item, dict) and item.get("kind") in config.REASONING_KINDS]
+        if kept:
+            meta["reasoningActions"] = kept
     # 답변 호출에 실은 이미지(Step 8): 모드, 실은 수·이름, 모드상 실을 수 있었던 수
     if value.get("answerImageMode") in config.ANSWER_IMAGE_MODES:
         meta["answerImageMode"] = value["answerImageMode"]

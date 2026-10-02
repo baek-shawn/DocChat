@@ -49,6 +49,7 @@
     disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
     serverVision: { disableThinkingGrounding: true, disableThinkingOcr: true, maxTokens: 4096 },
+    serverReasoning: null,                   // 추론 제어(Step 6) 설정: 호출 종류별 추론 예산·반복 기준(/api/health)
     serverDebugTrace: false,                 // 서버가 턴 트레이스를 기록하는지(/api/health)
     trace: { id: '', doc: null, timer: 0, open: new Set(), sections: new Map(), collapsed: new Set() },   // 열려 있는 "턴 과정" 창(펼친 행·접이식·접은 가지 기억)
     models: []
@@ -241,6 +242,7 @@
       if (ANSWER_IMAGE_LABELS[health.answerImageMode]) state.serverAnswerImageMode = health.answerImageMode;
       if (Number(health.maxModelImages) > 0) state.maxModelImages = Number(health.maxModelImages);
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
+      state.serverReasoning = health.reasoning || null;
       state.serverDebugTrace = health.debugTrace === true;
     } catch { /* 기본값(전체)으로 둔다 */ }
   }
@@ -251,11 +253,16 @@
     els.disableThinkingGrounding.disabled = everything; els.disableThinkingOcr.disabled = everything;
     els.callThinking.classList.toggle('inactive', everything);
     const limit = state.serverVision.maxTokens;
+    const budget = state.serverReasoning?.budget;
+    const fmt = (value) => Number(value || 0).toLocaleString();
     els.callThinkingHelp.textContent = (everything
       ? '위 항목이 켜져 있어 모든 호출의 추론이 꺼집니다. 위 항목을 끄면 아래 두 선택이 적용됩니다.'
       : '답변 호출만 추론을 쓰고, 위치 확인과 전사는 끌 수 있습니다. 이 둘은 보이는 것을 옮겨 적는 호출이라, 추론을 켜면 같은 생각을 맴돌다 끝나지 않는 일이 있습니다.')
+      + (budget
+        ? ` 추론을 켠 호출은 추론 예산(답변 ${fmt(budget.answer)} · 위치 확인 ${fmt(budget.grounding)} · 전사 ${fmt(budget.ocr)}토큰)을 넘거나 같은 내용을 되풀이하면 추론을 끊고 답만 이어 쓰게 합니다(.env의 DOCCHAT_REASONING_*).`
+        : '')
       + (limit > 0
-        ? ` 위치 확인·전사 호출은 출력 ${Number(limit).toLocaleString()}토큰에서 끊고 다시 보내지 않습니다(.env의 DOCCHAT_VISION_MAX_TOKENS). 이 둘에 추론을 켜려면 8,000 이상을 권합니다.`
+        ? ` 위치 확인·전사 호출의 출력 상한은 ${fmt(limit)}토큰(.env의 DOCCHAT_VISION_MAX_TOKENS)이고, 추론을 켠 호출에는 추론 예산이 더해집니다. 상한에 닿은 호출은 다시 보내지 않습니다.`
         : ' 위치 확인·전사 호출의 출력 상한이 꺼져 있습니다(.env의 DOCCHAT_VISION_MAX_TOKENS=0).');
   }
 
@@ -456,7 +463,14 @@
           // 트레이스를 켠 서버는 id를 먼저 알려 준다 → 답이 나오기 전에도 "과정 보기"를 열 수 있다.
           if (event.traceId) { placeholder.traceId = event.traceId; render(); }
         }
-        if (event.type === 'progress' && placeholder.activity.at(-1) !== event.message) { placeholder.activity.push(event.message); render(); }
+        if (event.type === 'progress') {
+          if (event.live) {
+            // "추론 중… n토큰"처럼 1초마다 오는 문구(Step 6)는 줄을 늘리지 않고 마지막 live 줄을 바꿔 쓴다.
+            if (placeholder.liveIndex === placeholder.activity.length - 1 && placeholder.liveIndex >= 0) placeholder.activity[placeholder.liveIndex] = event.message;
+            else { placeholder.activity.push(event.message); placeholder.liveIndex = placeholder.activity.length - 1; }
+            render();
+          } else if (placeholder.activity.at(-1) !== event.message) { placeholder.activity.push(event.message); placeholder.liveIndex = -1; render(); }
+        }
       });
       Object.assign(placeholder, { content: final.text, artifacts: final.artifacts || [], meta: final.meta || {}, pending: false });
       if (final.files?.length) userMessage.files = final.files;               // 저장된 첨부 id가 붙어 돌아온다
@@ -595,23 +609,46 @@
     const answerImages = meta.answerImages || null;
     // 기본이 아닌 모드(끔·전체)를 골랐으면 이미지가 없어도 적는다 — 방식을 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 보이게.
     const showAnswerImages = !!answerImages && (answerImages.sent > 0 || answerImages.candidates > 0 || (!!meta.answerImageMode && meta.answerImageMode !== 'uploads'));
-    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages) return '';
+    // 추론 제어(Step 6)의 조치가 있었으면 일반 대화 답변에도 적는다.
+    const answerActions = (vision.answerReasoningForced || 0) + (vision.answerReasoningStops || 0);
+    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !answerActions && !vision.reasoningTokens) return '';
     const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
     if (showAnswerImages) parts.push(describeAnswerImages(meta.answerImageMode, answerImages));
     if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
-    // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다)
-    const detail = (kind, stops) => {
+    // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다),
+    // 추론을 끊고 답으로 넘기거나(소프트) 끝내 중단한(하드) 호출이 있었는지(Step 6)
+    const detail = (kind, stops, forced, runaways) => {
       const notes = [];
       const off = meta.thinkingDisabled?.[kind];
       if (typeof off === 'boolean') notes.push(off ? '추론 끔' : '추론 끄지 않음');
       if (stops) notes.push(`출력 상한${meta.visionMaxTokens ? ` ${Number(meta.visionMaxTokens).toLocaleString()}토큰` : ''} 도달 ${stops}회`);
+      if (forced) notes.push(`추론을 끊고 답으로 넘김 ${forced}회${reasoningWhere(meta.reasoningActions, kind, false)}`);
+      if (runaways) notes.push(`추론이 끝나지 않아 중단 ${runaways}회${reasoningWhere(meta.reasoningActions, kind, true)}`);
       return notes.length ? ` (${notes.join(', ')})` : '';
     };
-    if (vision.ocrCalls) parts.push(`전사 호출 ${vision.ocrCalls}회${detail('ocr', vision.ocrLengthStops)}`);
-    if (vision.groundingCalls) parts.push(`위치 확인 호출 ${vision.groundingCalls}회${detail('grounding', vision.groundingLengthStops)}`);
+    if (answerActions) parts.push(`답변 호출 ${vision.answerCalls || 0}회${detail('answer', 0, vision.answerReasoningForced, vision.answerReasoningStops)}`);
+    if (vision.ocrCalls) parts.push(`전사 호출 ${vision.ocrCalls}회${detail('ocr', vision.ocrLengthStops, vision.ocrReasoningForced, vision.ocrReasoningStops)}`);
+    if (vision.groundingCalls) parts.push(`위치 확인 호출 ${vision.groundingCalls}회${detail('grounding', vision.groundingLengthStops, vision.groundingReasoningForced, vision.groundingReasoningStops)}`);
     if (!calls) parts.push('이번 턴에는 전사·위치 확인 호출 없음');
+    if (vision.reasoningTokens) parts.push(`추론 ${Number(vision.reasoningTokens).toLocaleString()}토큰`);
     if (typeof meta.elapsedMs === 'number') parts.push(`${(meta.elapsedMs / 1000).toFixed(1)}초`);
     return parts.join(' · ');
+  }
+
+  // 추론이 끊긴 호출이 어느 타일(이미지)이었고 왜였는지: " — 반복: r1c1 · 예산: r4c4, r4c5" (Step 6)
+  const REASON_LABELS = { repeat: '반복', budget: '예산', empty: '빈 답', rejected: '이어 쓰기 거절' };
+  const shortImage = (name) => { const text = String(name || ''); const tile = text.split(' · tile ')[1]; return tile || text.split(' · ').pop() || ''; };
+  function reasoningWhere(actions, kind, stopped) {
+    const groups = {};
+    (actions || []).filter((item) => item.kind === kind && !!item.stopped === stopped).forEach((item) => {
+      (groups[item.reason] = groups[item.reason] || []).push(shortImage(item.image));
+    });
+    const texts = Object.entries(groups).map(([reason, names]) => {
+      const named = names.filter(Boolean);
+      const shown = named.slice(0, 6).join(', ') + (named.length > 6 ? ` 외 ${named.length - 6}` : '');
+      return `${REASON_LABELS[reason] || reason}${shown ? `: ${shown}` : ''}`;
+    });
+    return texts.length ? ` — ${texts.join(' · ')}` : '';
   }
 
   // ------------------------------------------------------------------ 턴 과정(트레이스) 창
@@ -677,9 +714,25 @@
       `모델 대기 합계 ${fmtMs(modelTime)}`,
     ];
     if (tokens) parts.push(`출력 토큰 합계 ${tokens.toLocaleString()}`);
+    // 턴 합계(왜 느렸나를 호출 줄을 훑지 않고): 입력·추론 토큰, 추론을 끊은 호출, 가장 오래 걸린 호출
+    const promptTokens = models.reduce((sum, event) => sum + (event.data?.promptTokens || 0), 0);
+    const reasoningTokens = models.reduce((sum, event) => sum + (event.data?.reasoningTokens || 0), 0);
+    if (promptTokens) parts.push(`입력 토큰 합계 ${promptTokens.toLocaleString()}`);
+    if (reasoningTokens) parts.push(`추론 토큰 합계 ${reasoningTokens.toLocaleString()}`);
+    const cut = models.filter((event) => event.data?.forced || event.data?.runaway);
+    if (cut.length) {
+      const by = {};
+      cut.forEach((event) => { const reason = event.data.forced || String(event.data.runaway).split(':')[0]; by[reason] = (by[reason] || 0) + 1; });
+      parts.push(`추론 끊음 ${cut.length}건 (${Object.entries(by).map(([reason, count]) => `${REASON_LABELS[reason] || reason} ${count}`).join(' · ')})`);
+    }
     const failed = events.filter((event) => event.status === 'failed' || event.status === 'cancelled').length;
     if (failed) parts.push(`실패·취소 ${failed}건`);
     els.traceSummary.replaceChildren(el('span', '', parts.join(' · ')));
+    const slow = models.filter((event) => event.elapsedMs > 0).sort((a, b) => b.elapsedMs - a.elapsedMs).slice(0, 3);
+    if (models.length > 3 && slow.length) {
+      els.traceSummary.append(el('span', '', '가장 오래 걸린 호출: ' + slow.map((event) =>
+        `${shortImage(event.data?.images?.[0]?.name) || event.label} ${fmtMs(event.elapsedMs)}${event.data?.reasoningTokens ? ` (추론 ${Number(event.data.reasoningTokens).toLocaleString()})` : ''}`).join(' · ')));
+    }
     els.traceSummary.append(el('span', 'trace-hint', '행을 누르면 세부가 열리고, 도구·전사 묶음은 접힙니다(세부는 "세부" 버튼).'));
 
     // 타임라인: 트리로 그린다 — 자식(모델 호출)은 시작 시각과 무관하게 부모(도구·전사) 바로 아래에 들여 쓴다.
@@ -703,7 +756,8 @@
       return `도구 실행 #${index + 1} · ${event.data.name}${what ? ` — ${String(what).slice(0, 60)}${String(what).length > 60 ? '…' : ''}` : ''}`;
     };
     const emit = (event, depth) => {
-      const row = el('div', `trace-row-item k-${event.kind} s-${event.status}${state.trace.open.has(event.id) ? ' open' : ''}`);
+      const cutShort = event.kind === 'model' && (event.data?.forced || event.data?.runaway);      // 추론을 끊은 호출(Step 6)
+      const row = el('div', `trace-row-item k-${event.kind} s-${event.status}${state.trace.open.has(event.id) ? ' open' : ''}${cutShort ? ' cut' : ''}`);
       row.style.setProperty('--depth', depth);
       const head = el('button', 'trace-head'); head.type = 'button';
       head.append(el('span', 'trace-time', `+${fmtMs(event.startedMs)}`));
@@ -721,7 +775,13 @@
       // 전사 타일은 한꺼번에 시작해 차례를 기다린다 → 첫 모델 호출 전까지는 "대기", 끝난 뒤에는 대기 시간을 따로 보인다.
       const wait = firstCall ? firstCall.startedMs - event.startedMs : (running ? now - event.startedMs : 0);
       let duration = '';
-      if (running) duration = (stale ? '기록 중단 · ' : event.kind === 'ocr' && !firstCall ? '차례 대기 중 · ' : '진행 중 · ') + fmtMs(Math.max(0, now - event.startedMs));
+      if (running) duration = (stale ? '기록 중단 · ' : event.kind === 'ocr' && !firstCall ? '차례 대기 중 · ' : '진행 중 · ') + fmtMs(Math.max(0, now - event.startedMs))
+        + (event.data?.reasoningStage === 'reasoning' && event.data.reasoningTokens ? ` · 추론 ${Number(event.data.reasoningTokens).toLocaleString()}토큰` : '');
+      else if (cutShort) {
+        const reason = event.data.forced || String(event.data.runaway).split(':')[0];
+        duration = `${fmtMs(event.elapsedMs || 0)} · 추론 끊음(${REASON_LABELS[reason] || reason}${event.data.runaway ? ' → 중단' : ''})`
+          + (event.data.forcedCycle ? ` · “${String(event.data.forcedCycle).slice(0, 48)}”` : '');
+      }
       else if (spanKinds.has(event.kind) || event.elapsedMs > 0) duration = fmtMs(event.elapsedMs || 0) + (event.kind === 'ocr' && wait > 100 ? ` (대기 ${fmtMs(wait)})` : '');
       head.append(el('span', 'trace-kind', TRACE_KINDS[event.kind] || event.kind));
       head.append(el('span', 'trace-label', titleOf(event) + (folded ? ` (+${own.length})` : '')));
@@ -760,6 +820,12 @@
         ['종류', MODEL_KIND_LABELS[data.kind] || data.kind], ['모델', data.model], ['temperature', data.temperature],
         ['추론 끄기', data.thinkingControl === false ? '서버가 지원하지 않음' : (data.disableThinking ? '예' : '아니오')],
         ['출력 상한', data.maxTokens], ['종료 사유', data.finishReason], ['입력 토큰', data.promptTokens], ['출력 토큰', data.completionTokens],
+        // 추론 제어(Step 6): 예산, 센 추론 토큰·시간, 추론을 끊고 답으로 넘겼는지(소프트), 끝내 중단했는지(하드)
+        ['추론 예산', data.reasoningBudget], ['추론 토큰', data.reasoningTokens],
+        ['추론 시간', typeof data.reasoningSeconds === 'number' ? `${data.reasoningSeconds}s` : undefined],
+        ['추론 조치', data.forced ? `${data.forced === 'repeat' ? '반복' : '예산 초과'} → 추론을 끊고 답으로` : undefined],
+        ['되풀이된 줄', data.forcedCycle],
+        ['중단', data.runaway],
         ['도구 제공', (data.tools || []).join(', ') || '없음'],
       ];
       box.append(chipRow(chips));

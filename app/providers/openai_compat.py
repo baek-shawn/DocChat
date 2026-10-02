@@ -1,6 +1,11 @@
 """OpenAI 호환 provider — `openai` SDK에서 `base_url`만 바꿔 쓴다.
 
 하나의 구현으로 llama.cpp / Ollama / vLLM / LM Studio 같은 로컬 런타임과 OpenAI 클라우드를 모두 다룬다.
+
+추론 제어(Step 6): 추론을 켠 로컬 호출만 스트리밍으로 받으며 추론 조각을 지켜본다(`reasoning.ReasoningMonitor`).
+예산을 넘거나 반복이 보이면 스트림을 끊고, 쓴 추론 뒤에 `</think>`를 붙인 assistant 메시지로 **같은 요청을 이어 쓰기**
+(`continue_final_message`)로 다시 보낸다 — 답은 잘리지 않고 추론만 잘린다(소프트). 이어 쓰기도 걸리거나 빈 답이면
+`finish_reason="reasoning_runaway"`로 끝낸다(하드). 추론을 끈 호출은 Step 6 이전 경로(비스트리밍) 그대로다.
 """
 from __future__ import annotations
 
@@ -12,10 +17,12 @@ from typing import Any
 import openai
 from openai import AsyncOpenAI
 
+from .. import config
 from ..pipeline.images import ModelImage
-from .base import (ContextWindowError, Message, ModelResponse, Provider, ProviderError, ToolCall, ToolSpec,
-                   ToolsUnsupportedError, compact_messages, is_context_window_error, image_anchor_index,
+from .base import (REASONING_RUNAWAY, ContextWindowError, Message, ModelResponse, Provider, ProviderError, ToolCall,
+                   ToolSpec, ToolsUnsupportedError, compact_messages, is_context_window_error, image_anchor_index,
                    looks_like_tools_unsupported)
+from .reasoning import FORCED_END_NOTE, InlineThinkSplitter, OnReasoning, ReasoningMonitor
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
@@ -81,6 +88,14 @@ def parse_tool_calls(raw_calls: Any) -> list[ToolCall]:
     return calls
 
 
+def _reasoning_of(item: Any) -> str:
+    """서버가 본문과 따로 떼어 준 추론 글. vLLM 버전에 따라 `reasoning_content` 또는 `reasoning`이다."""
+    extra = getattr(item, "model_extra", None) or {}
+    value = (extra.get("reasoning_content") or extra.get("reasoning")
+             or getattr(item, "reasoning_content", None) or getattr(item, "reasoning", None))
+    return value if isinstance(value, str) else ""
+
+
 class OpenAICompatProvider(Provider):
     def __init__(self, *, name: str, model: str, api_key: str = "", base_url: str = "", timeout: float = 180.0,
                  is_local: bool = False, disable_thinking: bool = False):
@@ -105,6 +120,10 @@ class OpenAICompatProvider(Provider):
     def thinking_off_for_every_call(self) -> bool:
         return self._disable_thinking
 
+    def _thinking_off(self, disable_thinking: bool) -> bool:
+        """이 호출이 실제로 추론을 끄고 나가는가."""
+        return self._thinking_control and (self._disable_thinking or bool(disable_thinking))
+
     async def aclose(self) -> None:
         await self._client.close()
 
@@ -126,36 +145,52 @@ class OpenAICompatProvider(Provider):
 
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
-                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
+                      disable_thinking: bool = False, max_tokens: int | None = None,
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
         # 출력 상한은 폭주가 확인된 로컬 서버에만 보낸다. 클라우드 API는 이름도 의미도 달라(예: max_completion_tokens)
         # 실제로 확인하지 않고는 넣지 않는다.
         limit = int(max_tokens) if max_tokens and max_tokens > 0 and self.is_local else None
+        # 추론을 켠 로컬 호출만 스트리밍으로 받으며 추론을 지켜본다(Step 6). 추론을 끈 호출은 이전 경로 그대로다.
+        watch = self.is_local and not self._thinking_off(disable_thinking)
+        budget = max(0, int(reasoning_budget or 0)) if watch else 0
+        if watch and limit and budget:
+            limit += budget      # 상한 = 추론 예산 + 출력 몫. 이어 쓰기 호출은 출력 몫만 받는다
+        options: dict[str, Any] = dict(temperature=temperature, disable_thinking=disable_thinking, max_tokens=limit,
+                                       watch=watch, budget=budget, on_reasoning=on_reasoning)
         try:
-            return await self._complete(messages, images, tools, temperature, disable_thinking, limit)
+            return await self._complete(messages, images, tools, **options)
         except ContextWindowError:
             pass
         # 로컬 서버는 예산을 넘긴 프롬프트를 잘라 주지 않는다 → 두 단계로 줄여 다시 보낸다.
         try:
-            return await self._complete(compact_messages(messages, 1), images, tools, temperature, disable_thinking, limit)
+            return await self._complete(compact_messages(messages, 1), images, tools, **options)
         except ContextWindowError:
-            return await self._complete(compact_messages(messages, 2), (images or [])[:1] or None, tools, temperature,
-                                        disable_thinking, limit)
+            return await self._complete(compact_messages(messages, 2), (images or [])[:1] or None, tools, **options)
 
-    async def _complete(self, messages: list[Message], images: list[ModelImage] | None,
-                        tools: list[ToolSpec] | None, temperature: float, disable_thinking: bool = False,
-                        max_tokens: int | None = None) -> ModelResponse:
+    def _request(self, messages: list[Message], images: list[ModelImage] | None, tools: list[ToolSpec] | None,
+                 temperature: float, disable_thinking: bool, max_tokens: int | None) -> dict[str, Any]:
         request: dict[str, Any] = {"model": self.model, "messages": to_wire_messages(messages, images)}
         if self._send_temperature:
             request["temperature"] = temperature
         if tools:
             request["tools"] = to_wire_tools(tools)
             request["tool_choice"] = "auto"
-        thinking_off = self._thinking_control and (self._disable_thinking or disable_thinking)
-        if thinking_off:
+        if self._thinking_off(disable_thinking):
             request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         if max_tokens:
             request["max_tokens"] = max_tokens
+        return request
+
+    async def _complete(self, messages: list[Message], images: list[ModelImage] | None,
+                        tools: list[ToolSpec] | None, *, temperature: float, disable_thinking: bool = False,
+                        max_tokens: int | None = None, watch: bool = False, budget: int = 0,
+                        on_reasoning: OnReasoning | None = None) -> ModelResponse:
+        request = self._request(messages, images, tools, temperature, disable_thinking, max_tokens)
+        again = dict(temperature=temperature, disable_thinking=disable_thinking, max_tokens=max_tokens, watch=watch,
+                     budget=budget, on_reasoning=on_reasoning)
         try:
+            if watch:
+                return await self._watched(request, messages, images, budget, on_reasoning, max_tokens)
             completion = await self._client.chat.completions.create(**request)
         except openai.APIStatusError as error:
             detail = self._describe(error)
@@ -163,34 +198,153 @@ class OpenAICompatProvider(Provider):
                 if max_tokens:
                     # vLLM은 "입력 + 출력 상한"이 컨텍스트를 넘으면 생성하지 않고 거절한다. 남은 자리가 상한보다 작다는
                     # 뜻이므로 상한을 빼고 보낸다 — 그래도 출력은 남은 자리(< 상한)를 넘지 못한다.
-                    return await self._complete(messages, images, tools, temperature, disable_thinking, None)
+                    return await self._complete(messages, images, tools, **{**again, "max_tokens": None})
                 raise ContextWindowError(detail) from error
+            thinking_off = self._thinking_off(disable_thinking)
             if thinking_off and error.status_code in (400, 422) and re.search(
                     r"chat_template_kwargs|enable_thinking|extra|unknown|unrecognized|unexpected", detail, re.IGNORECASE):
                 self._thinking_control = False
-                return await self._complete(messages, images, tools, temperature, disable_thinking, max_tokens)
+                return await self._complete(messages, images, tools, **again)
             if self._send_temperature and error.status_code == 400 and "temperature" in detail.lower():
                 # 일부 추론형 모델은 기본값 외의 temperature를 거절한다.
                 self._send_temperature = False
-                return await self._complete(messages, images, tools, temperature, disable_thinking, max_tokens)
+                return await self._complete(messages, images, tools, **again)
             if tools and looks_like_tools_unsupported(error.status_code, detail):
                 raise ToolsUnsupportedError(detail) from error
             raise ProviderError(detail) from error
         except openai.APIError as error:  # 시간 초과·연결 실패 포함
             raise ProviderError(self._explain(error)) from error
+        return self._parse_completion(completion)
 
+    @staticmethod
+    def _parse_completion(completion: Any) -> ModelResponse:
         choice = completion.choices[0] if getattr(completion, "choices", None) else None
         if choice is None or choice.message is None:
             raise ProviderError("모델 엔드포인트가 assistant 메시지를 돌려주지 않았습니다.")
-        reasoning = getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None)
         usage = getattr(completion, "usage", None)
         return ModelResponse(
             text=(choice.message.content or "").strip(),
             tool_calls=parse_tool_calls(getattr(choice.message, "tool_calls", None)),
             finish_reason=str(choice.finish_reason or ""),
-            reasoning=reasoning.strip() if isinstance(reasoning, str) else "",
+            reasoning=_reasoning_of(choice.message).strip(),
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
+        )
+
+    # ------------------------------------------------------------------ 추론을 켠 호출: 스트리밍 + 지켜보기(Step 6)
+    async def _watched(self, request: dict[str, Any], messages: list[Message], images: list[ModelImage] | None,
+                       budget: int, on_reasoning: OnReasoning | None, max_tokens: int | None) -> ModelResponse:
+        image = (images or [None])[0]
+        where = str(getattr(image, "name", "") or "")
+        monitor = ReasoningMonitor(budget=budget, image=where, on_progress=on_reasoning)
+        first = await self._stream(request, monitor)       # 요청 자체의 오류(400 등)는 그대로 올라간다 → _complete가 처리
+        if not monitor.verdict:
+            return first
+        # 소프트: 쓴 추론 + 종료 문장 + </think>를 assistant 메시지로 넣고 같은 요청(도구 포함)을 이어 쓰기로 보낸다.
+        # 서버 프로브(2026-10-01, vLLM Qwen3.5): continue_final_message로 추론 없이 답만 나오지만, 비스트리밍으로 받으면
+        # 서버 파서가 그 답을 추론으로 분류해 content가 비어 온다 → 이어 쓰기도 스트리밍으로 받는다.
+        monitor.notify("forced")
+        kept = first.reasoning.rstrip()
+        prefill = f"<think>\n{kept}\n\n{FORCED_END_NOTE}\n</think>\n\n"
+        follow = dict(request, messages=to_wire_messages([*messages, {"role": "assistant", "content": prefill}], images))
+        follow["extra_body"] = {**(request.get("extra_body") or {}), "continue_final_message": True,
+                                "add_generation_prompt": False}
+        if max_tokens and budget:
+            follow["max_tokens"] = max(1, max_tokens - budget)      # 이어 쓰기는 출력 몫만
+        again = ReasoningMonitor(budget=config.REASONING_CONTINUATION_ALLOWANCE, image=where, on_progress=on_reasoning)
+        failure = ""
+        second: ModelResponse | None = None
+        try:
+            second = await self._stream(follow, again)
+        except openai.APIError as error:       # 이어 쓰기를 모르는 서버(400) 등 → 하드
+            failure = f"rejected: {self._describe(error)[:300]}"
+        if second is not None:
+            if again.verdict:
+                failure = again.verdict        # 이어 쓰기에서도 추론이 넘치거나 반복 → 하드
+            elif not second.text.strip() and not second.tool_calls:
+                failure = "empty"
+        reasoning = kept if second is None or not second.reasoning else f"{kept}\n{second.reasoning}"
+        if failure:
+            monitor.notify("runaway", failure.split(":")[0])
+            return ModelResponse(
+                text="", finish_reason=REASONING_RUNAWAY, reasoning=reasoning, forced=monitor.verdict, runaway=failure,
+                reasoning_tokens=monitor.tokens + again.tokens, reasoning_seconds=round(monitor.seconds, 1),
+                prompt_tokens=second.prompt_tokens if second is not None else first.prompt_tokens,
+                completion_tokens=monitor.tokens + again.tokens,
+            )
+        return ModelResponse(
+            text=second.text, tool_calls=second.tool_calls, finish_reason=second.finish_reason, reasoning=reasoning,
+            prompt_tokens=second.prompt_tokens, completion_tokens=(second.completion_tokens or 0) + monitor.tokens,
+            reasoning_tokens=monitor.tokens + again.tokens, reasoning_seconds=round(monitor.seconds, 1),
+            forced=monitor.verdict,
+        )
+
+    async def _stream(self, request: dict[str, Any], monitor: ReasoningMonitor) -> ModelResponse:
+        """스트리밍으로 받아 하나의 응답으로 조립한다. monitor가 걸리면 스트림을 닫고 그때까지의 조각을 돌려준다."""
+        stream = await self._client.chat.completions.create(**request, stream=True, stream_options={"include_usage": True})
+        text: list[str] = []
+        reasoning: list[str] = []
+        tool_parts: dict[int, dict[str, str]] = {}
+        finish = ""
+        usage = None
+        splitter = InlineThinkSplitter()
+        # 조각 생성기를 직접 쥐고 있다가 끝에서 명시적으로 닫는다 — 중간에 끊은 생성기를 GC에 맡기면 이벤트 루프가 닫힌 뒤
+        # "async generator already executing" 경고가 난다.
+        chunks = stream.__aiter__()
+        try:
+            async for chunk in chunks:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if getattr(choice, "finish_reason", None):
+                    finish = str(choice.finish_reason)
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+                # 추론 파서가 있는 서버는 추론을 따로 준다. 없으면 본문 속 <think>…</think>를 갈라 쓴다.
+                inline_reasoning, content = splitter.feed(delta.content or "")
+                piece = _reasoning_of(delta) + inline_reasoning
+                if content:
+                    text.append(content)
+                for raw in getattr(delta, "tool_calls", None) or []:
+                    index = int(getattr(raw, "index", 0) or 0)
+                    part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    if getattr(raw, "id", None):
+                        part["id"] = str(raw.id)
+                    function = getattr(raw, "function", None)
+                    if function is not None:
+                        part["name"] = part["name"] or str(getattr(function, "name", None) or "")
+                        part["arguments"] += str(getattr(function, "arguments", None) or "")
+                if piece:
+                    reasoning.append(piece)
+                    if monitor.feed(piece):
+                        break      # 예산 초과·반복 → 스트림을 닫는다(서버는 연결이 끊기면 생성을 멈춘다)
+        finally:
+            await chunks.aclose()
+            await stream.close()
+        tail_reasoning, tail_content = splitter.flush()
+        reasoning.append(tail_reasoning)
+        text.append(tail_content)
+        calls: list[ToolCall] = []
+        for part in tool_parts.values():
+            if not part["name"]:
+                continue
+            try:
+                arguments = json.loads(part["arguments"] or "{}")
+            except ValueError:
+                arguments = {}
+            call = ToolCall(name=part["name"], arguments=arguments if isinstance(arguments, dict) else {})
+            if part["id"]:
+                call.id = part["id"]
+            calls.append(call)
+        return ModelResponse(
+            text="".join(text).strip(), tool_calls=calls, finish_reason=finish, reasoning="".join(reasoning).strip(),
+            prompt_tokens=getattr(usage, "prompt_tokens", None), completion_tokens=getattr(usage, "completion_tokens", None),
+            reasoning_tokens=monitor.tokens if monitor.chunks else None,
+            reasoning_seconds=round(monitor.seconds, 1) if monitor.chunks else None,
         )
 
     @staticmethod

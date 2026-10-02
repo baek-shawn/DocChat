@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from .. import config, trace
 from ..pipeline.images import ModelImage
 from ..providers.base import (Message, ModelResponse, Provider, ToolCall, ToolSpec, ToolsUnsupportedError,
-                              is_output_length_stop, last_user_index)
+                              is_output_length_stop, is_reasoning_runaway, last_user_index)
+from ..providers.reasoning import describe_reasoning_progress
 from .prompts import (AFTER_TOOL_RESULT, CONTINUE_ANSWER, FORCE_FINAL_ANSWER, RESEND_VALID_TOOL_JSON,
                       json_tool_protocol, json_tool_reminder)
 
@@ -27,6 +28,12 @@ _MAX_MALFORMED_ENVELOPES = 2
 
 ExecuteTool = Callable[[ToolCall], Awaitable[str]]
 Progress = Callable[[str], None]
+
+# 추론 제어(Step 6)로 답을 받지 못했을 때 사용자에게 보이는 안내문. 추론 글은 답으로 내보내지 않는다.
+REASONING_RUNAWAY_NOTICE = ("모델의 추론이 끝나지 않아(같은 내용을 반복하거나 추론 예산을 넘어) 답변을 받지 못했습니다. "
+                            "다시 보내거나, 설정에서 \"추론 끄기\"를 켜 보세요.")
+REASONING_LENGTH_NOTICE = ("모델이 추론만 하다 출력 한도에 닿아 답변을 내지 못했습니다. "
+                           "다시 보내거나, 설정에서 \"추론 끄기\"를 켜 보세요.")
 
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_OPEN_TAIL = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
@@ -40,8 +47,12 @@ class LoopResult:
     text: str
     steps: int = 0
     used_json_fallback: bool = False
-    stopped_reason: str = ""  # "" | "max_steps" | "repeated_tool_call"
+    stopped_reason: str = ""  # "" | "max_steps" | "repeated_tool_call" | "malformed_tool_call" | "reasoning_runaway" | "reasoning_length"
     model_calls: int = 0      # 답변 모델을 부른 횟수(도구 안의 비전 호출은 포함하지 않는다)
+    reasoning_forced: int = 0  # 추론을 끊고 답으로 넘긴 호출 수(Step 6, 소프트)
+    reasoning_stops: int = 0   # 그래도 답을 받지 못해 중단한 호출 수(하드)
+    # 답변 호출의 응답들 — 호출부가 추론 토큰·조치를 집계한다(`VisionUsage.count_reasoning`)
+    responses: list[ModelResponse] = field(default_factory=list)
 
 
 def strip_reasoning(text: str) -> str:
@@ -213,8 +224,10 @@ async def run_tool_loop(
     max_steps: int | None = None,
     temperature: float = 0.2,
     language_hint: str = "",
+    on_live: Progress | None = None,
 ) -> LoopResult:
     """language_hint: "최종 답변을 한국어로" 같은 한 줄. 메시지에 미리 박지 않고 루프가 상황을 보고 붙인다.
+    on_live: 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6).
 
     gemma3 실측(각 6회): JSON 폴백에서 도구를 제공하는 호출의 user 턴에 언어 지시가 **어디에든** 있으면
     도구 호출이 0/6으로 죽고, 빼면 위치 질문 6/6 · 비위치 질문 오호출 0/6이었다. 그래서
@@ -238,11 +251,22 @@ async def run_tool_loop(
     stopped = ""
     malformed = 0
     model_calls = 0
+    reasoning_forced = 0
+    reasoning_stops = 0
+    responses: list[ModelResponse] = []
+    notice_given = False      # 추론 제어가 답 대신 안내문을 냈다 → 이어 쓰기·정리를 더 하지 않는다
+    # 추론을 켠 답변 호출의 추론 예산(Step 6). 넘거나 반복하면 provider가 추론을 끊고 답만 이어 쓰게 한다.
+    watch = (lambda info: on_live(describe_reasoning_progress(info))) if on_live is not None else None
 
     async def ask(request: list[Message], offered: list[ToolSpec] | None) -> ModelResponse:
-        nonlocal model_calls
+        nonlocal model_calls, reasoning_forced
         model_calls += 1
-        return await provider.analyze(request, images, offered, temperature=temperature)
+        reply = await provider.analyze(request, images, offered, temperature=temperature,
+                                       reasoning_budget=config.reasoning_budget("answer"), on_reasoning=watch)
+        if reply.forced:
+            reasoning_forced += 1
+        responses.append(reply)
+        return reply
 
     def hinted() -> list[Message]:
         """원래 질문(anchor) 끝에 언어 힌트를 붙인 사본."""
@@ -274,6 +298,20 @@ async def run_tool_loop(
         text = strip_reasoning(response.text)
         if "<think" in (response.text or "").lower() or "</think>" in (response.text or "").lower():
             trace.note("cleanup", "본문에서 추론 블록 제거", removedChars=len(response.text or "") - len(text))
+        if is_reasoning_runaway(response.finish_reason):
+            # 추론이 끝나지 않아 이어 쓰기로도 답을 받지 못했다(Step 6 하드). 추론 글을 답으로 내보내지 않는다.
+            reasoning_stops += 1
+            stopped, notice_given = "reasoning_runaway", True
+            trace.note("loop", "추론이 끝나지 않아 답을 받지 못함 → 안내문으로 대체", reason=response.runaway)
+            text = REASONING_RUNAWAY_NOTICE
+            break
+        if is_output_length_stop(response.finish_reason) and not text and response.reasoning:
+            # 추론만 하다 출력 한도에 닿았다(예산 없이 서버 상한만 있을 때). 이어 쓸 답이 없으니 안내만 한다.
+            stopped, notice_given = "reasoning_length", True
+            trace.note("loop", "추론 도중 출력 한도에 닿아 답을 받지 못함 → 안내문으로 대체",
+                       reasoningChars=len(response.reasoning))
+            text = REASONING_LENGTH_NOTICE
+            break
         calls = list(response.tool_calls) if offer_tools else []
         if offer_tools and not calls:
             # 네이티브 모드여도 일부 서버는 호출을 본문에 적어 보낸다 → 두 형태를 모두 받아 준다.
@@ -343,7 +381,7 @@ async def run_tool_loop(
 
     # 출력 길이 한도에서 끊겼으면 이어 쓰게 한다.
     continuations = 0
-    while is_output_length_stop(response.finish_reason) and continuations < config.MAX_CONTINUATIONS:
+    while not notice_given and is_output_length_stop(response.finish_reason) and continuations < config.MAX_CONTINUATIONS:
         continuations += 1
         notify(f"답변이 길어 이어서 작성하는 중… ({continuations})")
         trace.note("loop", f"답변이 출력 한도에서 끊겨 이어 쓰기 요청 ({continuations}/{config.MAX_CONTINUATIONS})")
@@ -355,13 +393,15 @@ async def run_tool_loop(
             break
         text = f"{text}\n\n{addition}"
 
-    if tool_names and looks_like_tool_envelope(text, tool_names):
+    if tool_names and not notice_given and looks_like_tool_envelope(text, tool_names):
         # 마지막 안전망: 끝까지 도구 봉투만 내놓는 모델. 날 JSON을 답변이라고 보여 주지 않는다.
         trace.note("cleanup", "최종 답이 도구 호출 JSON이라 안내문으로 대체", text=trace.clip(text))
         text = ("모델이 도구 호출 형식(JSON)을 올바르게 만들지 못해 답변을 완성하지 못했습니다. "
                 "다시 시도하거나, 도구 호출을 더 안정적으로 지원하는 모델을 선택해 주세요.")
         stopped = stopped or "malformed_tool_call"
     trace.note("loop", "도구 루프 종료", steps=steps, modelCalls=model_calls, jsonFallback=use_fallback,
-               stoppedReason=stopped or None, continuations=continuations)
+               stoppedReason=stopped or None, continuations=continuations,
+               reasoningForced=reasoning_forced or None, reasoningStops=reasoning_stops or None)
     return LoopResult(text=text, steps=steps, used_json_fallback=use_fallback, stopped_reason=stopped,
-                      model_calls=model_calls)
+                      model_calls=model_calls, reasoning_forced=reasoning_forced, reasoning_stops=reasoning_stops,
+                      responses=responses)

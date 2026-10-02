@@ -104,6 +104,12 @@ def test_example_file_shows_the_real_defaults():
         "DOCCHAT_VISION_MAX_TOKENS": config.VISION_MAX_TOKENS,
         "DOCCHAT_GROUNDING_DISABLE_THINKING": config.GROUNDING_DISABLE_THINKING,
         "DOCCHAT_OCR_DISABLE_THINKING": config.OCR_DISABLE_THINKING,
+        "DOCCHAT_REASONING_BUDGET_ANSWER": config.REASONING_BUDGET_ANSWER,
+        "DOCCHAT_REASONING_BUDGET_GROUNDING": config.REASONING_BUDGET_GROUNDING,
+        "DOCCHAT_REASONING_BUDGET_OCR": config.REASONING_BUDGET_OCR,
+        "DOCCHAT_REASONING_REPEAT_LINES": config.REASONING_REPEAT_LINES,
+        "DOCCHAT_REASONING_REPEAT_COUNT": config.REASONING_REPEAT_COUNT,
+        "DOCCHAT_REASONING_REPEAT_MIN_CHARS": config.REASONING_REPEAT_MIN_CHARS,
     }
     assert {name: float(example[name]) for name in defaults} == {name: float(value) for name, value in defaults.items()}
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST

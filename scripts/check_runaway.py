@@ -9,12 +9,18 @@
     uv run python scripts/check_runaway.py --pdf samples/large_scanned_plan.pdf --expect-file samples/large_plan.expect.txt --conditions D,E
     # 실제 /api/chat 경로로 한 턴("추론 끄기"(모든 호출)는 해제, 호출별 선택은 서버 기본값)
     uv run python scripts/check_runaway.py --image plan.png --question "창호 심볼을 찾아 표시해 줘" --conditions CHAT
+    # 추론 제어(Step 6): 답변 호출의 추론 예산(소프트)이 걸리는지 — 첨부 없는 짧은 질문을 예산 500으로 3번, 예산 없이 1번
+    uv run python scripts/check_runaway.py --question "17 곱하기 23은?" --conditions SOFT:3,FULL --budget 500
 
 조건
     A  bbox 추론 끔 · 상한 4,096      B  bbox 추론 켬 · 상한 4,096      C  bbox 추론 켬 · 상한 16,000
     D  전사 추론 끔 · 상한 4,096      E  전사 추론 켬 · 상한 4,096
     CHAT  /api/chat 한 턴(타일 모드)
+    SOFT  /api/chat 첨부 없는 한 턴, 답변 호출 추론 켬 · 추론 예산 --budget(기본 500)
+    FULL  같은 턴을 추론 예산 없이(비교용)
     상한은 --limit으로, 되풀이 횟수는 --repeat으로 바꾼다(조건 뒤에 `A:2`처럼 적어도 된다).
+    추론을 켠 bbox·전사 조건(B·C·E)에는 서버의 추론 예산(DOCCHAT_REASONING_BUDGET_*)이 그대로 적용된다 — 호출마다
+    추론을 끊고 답으로 넘겼는지(forced), 끝내 중단했는지(runaway)를 적는다.
 
 대상 모델은 e2e_check.py와 같은 환경변수로 고른다(DOCCHAT_E2E_BASE_URL · DOCCHAT_E2E_MODEL …).
 실제 데이터(data/)는 읽기만 한다. CHAT 조건은 임시 DB와 임시 파일 폴더를 쓴다.
@@ -55,7 +61,8 @@ MIMES = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", "
          ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp", ".tif": "image/tiff", ".tiff": "image/tiff"}
 # (종류, 추론 끔, 출력 상한)
 CONDITIONS = {"A": ("bbox", True, 4096), "B": ("bbox", False, 4096), "C": ("bbox", False, 16000),
-              "D": ("ocr", True, 4096), "E": ("ocr", False, 4096), "CHAT": ("chat", None, None)}
+              "D": ("ocr", True, 4096), "E": ("ocr", False, 4096), "CHAT": ("chat", None, None),
+              "SOFT": ("plain", False, None), "FULL": ("plain", False, None)}
 CHAT_TIMEOUT_SECONDS = 600
 
 
@@ -92,13 +99,17 @@ def watch(provider, calls: list[dict[str, Any]], *, grounding: bool) -> None:
             entry.update(seconds=round(time.time() - started, 1), finish=response.finish_reason,
                          promptTokens=response.prompt_tokens, completionTokens=response.completion_tokens,
                          textChars=len(response.text), reasoningChars=len(response.reasoning),
-                         text=response.text[:4000], reasoningTail=response.reasoning[-600:])
+                         text=response.text[:4000], reasoningTail=response.reasoning[-600:],
+                         reasoningTokens=response.reasoning_tokens, forced=response.forced or None,
+                         runaway=response.runaway or None)
             if grounding:
                 parsed = parse_visual_inspection(response.text, image_width=getattr(image, "width", None),
                                                  image_height=getattr(image, "height", None))
                 entry.update(structured=parsed.structured, boxes=len(parsed.boxes))
-            print(f"      {entry['image'] or '(이미지 없음)':<46} {entry['finish']:<7} {entry['seconds']:>6.1f}s  출력 "
-                  f"{entry['completionTokens']}토큰 · 본문 {entry['textChars']}자 · 추론 {entry['reasoningChars']}자", flush=True)
+            action = (f" · 추론 끊음({entry['forced']})" if entry["forced"] else "") + (f" · 중단({entry['runaway']})" if entry["runaway"] else "")
+            print(f"      {entry['image'] or '(이미지 없음)':<46} {entry['finish']:<17} {entry['seconds']:>6.1f}s  출력 "
+                  f"{entry['completionTokens']}토큰 · 본문 {entry['textChars']}자 · 추론 {entry['reasoningChars']}자"
+                  f"{action}", flush=True)
         except Exception as error:
             entry["logError"] = str(error)[:300]
         return response
@@ -200,17 +211,18 @@ async def run_ocr(path: Path, thinking_off: bool, limit: int, expected: list[str
     return result
 
 
-def run_chat(path: Path, question: str) -> dict[str, Any]:
-    """실제 `/api/chat` 경로. 답변 호출은 추론을 켜고 출력 상한 없이 나간다(그 폭주는 Step 6의 범위)."""
+def run_chat(path: Path | None, question: str) -> dict[str, Any]:
+    """실제 `/api/chat` 경로. 답변 호출은 추론을 켜고 출력 상한 없이 나간다 — 추론 예산·반복 감지(Step 6)만 건다."""
     scratch = Path(tempfile.mkdtemp(prefix="docchat-runaway-"))
     os.environ["DOCCHAT_DB_PATH"] = str(scratch / "check.sqlite")
     os.environ["DOCCHAT_FILES_DIR"] = str(scratch / "files")
+    os.environ["DOCCHAT_DEBUG_TRACE"] = "1"
     from fastapi.testclient import TestClient
 
     from app.main import create_app
 
     body = {**CONNECTION, "model": MODEL, "contextSize": CONTEXT, "imageMode": "tile", "disableThinking": False,
-            "messages": [{"role": "user", "content": question}], "attachments": [upload_of(path)]}
+            "messages": [{"role": "user", "content": question}], "attachments": [upload_of(path)] if path else []}
 
     def post() -> dict[str, Any]:
         with TestClient(create_app()) as client:
@@ -219,6 +231,13 @@ def run_chat(path: Path, question: str) -> dict[str, Any]:
             data = response.json()
             data.update(seconds=round(time.time() - started, 1), status=response.status_code)
             data.pop("attachments", None)
+            # 트레이스의 답변 호출 기록: 추론 토큰·시간·조치(Step 6)
+            trace_id = (data.get("meta") or {}).get("traceId")
+            document = client.get(f"/api/traces/{trace_id}").json() if trace_id else {}
+            data["answerCalls"] = [
+                {key: event["data"].get(key) for key in ("reasoningTokens", "reasoningSeconds", "forced", "runaway",
+                                                           "finishReason", "promptTokens", "completionTokens")}
+                for event in document.get("events", []) if event["kind"] == "model" and event["data"].get("kind") == "answer"]
             return data
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -239,6 +258,7 @@ def main() -> int:
     parser.add_argument("--conditions", default="A,B,C", help="쉼표로 구분. 되풀이 횟수는 A:2처럼 적는다")
     parser.add_argument("--repeat", type=int, default=1, help="횟수를 적지 않은 조건의 되풀이 횟수")
     parser.add_argument("--limit", type=int, help="조건의 출력 상한을 이 값으로 바꾼다(0 = 상한 없음)")
+    parser.add_argument("--budget", type=int, default=500, help="SOFT 조건의 답변 호출 추론 예산(토큰)")
     parser.add_argument("--out", help="결과 폴더(기본 samples/compare/runaway-<시각>)")
     arguments = parser.parse_args()
 
@@ -268,6 +288,13 @@ def main() -> int:
                     parser.error("CHAT 조건에는 --image와 --question이 필요합니다.")
                 print(f"\n── {label}: /api/chat · 타일 모드 · 추론 끄기(모든 호출) 해제 · 호출별 선택은 서버 기본값", flush=True)
                 result = run_chat(Path(arguments.image), arguments.question)
+            elif kind == "plain":
+                if not arguments.question:
+                    parser.error("SOFT·FULL 조건에는 --question이 필요합니다.")
+                config.REASONING_BUDGET_ANSWER = arguments.budget if name == "SOFT" else 0
+                print(f"\n── {label}: /api/chat · 첨부 없음 · 답변 호출 추론 켬 · 추론 예산 "
+                      f"{config.REASONING_BUDGET_ANSWER or '없음'}", flush=True)
+                result = run_chat(None, arguments.question)
             elif kind == "bbox":
                 if not arguments.image or not arguments.task:
                     parser.error("조건 A·B·C에는 --image와 --task가 필요합니다.")
@@ -280,7 +307,7 @@ def main() -> int:
                 result = asyncio.run(run_ocr(Path(arguments.pdf), thinking_off, limit, expected))
             result.update(condition=name, attempt=attempt, thinkingDisabled=thinking_off, limit=limit)
             results.append(result)
-            summarize(label, kind, result)
+            summarize(label, "chat" if kind == "plain" else kind, result)
             (out / "result.json").write_text(json.dumps({
                 "model": MODEL, "baseUrl": CONNECTION["baseUrl"], "image": arguments.image, "pdf": arguments.pdf,
                 "task": arguments.task, "question": arguments.question, "results": results,
@@ -300,17 +327,24 @@ def summarize(label: str, kind: str, result: dict[str, Any]) -> None:
             print(f"   {label}: {CHAT_TIMEOUT_SECONDS}초 안에 끝나지 않음")
             return
         meta = result.get("meta") or {}
+        vision = meta.get("vision") or {}
         print(f"   {label}: HTTP {result.get('status')} · {result.get('seconds')}초 · 추론 끔 기록 {meta.get('thinkingDisabled')}"
-              f" · 출력 상한 {meta.get('visionMaxTokens')}")
-        print(f"   비전 호출: {meta.get('vision')}")
+              f" · 출력 상한 {meta.get('visionMaxTokens')} · 추론 예산 {(meta.get('reasoning') or {}).get('budget')}")
+        print(f"   비전 호출: {vision}")
+        for index, call in enumerate(result.get("answerCalls") or [], start=1):
+            print(f"   답변 호출 #{index}: 추론 {call.get('reasoningTokens')}토큰 · {call.get('reasoningSeconds')}초 · "
+                  f"조치 {call.get('forced') or '없음'} · 중단 {call.get('runaway') or '없음'} · 종료 {call.get('finishReason')} · "
+                  f"입력 {call.get('promptTokens')} · 출력 {call.get('completionTokens')}")
         for artifact in result.get("artifacts") or []:
             print(f"   ▸ {artifact.get('name')}: 박스 {len(artifact.get('boxes') or [])}개 · 작업 문장 {artifact.get('task')!r}")
         print("   답변: " + " ".join(str(result.get("text") or result.get("error") or "").split())[:400])
         return
     usage = result["usage"]
     stops = usage["groundingLengthStops"] + usage["ocrLengthStops"]
+    forced = usage.get("groundingReasoningForced", 0) + usage.get("ocrReasoningForced", 0)
+    runaways = usage.get("groundingReasoningStops", 0) + usage.get("ocrReasoningStops", 0)
     print(f"   {label}: {result['seconds']}초 · 타일 {result['tiles']}장 · 호출 {len(result['calls'])}회 · 상한 도달 {stops}회"
-          f" ({', '.join(result['stoppedTiles']) or '없음'})")
+          f" ({', '.join(result['stoppedTiles']) or '없음'}) · 추론 끊고 답으로 {forced}회 · 추론 중단 {runaways}회")
     print(f"   상한에 닿은 뒤 다시 보낸 타일: {result['retriedAfterLimit'] or '없음'}")
     if kind == "bbox":
         print(f"   구조화 실패 타일 {len(result['unstructuredTiles'])}/{result['tiles']} · 박스 {len(result['regions'])}개"

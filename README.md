@@ -87,7 +87,28 @@ uv run python run.py
 - 답변 아래에 `위치 확인 호출 6회 (추론 끄지 않음, 출력 상한 4,096토큰 도달 4회)`처럼 표시됩니다.
 - 같은 대화에서 전사의 추론 선택을 바꾸면 이미 전사한 쪽을 **다시 전사**합니다(비교가 섞이지 않게).
 - 추론 끄기와 출력 상한은 로컬(OpenAI 호환) 서버에만 보냅니다. 클라우드 provider에는 적용되지 않습니다.
-- 답변 호출에는 출력 상한이 없습니다. 답변 호출의 추론이 길어지는 문제는 아직 남아 있습니다(STEPS.md Step 6).
+- 답변 호출에는 출력 상한이 없습니다. 답변 호출의 추론이 길어지는 문제는 아래 "추론 폭주 막기"가 맡습니다.
+
+### 추론 폭주 막기 — 추론 예산과 반복 감지 (Step 6)
+
+추론형 모델(Qwen3.5 등)은 "안녕"에도 수천 토큰을 생각하고, 가끔 같은 생각을 맴돌며 끝나지 않습니다(실측: 80,000토큰, 20분). **추론을 켠** 로컬 호출(답변·위치 확인·전사 모두)은 서버↔모델 구간을 스트리밍으로 받으며 **추론 부분만** 지켜봅니다.
+
+| 감지 | 조치 |
+|---|---|
+| 추론 토큰이 예산을 넘음 — 답변 8,000 · 위치 확인 4,000 · 전사 4,000(`.env`의 `DOCCHAT_REASONING_BUDGET_*`, 0이면 없음) | **소프트**: 스트림을 끊고, 쓴 추론 뒤에 "충분히 생각했으니 답한다"와 `</think>`를 붙여 같은 요청을 **이어 쓰기**로 다시 보냅니다. 답은 잘리지 않고 추론만 잘립니다 |
+| 추론이 같은 줄 묶음(최대 8줄)을 연달아 3번 되풀이함(`DOCCHAT_REASONING_REPEAT_*`) | 같은 소프트 조치 — 예산을 다 쓸 때까지 기다리지 않습니다 |
+| 이어 쓰기에서도 추론이 넘치거나 반복, 빈 답, 서버가 이어 쓰기를 거절 | **하드**: 그 호출을 끝냅니다. 답변은 안내문("추론이 끝나지 않아 답변을 받지 못했습니다…"), 전사는 `[OCR FAILED …]`, 위치 확인은 박스 없음 + 경고. 어느 쪽도 **다시 보내지 않습니다** |
+| 추론만 하다 출력 한도(`finish_reason=length`)에 닿음 | 추론 글을 답으로 내보내지 않고 안내문 |
+
+- 생성 중에는 `추론 중… 1,234토큰 · 12초`가 같은 줄에서 갱신되고(타일이면 타일 이름 포함), 조치가 있으면 `추론 예산(…)을 넘어 추론을 끊고 답으로 넘기는 중…`이 보입니다.
+- 답변 아래에는 **어느 타일이 왜 끊겼는지**와 턴의 추론 토큰 합계가 남습니다: `위치 확인 호출 20회 (추론 끄지 않음, 추론을 끊고 답으로 넘김 3회 — 반복: r1c1 · 예산: r4c4, r4c5) · 추론 22,522토큰`. 반복으로 끊긴 타일의 결과는 한 번 의심해 볼 만합니다(모델이 헷갈려 맴돈 자리).
+- "과정 보기" 맨 위 요약에 입력·추론 토큰 합계, `추론 끊음 3건 (반복 1 · 예산 2)`, 가장 오래 걸린 호출 3개가 나오고, 끊긴 호출 행은 색 띠와 함께 `추론 끊음(반복) · “되풀이된 첫 줄”`로 표시됩니다. 호출마다 추론 예산·토큰·시간·조치 칩이 있습니다.
+- 이 표시는 **화면에만** 있습니다. 답을 낸 타일이 추론을 끊긴 채 답했다는 사실은 도구 결과(답변 모델이 읽는 글)에 넣지 않습니다 — 넣으면 답변 모델이 "덜 됐다"고 보고 도구를 다시 부릅니다.
+- 추론을 끈 호출(기본값의 위치 확인·전사)은 스트리밍하지 않고 이전과 똑같이 동작합니다. 추론을 켠 위치 확인·전사 호출의 출력 상한은 `DOCCHAT_VISION_MAX_TOKENS` + 그 호출의 추론 예산입니다(상한 = 예산 + 출력 몫).
+- 전사의 추론 예산은 OCR 캐시 키에 들어가므로, 추론을 켠 채 예산을 바꾸면 그 쪽은 다시 전사합니다.
+- 감지는 답 부분에는 걸지 않습니다 — 표 전사나 bbox JSON처럼 비슷한 줄이 이어지는 출력은 정상입니다.
+- 이어 쓰기 요청 형식(`continue_final_message`)은 vLLM에서 확인했습니다. Ollama·llama.cpp처럼 그 필드를 모르는 서버는 assistant 메시지를 이력으로 보고 새로 답할 수도, 빈 답을 낼 수도 있습니다(빈 답이면 하드로 끝납니다, 미실측). 클라우드 provider에는 적용되지 않습니다.
+- 실제 서버에서 확인하려면 `scripts/check_runaway.py`(3.4절)의 `SOFT`/`FULL` 조건을 씁니다.
 
 ### 턴 과정 보기 — 개발용 트레이스
 
@@ -137,6 +158,8 @@ Copy-Item .env.example .env
 | `DOCCHAT_GROUNDING_RETRY_COUNT` | `2` | bbox JSON 재시도 |
 | `DOCCHAT_VISION_MAX_TOKENS` | `4096` | 위치 확인·전사 호출 한 번의 출력 토큰 상한(추론 포함). `0`이면 상한 없음. 닿은 호출은 다시 보내지 않음 |
 | `DOCCHAT_GROUNDING_DISABLE_THINKING` / `DOCCHAT_OCR_DISABLE_THINKING` | `1` / `1` | 요청에 값이 없을 때 위치 확인 / 전사 호출의 추론을 끌지(설정 화면에서 고르면 그 값이 우선) |
+| `DOCCHAT_REASONING_BUDGET_ANSWER` / `_GROUNDING` / `_OCR` | `8000` / `4000` / `4000` | 추론을 켠 호출의 추론 토큰 예산. 넘으면 추론을 끊고 답만 이어 쓰게 함(`0`이면 예산 없음) |
+| `DOCCHAT_REASONING_REPEAT_LINES` / `_COUNT` / `_MIN_CHARS` | `8` / `3` / `24` | 추론 반복 감지: 최대 8줄 묶음이 연달아 3번 같으면 반복(묶음이 24자 미만이면 제외) |
 | `DOCCHAT_MAX_PDF_VISUAL_PAGES` | `60` (최대 200) | 검사할 최대 페이지 |
 | `DOCCHAT_MAX_TOOL_STEPS` | `8` | 한 턴의 최대 도구 호출 횟수 |
 
@@ -144,7 +167,7 @@ Copy-Item .env.example .env
 
 ## 3. 테스트
 
-### 3.1 자동 테스트 (모델 불필요, 약 35초, 276개)
+### 3.1 자동 테스트 (모델 불필요, 약 40초, 292개)
 
 ```powershell
 uv run pytest
@@ -167,6 +190,7 @@ uv run pytest
 | `tests/test_env_file.py` | `.env` 읽기, 셸 환경변수 우선, `.env.example`이 모든 설정과 실제 기본값을 담고 있는지 |
 | `tests/test_trace.py` | 턴 트레이스: 꺼져 있으면 아무것도 기록하지 않음, 한 턴의 입력→전처리→전사→증거→모델 호출→도구→답변 기록, 도구 아래 자식 호출, 진행 중인 턴의 `running` 호출과 취소 시 `cancelled`, API key·base64 미기록, 대화 삭제 시 함께 삭제 |
 | `tests/test_answer_images.py` | 답변 호출 이미지(Step 8): 기본값은 이전 동작 그대로, 전체 모드는 전사 뒤 쪽 이미지를 쪽 순서로 싣고 네이티브 쪽을 렌더해 저장, 상한 안에서만 렌더, 루프의 매 호출에 실림, 끔 모드에서도 bbox 도구 동작, 렌더한 쪽이 기본 모드로 새지 않음, 트레이스 기록 |
+| `tests/test_reasoning_control.py` | 추론 제어(Step 6): 실측 반복 표본을 3번째 순환에서 잡고 정상 추론·짧은 줄은 오인하지 않음, 조각·글자 수로 토큰 세기, 본문 속 `<think>` 가르기, 추론을 켠 로컬 호출만 스트리밍, 도구 호출 델타 조립, 예산 초과·반복 → 이어 쓰기 요청 형식(`</think>` 접두 + `continue_final_message`), 이어 쓰기 실패 → 하드 중단(반복·빈 답·거절), 상한 = 예산 + 출력 몫, 전사·bbox 호출의 실패 처리와 재시도 없음, `/api/chat`의 메타·live 진행·안내문, 트레이스 기록 |
 
 특정 테스트만: `uv run pytest tests/test_pdf_pipeline.py -k classification -v`
 
@@ -210,6 +234,8 @@ $env:DOCCHAT_E2E_BASE_URL="http://<서버>/v1"; $env:DOCCHAT_E2E_MODEL="<모델>
 uv run python scripts/check_runaway.py --image plan.png --task "Find every door symbol." --conditions A:2,B:2,C
 # 전사: D = 추론 끔, E = 추론 켬
 uv run python scripts/check_runaway.py --pdf samples/large_scanned_plan.pdf --expect-file samples/large_plan.expect.txt --conditions D,E
+# 추론 제어(Step 6): 답변 호출의 추론 예산이 걸리는지 — 첨부 없는 짧은 질문을 예산 500으로 3번, 예산 없이 1번
+uv run python scripts/check_runaway.py --question "17 곱하기 23은? 숫자만 답해 줘." --conditions SOFT:3,FULL --budget 500
 # 실제 /api/chat 경로로 한 턴(타일 모드, "추론 끄기 — 모든 호출" 해제)
 uv run python scripts/check_runaway.py --image plan.png --question "문 심볼을 찾아 표시해 줘" --conditions CHAT
 ```
@@ -244,8 +270,8 @@ curl -X POST http://127.0.0.1:8000/api/test-connection -H "Content-Type: applica
 
 | 메서드 · 경로 | 설명 |
 |---|---|
-| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`(답변 호출에 실을 이미지, 비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
-| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 트레이스 켬 여부(`debugTrace`) |
+| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`; `progress`에 `live: true`가 있으면 "추론 중… n토큰"처럼 같은 줄을 갱신하는 문구). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`(답변 호출에 실을 이미지, 비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
+| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 추론 예산·반복 기준(`reasoning`), 트레이스 켬 여부(`debugTrace`) |
 | `GET /api/traces/{id}` | 턴 트레이스 JSON(진행 중이면 그때까지의 기록). `?download=1`이면 파일로 |
 | `GET /api/sessions/{id}/traces` | 그 대화의 트레이스 목록(id·시각·상태) |
 | `GET /api/sessions` · `POST /api/sessions` · `DELETE /api/sessions` | 목록 · 생성 · 선택/전체 삭제(`{ids}` 또는 `{all:true}`) |

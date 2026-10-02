@@ -31,6 +31,7 @@ from .pipeline.ocr import TileSink, build_ocr_reader, prepare_visual_ocr_evidenc
 from .pipeline.pdf import PdfError
 from .pipeline.preprocess import preprocess_attachments, render_page_attachment
 from .providers import Provider, ProviderError, create_provider
+from .providers.reasoning import describe_reasoning_progress
 from .providers.traced import TracedProvider
 from .storage import StorageError, extension_for, safe_filename
 
@@ -269,6 +270,12 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         meta["thinkingDisabled"] = thinking.to_public()
     if provider.is_local and config.vision_max_tokens():
         meta["visionMaxTokens"] = config.vision_max_tokens()
+    if provider.is_local:
+        # 추론 제어(Step 6)의 설정. 소프트·하드 조치 횟수는 vision 카운터(…ReasoningForced / …ReasoningStops)에 있다.
+        meta["reasoning"] = config.reasoning_settings()
+        if answer.usage.reasoning_actions:
+            # 어느 호출(타일)이 왜 끊겼는지 — 화면 표시용. 도구 결과에는 넣지 않는다(답변 모델이 다시 부르지 않게).
+            meta["reasoningActions"] = answer.usage.reasoning_actions[:config.MAX_REASONING_ACTIONS_IN_META]
     if turn is not None:
         turn.note("answer", "최종 답변", text=trace.clip(answer.text), chars=len(answer.text), meta=meta,
                   artifacts=[{"name": item.get("name"), "boxes": len(item.get("boxes") or [])} for item in answer.artifacts])
@@ -296,6 +303,7 @@ def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[di
         answerImageMode=answer_image_mode, maxModelImages=config.MAX_MODEL_IMAGES,
         contextSize=request.context_size, thinkingDisabled=thinking.to_public() if thinking.controllable else None,
         thinkingControl=provider.can_disable_thinking(), visionMaxTokens=config.vision_max_tokens(),
+        reasoning=config.reasoning_settings() if provider.is_local else None,
         tiling=config.tile_settings() if image_mode == "tile" else None,
     )
 
@@ -389,9 +397,15 @@ async def _render_pending_pages(store: ChatStore, attachments: list[Attachment],
 async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, conversation_id: str,
                   messages: list[dict[str, Any]], uploads: list[Attachment], emit: Emit,
                   image_mode: str, answer_image_mode: str, thinking: ThinkingPlan) -> Answer:
-    def progress(message: str) -> None:
-        emit({"type": "progress", "message": message})
-        trace.note("progress", message)      # 화면에 보인 진행 단계가 트레이스의 시간축에도 남는다
+    def progress(message: str, *, live: bool = False) -> None:
+        # live: "추론 중… n토큰"처럼 1초마다 갱신되는 문구. 화면은 같은 줄을 바꿔 쓰고, 트레이스에는 적지 않는다
+        # (호출 이벤트가 추론 토큰 수를 직접 갖는다). 단계 알림은 그대로 트레이스의 시간축에 남는다.
+        emit({"type": "progress", "message": message, **({"live": True} if live else {})})
+        if not live:
+            trace.note("progress", message)
+
+    def live(message: str) -> None:
+        progress(message, live=True)
 
     progress("요청을 준비하는 중…")
     usage = VisionUsage()
@@ -416,7 +430,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         attachments,
         read_image=build_ocr_reader(provider, image_mode=image_mode, usage=usage, on_progress=progress,
                                     load_tile_source=_tile_source_loader(store, attachments), on_tiles=tile_sink,
-                                    disable_thinking=thinking.ocr),
+                                    disable_thinking=thinking.ocr, on_live=live),
         load_data=lambda item: store.load_attachment_data(item.id) if item.id is not None else _none(),
         on_progress=progress,
         cache_namespace=provider.cache_namespace,
@@ -473,17 +487,19 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     tool_context = ToolContext(
         provider=provider, attachments=attachments, store=store, conversation_id=conversation_id,
         default_read_chars=max(1000, min(16_000, attachment_budget // 3)), on_progress=progress,
-        image_mode=image_mode, usage=usage, on_tiles=tile_sink, disable_thinking=thinking.grounding,
+        image_mode=image_mode, usage=usage, on_tiles=tile_sink, disable_thinking=thinking.grounding, on_live=live,
     )
     progress("답변을 생성하는 중…")
     language_hint = reply_language_hint(latest_user)
     result = await run_tool_loop(
         provider, model_messages, images=model_images or None, tools=tools,
         execute=lambda call: execute_tool(tool_context, call), on_progress=progress, describe=describe_tool_call,
-        language_hint=language_hint,
+        language_hint=language_hint, on_live=live,
     )
     text = result.text
     usage.answer_calls += result.model_calls
+    for reply in result.responses:      # 답변 호출의 추론 토큰과 소프트·하드 조치(Step 6)
+        usage.count_reasoning("answer", reply)
 
     # 5) 내용을 이미 줬는데 "첨부를 볼 수 없다"고 하면 한 번만 바로잡는다
     if has_usable_attachment_content(attachments) and looks_like_false_attachment_refusal(text):
@@ -493,8 +509,10 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         retry = await provider.analyze(
             [*model_messages, {"role": "assistant", "content": text},
              {"role": "user", "content": f"{FALSE_REFUSAL_CORRECTION}\n{language_hint}".strip()}],
-            images=model_images or None,
+            images=model_images or None, reasoning_budget=config.reasoning_budget("answer"),
+            on_reasoning=lambda info: live(describe_reasoning_progress(info)),
         )
+        usage.count_reasoning("answer", retry)
         text = retry.text.strip() or text
     if not text.strip():
         raise ProviderError("모델이 빈 응답을 돌려주었습니다. 다시 시도하거나 다른 모델을 선택하세요.")

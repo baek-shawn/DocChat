@@ -226,14 +226,15 @@ def tile_settings() -> dict[str, float | int]:
     }
 
 
-def image_mode_variant(mode: str, *, thinking: bool = False) -> str:
+def image_mode_variant(mode: str, *, thinking: bool = False, budget: int = 0) -> str:
     """전사 결과가 어떤 방식·설정으로 만들어졌는지 나타내는 문자열(OCR 캐시 키와 첨부 메타데이터에 쓴다).
 
     모드나 타일 설정이 바뀌면 값이 달라지므로 이전 결과가 섞여 재사용되지 않는다.
     thinking: 전사 호출의 추론을 끄지 않고 보냈는가(Step 6-0). 추론을 끈 쪽이 기본이라 그때는 아무것도 붙이지 않는다
     — Step 6-0 이전에 전사해 둔 쪽의 기록(`whole`, `tile:…`)과 같은 값이 되어 다시 전사하지 않는다.
+    budget: 추론을 켠 전사의 추론 예산(Step 6). 예산을 바꾸면 끊기는 자리가 달라 결과가 달라지므로 키에 넣는다(0이면 안 붙인다).
     """
-    suffix = "+thinking" if thinking else ""
+    suffix = ("+thinking" + (f":b{int(budget)}" if thinking and budget else "")) if thinking else ""
     if mode != "tile":
         return f"whole{suffix}"
     return ":".join(["tile", *(f"{value:g}" for value in (
@@ -261,6 +262,39 @@ def vision_max_tokens() -> int | None:
 def resolve_switch(requested: bool | None, default: bool) -> bool:
     """요청에 값이 없으면(None) 서버 기본값."""
     return default if requested is None else bool(requested)
+
+
+# --------------------------------------------------------------------------- 추론 제어 (Step 6)
+# 추론을 켠 로컬 호출은 스트리밍으로 받으며 추론 토큰을 센다. 예산을 넘거나 같은 줄 묶음이 되풀이되면(반복) 추론을 끊고
+# "답만 이어 쓰라"고 다시 보낸다(소프트). 그래도 답이 안 나오면 중단한다(하드). 감지는 추론 부분에만 건다 — 답 부분의
+# 반복(표 전사, bbox JSON)은 정상이다. 예산은 호출 종류별로 따로이고 0이면 예산을 두지 않는다(반복 감지는 그대로).
+REASONING_BUDGET_ANSWER = _int("DOCCHAT_REASONING_BUDGET_ANSWER", 8000, low=0, high=10_000_000)
+REASONING_BUDGET_GROUNDING = _int("DOCCHAT_REASONING_BUDGET_GROUNDING", 4000, low=0, high=10_000_000)
+REASONING_BUDGET_OCR = _int("DOCCHAT_REASONING_BUDGET_OCR", 4000, low=0, high=10_000_000)
+# 반복 감지: 줄 단위로 최대 REPEAT_LINES줄 묶음이 연달아 REPEAT_COUNT번 같으면 반복이다. 묶음이 REPEAT_MIN_CHARS보다 짧으면
+# 반복으로 보지 않는다(`Okay.` 셋은 반복이 아니다). 실측 반복(Qwen3.5): 8줄 묶음 × 40회, 4줄 묶음 순환.
+REASONING_REPEAT_LINES = _int("DOCCHAT_REASONING_REPEAT_LINES", 8, low=1, high=64)
+REASONING_REPEAT_COUNT = _int("DOCCHAT_REASONING_REPEAT_COUNT", 3, low=2, high=50)
+REASONING_REPEAT_MIN_CHARS = _int("DOCCHAT_REASONING_REPEAT_MIN_CHARS", 24, low=1, high=10_000)
+# 추론을 끊고 이어 쓰게 한 호출에서 모델이 다시 추론을 시작하면 이만큼만 두고 본다(넘으면 하드 중단).
+REASONING_CONTINUATION_ALLOWANCE = 512
+REASONING_KINDS = ("answer", "grounding", "ocr")
+MAX_REASONING_ACTIONS_IN_META = 60       # 답변 메타데이터에 남기는 "끊긴 호출" 목록의 최대 길이
+
+
+def reasoning_budget(kind: str) -> int:
+    """호출 종류별 추론 예산(토큰). 0이면 예산 없음."""
+    return {"answer": REASONING_BUDGET_ANSWER, "grounding": REASONING_BUDGET_GROUNDING,
+            "ocr": REASONING_BUDGET_OCR}.get(kind, 0)
+
+
+def reasoning_settings() -> dict[str, int | dict[str, int]]:
+    """지금 적용 중인 추론 제어 설정 — 답변 메타데이터와 /api/health가 같은 값을 본다."""
+    return {
+        "budget": {kind: reasoning_budget(kind) for kind in REASONING_KINDS},
+        "repeatLines": REASONING_REPEAT_LINES, "repeatCount": REASONING_REPEAT_COUNT,
+        "repeatMinChars": REASONING_REPEAT_MIN_CHARS,
+    }
 
 
 # --------------------------------------------------------------------------- §5.3 OCR 전사

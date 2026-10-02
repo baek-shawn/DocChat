@@ -2,6 +2,7 @@
 
 이 저장소에서 작업하는 Claude가 **매 세션 시작 시 가장 먼저 읽는** 지침이다.
 무엇을 만드는지는 [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md), 어디까지 했는지는 [STEPS.md](STEPS.md)에 있다.
+왜 그 방향인지(실측에서 본 것, 그 원인에 대한 이해, 아직 만들지 않은 구상)는 [IDEAS.md](IDEAS.md)에 있다 — 로드맵·도구 설계를 논의할 때 먼저 읽고, 논의에서 나온 이해·구상은 실측 / 이해 / 구상을 구분해 거기에 적는다.
 
 ## 1. 프로젝트 한 줄 요약
 
@@ -34,7 +35,7 @@
 - **단일 tool-calling 루프**만 둔다: 모델 호출 → tool_call 감지 → 실행 → 결과 재주입 → 반복. 프레임워크 금지.
 - **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다.
 - 통신은 **동기 HTTP**가 기본. 진행률이 필요할 때만 `StreamingResponse`로 **NDJSON 한 줄씩** 흘린다(`data:` 접두사·`text/event-stream` 쓰지 않음).
-- 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`)은 키워드 인자로만 받는다.
+- 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`, `reasoning_budget`, `on_reasoning`)은 키워드 인자로만 받는다. 서버↔모델 구간의 스트리밍(추론을 켠 로컬 호출만)은 provider 안에서 끝나고 호출 지점은 완성된 `ModelResponse`만 본다.
 - "페이지 이미지 준비"(`pipeline/images.py`, `pipeline/pdf.py`)와 "VLM에 보낼 이미지 목록 조립"(`assemble_model_images`)을 **분리 유지**한다 — 전체/타일 모드가 갈리는 곳은 `assemble_model_images` 한 곳이다.
 - **비교 실험을 위한 모드는 요청마다 고를 수 있게** 둔다(예: 전처리 전체/타일, 추론 호출 이미지 끔/전체/개요+확대). 기본값은 `config.py`, 각 답변에 어떤 모드로 처리했는지 기록하고, 캐시 키에 모드를 포함한다(모드를 바꿨는데 이전 결과가 재사용되면 비교가 무의미해진다).
 - API key는 **요청마다 받아서 쓰고 디스크에 저장하지 않는다.** DB·로그에 남기지 않는다.
@@ -80,6 +81,20 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 - 출력 상한에 닿은(`finish_reason=length`) 전사·bbox 호출은 **다시 보내지 않는다.** bbox는 끊긴 글·미완성 JSON을 결과로 쓰지 않는다. 전사는 읽은 데까지 남기되 끊긴 자리를 표시하고, 끊긴 글이 추론일 수 있으면(`ocr.cut_off_transcription`) 버린다.
 - 추론 끄기와 출력 상한은 **로컬(OpenAI 호환) provider에만** 보낸다. 답변 호출에는 출력 상한을 붙이지 않는다(Step 6의 범위).
 - 전사 호출의 추론 여부는 `image_mode_variant(mode, thinking=…)`로 OCR 캐시 키와 쪽 기록에 들어간다.
+
+추론 제어(Step 6 1차) — 추론을 **켠** 로컬 호출만 스트리밍으로 받으며 추론 부분을 지켜본다(`providers/reasoning.py`, `openai_compat.py`). 추론을 끈 호출(기본값의 bbox·전사)은 비스트리밍 경로 그대로다.
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `REASONING_BUDGET_ANSWER` / `_GROUNDING` / `_OCR` | 8,000 / 4,000 / 4,000 | 호출 종류별 추론 토큰 예산(0 = 없음). 추론을 켠 bbox·전사 호출의 `max_tokens` = `VISION_MAX_TOKENS` + 예산 |
+| `REASONING_REPEAT_LINES` / `_COUNT` / `_MIN_CHARS` | 8 / 3 / 24 | 최대 8줄 묶음이 연달아 3번 같으면 반복(묶음이 24자 미만이면 제외) |
+| `REASONING_CONTINUATION_ALLOWANCE` | 512 | 이어 쓰기 호출에서 모델이 다시 추론하면 이만큼만 두고 하드 중단 |
+
+- 감지(예산 초과·반복)는 **추론 부분에만** 건다. 답 부분의 반복(표 전사, bbox JSON)은 정상이다 → `max_tokens`가 맡는다.
+- 소프트: 스트림을 끊고 쓴 추론 + 종료 문장 + `</think>`를 assistant 메시지로 넣어 **같은 요청을 이어 쓰기**(`continue_final_message`, 스트리밍)로 다시 보낸다. 하드: 이어 쓰기도 걸리거나 빈 답이면 `finish_reason="reasoning_runaway"` — 답변은 안내문, 전사는 `[OCR FAILED …]`, bbox는 박스 없음 + 경고. **어느 쪽도 다시 보내지 않는다**(Step 6-0 규칙).
+- 호출 지점은 `analyze(..., reasoning_budget=config.reasoning_budget(kind), on_reasoning=…)`만 넘긴다. 감지·조치 코드를 호출 지점에 두지 않는다. 가짜 provider의 `analyze`는 이 두 키워드 인자를 받아야 한다.
+- 추론을 켠 전사의 캐시 키·쪽 기록에 예산이 들어간다(`whole+thinking:b4000`). 예산을 바꾸면 다시 전사한다.
+- 진행 문구 중 1초마다 갱신되는 것("추론 중… n토큰")은 `progress(message, live=True)`로 보내 화면이 같은 줄을 바꿔 쓰고, 트레이스에는 적지 않는다(호출 이벤트가 토큰 수를 갖는다).
 
 답변(추론) 호출의 이미지(Step 8 1차) — 요청의 `answerImageMode`, 없으면 아래 기본값.
 
@@ -128,6 +143,7 @@ uv run python scripts/check_runaway.py --image plan.png --task "Find every door 
 ```
 
 - 한 턴이 왜 그렇게 답했는지·왜 느렸는지는 `.env`에 `DOCCHAT_DEBUG_TRACE=1`을 켜고 답변의 **"과정 보기"**(또는 `GET /api/traces/{id}`)로 본다(Step 7). 재현 스크립트를 따로 짜기 전에 이것부터 본다. `docchat-scratch`는 켠 채 뜬다.
+- 추론 모델의 폭주(예산·반복)는 `scripts/check_runaway.py`로 실제 서버에서 확인한다(README 3.4). 조건 `SOFT`/`FULL`이 답변 호출의 소프트 조치, `B`/`E`가 bbox·전사의 조치를 적는다. 추론 모델은 사용자 vLLM(Qwen3.5)뿐이라 **요청받았을 때만** 보낸다.
 
 - 브라우저로 UI를 확인할 때는 `.claude/launch.json`의 **`docchat-scratch`**(포트 8765, DB는 `%TEMP%\docchat-scratch`)를 쓴다. 기본 `docchat` 구성은 사용자의 실제 `data/`를 쓴다.
 - 이 PC에는 **Ollama(`http://127.0.0.1:11434/v1`)에 `gemma3:latest`(비전 지원, tool-calling 미지원)** 가 있다 → 종단 점검에 사용. tool-calling 미지원이므로 **JSON 폴백 경로**가 실제로 검증된다. bbox 위치 정확도는 낮다(모델 한계) — 파이프라인 버그로 오해하지 말 것.
@@ -174,7 +190,8 @@ app/
   storage.py         FileStore — data/files 아래 파일 쓰기·읽기, 경로 검사, 대화 폴더 삭제
   attachments.py     Attachment 모델, 업로드 정제
   api/               sessions / models / files / chat / traces 라우터
-  providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현, traced(트레이스용 겉싸개)
+  providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현, reasoning(추론 예산·반복 감지, Step 6),
+                     traced(트레이스용 겉싸개)
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)
                      / preprocess(업로드 펼치기, 쪽 즉석 렌더) / ocr(전사·타일 전사 병합) / evidence(증거 예산·답변 호출 이미지 선택)

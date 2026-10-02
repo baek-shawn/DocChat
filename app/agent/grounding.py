@@ -29,6 +29,8 @@ class VisualInspection:
     structured: bool = False
     # 출력 상한에 닿아 끊긴 호출(Step 6-0). 끊긴 글은 추론이거나 미완성 JSON이라 결과로 쓰지 않는다 → text·boxes는 비어 있다.
     cut_off: bool = False
+    # 추론이 끝나지 않아(예산 초과·반복) 이어 쓰기로도 답을 받지 못한 호출(Step 6). 역시 다시 보내지 않는다.
+    runaway: bool = False
 
 
 def _load_json(raw: str) -> Any:
