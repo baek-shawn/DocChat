@@ -17,11 +17,12 @@ def test_env_file_syntax():
         "# 주석", "", "DOCCHAT_TILE_SIZE=1024", "  DOCCHAT_TILE_OVERLAP = 0.25  ", "export DOCCHAT_IMAGE_MODE=tile",
         'DOCCHAT_DB_PATH="D:\\data folder\\docchat.sqlite"', "DOCCHAT_FILES_DIR='files #1'",
         "DOCCHAT_DEBUG_TRACE=1   # 값 뒤의 주석", "DOCCHAT_EMPTY=", "no equals sign", "=no name",
+        "DOCCHAT_ONLY_COMMENT=      # 값 없이 주석만(비워 두는 설정 — 추론 수준)",
     ]))
     assert parsed == {
         "DOCCHAT_TILE_SIZE": "1024", "DOCCHAT_TILE_OVERLAP": "0.25", "DOCCHAT_IMAGE_MODE": "tile",
         "DOCCHAT_DB_PATH": "D:\\data folder\\docchat.sqlite", "DOCCHAT_FILES_DIR": "files #1",
-        "DOCCHAT_DEBUG_TRACE": "1", "DOCCHAT_EMPTY": "",
+        "DOCCHAT_DEBUG_TRACE": "1", "DOCCHAT_EMPTY": "", "DOCCHAT_ONLY_COMMENT": "",
     }
 
 

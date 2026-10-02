@@ -40,6 +40,9 @@ class TracedProvider(Provider):
     def thinking_off_for_every_call(self) -> bool:
         return self.inner.thinking_off_for_every_call()
 
+    def can_set_reasoning_effort(self) -> bool:
+        return self.inner.can_set_reasoning_effort()
+
     async def list_models(self) -> list[str]:
         return await self.inner.list_models()
 
@@ -63,7 +66,8 @@ class TracedProvider(Provider):
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
                       disable_thinking: bool = False, max_tokens: int | None = None,
-                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None,
+                      reasoning_effort: str | None = None) -> ModelResponse:
         kind, label = self._kind()
         number = self.turn.count(f"model:{kind}")
         image_notes = self.turn.describe_images(images)
@@ -79,6 +83,8 @@ class TracedProvider(Provider):
             tools=trace.describe_tools(tools), temperature=temperature, disableThinking=thinking_off,
             thinkingControl=control, maxTokens=max_tokens if self.is_local else None,
             reasoningBudget=reasoning_budget if (self.is_local and not thinking_off) else None,
+            # 추론 수준(Step 6 2차): 실제로 실려 나가는 경우만 적는다 — 추론을 켠 호출이고 provider가 그 값을 보낼 때.
+            reasoningEffort=(reasoning_effort or None) if (self.inner.can_set_reasoning_effort() and not thinking_off) else None,
         )
 
         def watched(info: ReasoningProgress) -> None:
@@ -99,7 +105,8 @@ class TracedProvider(Provider):
         try:
             response = await self.inner.analyze(messages, images, tools, temperature=temperature,
                                                 disable_thinking=disable_thinking, max_tokens=max_tokens,
-                                                reasoning_budget=reasoning_budget, on_reasoning=watched)
+                                                reasoning_budget=reasoning_budget, on_reasoning=watched,
+                                                reasoning_effort=reasoning_effort)
         except asyncio.CancelledError:
             self.turn.finish(event, "cancelled", reason=trace.CANCELLED_REASON)
             raise

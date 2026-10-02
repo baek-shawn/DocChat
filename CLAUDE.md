@@ -35,7 +35,7 @@
 - **단일 tool-calling 루프**만 둔다: 모델 호출 → tool_call 감지 → 실행 → 결과 재주입 → 반복. 프레임워크 금지.
 - **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다.
 - 통신은 **동기 HTTP**가 기본. 진행률이 필요할 때만 `StreamingResponse`로 **NDJSON 한 줄씩** 흘린다(`data:` 접두사·`text/event-stream` 쓰지 않음).
-- 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`, `reasoning_budget`, `on_reasoning`)은 키워드 인자로만 받는다. 서버↔모델 구간의 스트리밍(추론을 켠 로컬 호출만)은 provider 안에서 끝나고 호출 지점은 완성된 `ModelResponse`만 본다.
+- 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`, `reasoning_budget`, `on_reasoning`, `reasoning_effort`)은 키워드 인자로만 받는다. 서버↔모델 구간의 스트리밍(추론을 켠 로컬 호출만)은 provider 안에서 끝나고 호출 지점은 완성된 `ModelResponse`만 본다.
 - "페이지 이미지 준비"(`pipeline/images.py`, `pipeline/pdf.py`)와 "VLM에 보낼 이미지 목록 조립"(`assemble_model_images`)을 **분리 유지**한다 — 전체/타일 모드가 갈리는 곳은 `assemble_model_images` 한 곳이다.
 - **비교 실험을 위한 모드는 요청마다 고를 수 있게** 둔다(예: 전처리 전체/타일, 추론 호출 이미지 끔/전체/개요+확대). 기본값은 `config.py`, 각 답변에 어떤 모드로 처리했는지 기록하고, 캐시 키에 모드를 포함한다(모드를 바꿨는데 이전 결과가 재사용되면 비교가 무의미해진다).
 - API key는 **요청마다 받아서 쓰고 디스크에 저장하지 않는다.** DB·로그에 남기지 않는다.
@@ -92,9 +92,23 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 
 - 감지(예산 초과·반복)는 **추론 부분에만** 건다. 답 부분의 반복(표 전사, bbox JSON)은 정상이다 → `max_tokens`가 맡는다.
 - 소프트: 스트림을 끊고 쓴 추론 + 종료 문장 + `</think>`를 assistant 메시지로 넣어 **같은 요청을 이어 쓰기**(`continue_final_message`, 스트리밍)로 다시 보낸다. 하드: 이어 쓰기도 걸리거나 빈 답이면 `finish_reason="reasoning_runaway"` — 답변은 안내문, 전사는 `[OCR FAILED …]`, bbox는 박스 없음 + 경고. **어느 쪽도 다시 보내지 않는다**(Step 6-0 규칙).
-- 호출 지점은 `analyze(..., reasoning_budget=config.reasoning_budget(kind), on_reasoning=…)`만 넘긴다. 감지·조치 코드를 호출 지점에 두지 않는다. 가짜 provider의 `analyze`는 이 두 키워드 인자를 받아야 한다.
+- 호출 지점은 `analyze(..., reasoning_budget=config.reasoning_budget(kind), on_reasoning=…)`만 넘긴다. 감지·조치 코드를 호출 지점에 두지 않는다. 가짜 provider의 `analyze`는 이 두 키워드 인자를 받아야 한다(2차에서 `reasoning_effort`가 더해져 셋 — 아래).
 - 추론을 켠 전사의 캐시 키·쪽 기록에 예산이 들어간다(`whole+thinking:b4000`). 예산을 바꾸면 다시 전사한다.
 - 진행 문구 중 1초마다 갱신되는 것("추론 중… n토큰")은 `progress(message, live=True)`로 보내 화면이 같은 줄을 바꿔 쓰고, 트레이스에는 적지 않는다(호출 이벤트가 토큰 수를 갖는다).
+
+추론 수준(Step 6 2차-a) — 모델의 채팅 템플릿이 받는 `reasoning_effort`를 호출 종류별로 싣는다. 요청의 `reasoningEffortAnswer` / `reasoningEffortGrounding` / `reasoningEffortOcr`, 없으면 아래 기본값.
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `REASONING_EFFORT_ANSWER` / `_GROUNDING` / `_OCR` | 빈 값 | 요청에 값이 없을 때 실어 보낼 추론 수준. 빈 값 = 보내지 않는다(모델 기본 수준 — Qwen3.8은 `xhigh`) (`DOCCHAT_REASONING_EFFORT_*`) |
+
+- 값은 모델마다 다르다(Qwen3.8: `low`/`medium`/`xhigh`, `high` 없음) → **목록으로 묶지 않고 모양만 검사한다**(`config.normalize_reasoning_effort`). 화면은 고른 값을 모델 이름별로 저장한다.
+- **추론을 켠 로컬 호출에만** `chat_template_kwargs.reasoning_effort`로 실린다. 추론을 끈 호출의 요청은 이전과 같아야 한다. 이어 쓰기(소프트) 요청도 같은 값을 싣는다. 요청 최상위 `reasoning_effort`와 클라우드 provider는 연결하지 않았다(확인할 서버·키가 없다).
+- 어느 호출에 실을지는 `chat_service.plan_effort` **한 곳**에서 정한다(추론을 끄는 호출 종류·수준을 보내지 않는 provider는 비운다). 호출 지점은 `analyze(..., reasoning_effort=…)`만 넘긴다. 가짜 provider의 `analyze`는 `reasoning_budget`·`on_reasoning`·`reasoning_effort` 세 키워드 인자를 받아야 한다.
+- **서버가 값을 받지 않으면 `ReasoningEffortError`로 턴을 끝낸다. 값을 빼고 다시 보내지 않는다** — 빼고 보내면 모델 기본 수준으로 돌고 답에는 요청한 수준이 적혀 실험 기록이 틀린다. 이 오류는 전사 재시도(`ocr._transcribe`), 도구 오류(`loop`), 타일의 일부 실패(`tools._inspect_tiles`)에 묻히면 안 된다 — 넓게 잡는 `except`를 새로 넣을 때 이 예외를 먼저 다시 던진다.
+- 원인이 수준인지는 **서버의 오류 문구로 판단하지 않는다**. 거절된 뒤에만 1토큰 확인 요청 둘(수준을 실은 것 / 뺀 것)을 보내 가린다(`openai_compat._effort_is_refused`). 이 판정은 "도구 미지원 → JSON 폴백"(400이면 무엇이든 해당)보다 먼저다.
+- "받았다 ≠ 적용됐다": 수준이 없는 모델(Qwen3.5)은 값을 거절하지 않고 무시한다. 답변의 `meta.reasoningEffort`는 "실어 보냈고 거절되지 않았다"는 뜻이다. 효과는 추론 토큰 수로 본다.
+- 추론을 켠 전사의 캐시 키·쪽 기록에 수준이 들어간다(`whole+thinking:b4000:elow`). 수준이 없으면 1차의 기록과 같은 값이다.
 
 답변(추론) 호출의 이미지(Step 8 1차) — 요청의 `answerImageMode`, 없으면 아래 기본값.
 
@@ -143,7 +157,7 @@ uv run python scripts/check_runaway.py --image plan.png --task "Find every door 
 ```
 
 - 한 턴이 왜 그렇게 답했는지·왜 느렸는지는 `.env`에 `DOCCHAT_DEBUG_TRACE=1`을 켜고 답변의 **"과정 보기"**(또는 `GET /api/traces/{id}`)로 본다(Step 7). 재현 스크립트를 따로 짜기 전에 이것부터 본다. `docchat-scratch`는 켠 채 뜬다.
-- 추론 모델의 폭주(예산·반복)는 `scripts/check_runaway.py`로 실제 서버에서 확인한다(README 3.4). 조건 `SOFT`/`FULL`이 답변 호출의 소프트 조치, `B`/`E`가 bbox·전사의 조치를 적는다. 추론 모델은 사용자 vLLM(Qwen3.5)뿐이라 **요청받았을 때만** 보낸다.
+- 추론 모델의 폭주(예산·반복)는 `scripts/check_runaway.py`로 실제 서버에서 확인한다(README 3.4). 조건 `SOFT`/`FULL`이 답변 호출의 소프트 조치, `B`/`E`가 bbox·전사의 조치를 적는다. `LEVELS`는 추론 수준이 모델에 닿는지를 입력 토큰 수로 본다(출력 1토큰), `--effort`는 다른 조건의 추론을 켠 호출에 수준을 싣는다. 추론 모델은 사용자 vLLM(Qwen3.5 · Qwen3.8)뿐이라 **요청받았을 때만** 보낸다.
 
 - 브라우저로 UI를 확인할 때는 `.claude/launch.json`의 **`docchat-scratch`**(포트 8765, DB는 `%TEMP%\docchat-scratch`)를 쓴다. 기본 `docchat` 구성은 사용자의 실제 `data/`를 쓴다.
 - 이 PC에는 **Ollama(`http://127.0.0.1:11434/v1`)에 `gemma3:latest`(비전 지원, tool-calling 미지원)** 가 있다 → 종단 점검에 사용. tool-calling 미지원이므로 **JSON 폴백 경로**가 실제로 검증된다. bbox 위치 정확도는 낮다(모델 한계) — 파이프라인 버그로 오해하지 말 것.
@@ -190,7 +204,7 @@ app/
   storage.py         FileStore — data/files 아래 파일 쓰기·읽기, 경로 검사, 대화 폴더 삭제
   attachments.py     Attachment 모델, 업로드 정제
   api/               sessions / models / files / chat / traces 라우터
-  providers/         analyze() 인터페이스와 OpenAI호환·Anthropic·Gemini 구현, reasoning(추론 예산·반복 감지, Step 6),
+  providers/         analyze() 인터페이스와 OpenAI호환(추론 수준 싣기·거절 판별 포함)·Anthropic·Gemini 구현, reasoning(추론 예산·반복 감지, Step 6),
                      traced(트레이스용 겉싸개)
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)

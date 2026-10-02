@@ -11,6 +11,10 @@
     uv run python scripts/check_runaway.py --image plan.png --question "창호 심볼을 찾아 표시해 줘" --conditions CHAT
     # 추론 제어(Step 6): 답변 호출의 추론 예산(소프트)이 걸리는지 — 첨부 없는 짧은 질문을 예산 500으로 3번, 예산 없이 1번
     uv run python scripts/check_runaway.py --question "17 곱하기 23은?" --conditions SOFT:3,FULL --budget 500
+    # 추론 수준(Step 6 2차): 값이 모델에 닿는지(1토큰 요청의 입력 토큰 수)와, 받지 않는 값이 오류로 끝나는지
+    uv run python scripts/check_runaway.py --conditions LEVELS --levels low,medium,xhigh --invalid high
+    # 추론 수준을 실어 한 턴: 수준별 추론 토큰·시간을 본다(--effort는 B·C·E·CHAT·SOFT·FULL의 추론을 켠 호출에 실린다)
+    uv run python scripts/check_runaway.py --question "17 곱하기 23은?" --conditions FULL:2 --effort low
 
 조건
     A  bbox 추론 끔 · 상한 4,096      B  bbox 추론 켬 · 상한 4,096      C  bbox 추론 켬 · 상한 16,000
@@ -18,6 +22,9 @@
     CHAT  /api/chat 한 턴(타일 모드)
     SOFT  /api/chat 첨부 없는 한 턴, 답변 호출 추론 켬 · 추론 예산 --budget(기본 500)
     FULL  같은 턴을 추론 예산 없이(비교용)
+    LEVELS  추론 수준(reasoning_effort) 전달 확인. 같은 짧은 질문을 수준만 바꿔 **출력 1토큰**으로 보내 입력 토큰 수를 적는다
+            (수준에 따라 템플릿이 지시문을 넣으면 입력 토큰 수가 달라진다). --invalid 값은 앱이 오류로 끝내는지 본다.
+            생성이 1토큰이라 느린 장비에서도 몇 초면 끝난다.
     상한은 --limit으로, 되풀이 횟수는 --repeat으로 바꾼다(조건 뒤에 `A:2`처럼 적어도 된다).
     추론을 켠 bbox·전사 조건(B·C·E)에는 서버의 추론 예산(DOCCHAT_REASONING_BUDGET_*)이 그대로 적용된다 — 호출마다
     추론을 끊고 답으로 넘겼는지(forced), 끝내 중단했는지(runaway)를 적는다.
@@ -62,8 +69,9 @@ MIMES = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", "
 # (종류, 추론 끔, 출력 상한)
 CONDITIONS = {"A": ("bbox", True, 4096), "B": ("bbox", False, 4096), "C": ("bbox", False, 16000),
               "D": ("ocr", True, 4096), "E": ("ocr", False, 4096), "CHAT": ("chat", None, None),
-              "SOFT": ("plain", False, None), "FULL": ("plain", False, None)}
+              "SOFT": ("plain", False, None), "FULL": ("plain", False, None), "LEVELS": ("levels", False, None)}
 CHAT_TIMEOUT_SECONDS = 600
+LEVELS_QUESTION = "What is 17 times 23? Answer with the number only."
 
 
 def upload_of(path: Path) -> dict[str, Any]:
@@ -137,7 +145,39 @@ def retried_after_limit(calls: list[dict[str, Any]]) -> list[str]:
             if any(item.get("finish") == "length" for item in items) and len(items) > 1]
 
 
-async def run_bbox(path: Path, task: str, thinking_off: bool, limit: int) -> dict[str, Any]:
+async def run_levels(levels: list[str], invalid: list[str]) -> dict[str, Any]:
+    """추론 수준이 모델에 닿는지(Step 6 2차). 앱의 provider 경로(`analyze(reasoning_effort=…)`)로 출력 1토큰만 받는다.
+
+    수준에 따라 채팅 템플릿이 지시문을 넣으면 **입력 토큰 수**가 달라진다 — 생성을 기다리지 않고도 전달을 확인할 수 있다.
+    """
+    from app.providers.base import ProviderError, ReasoningEffortError
+
+    provider = new_provider()
+    rows: list[dict[str, Any]] = []
+    try:
+        for level in ["", *levels, *invalid]:
+            started = time.time()
+            row: dict[str, Any] = {"level": level or "(보내지 않음)", "expectRefusal": level in invalid}
+            try:
+                response = await provider.analyze([{"role": "user", "content": LEVELS_QUESTION}], max_tokens=1,
+                                                  reasoning_effort=level or None)
+                row.update(accepted=True, promptTokens=response.prompt_tokens, finish=response.finish_reason)
+            except ReasoningEffortError as error:
+                row.update(accepted=False, refused=True, error=str(error)[:600])
+            except ProviderError as error:      # 수준 탓이 아닌 다른 오류(연결 실패 등)
+                row.update(accepted=False, refused=False, error=str(error)[:600])
+            row["seconds"] = round(time.time() - started, 1)
+            rows.append(row)
+            state = (f"입력 {row.get('promptTokens')}토큰" if row["accepted"]
+                     else ("추론 수준 오류로 끝남" if row.get("refused") else "다른 오류"))
+            print(f"      {row['level']:<14} {state} · {row['seconds']}s" + (f"\n        {row['error']}" if row.get("error") else ""),
+                  flush=True)
+    finally:
+        await provider.aclose()
+    return {"levels": rows}
+
+
+async def run_bbox(path: Path, task: str, thinking_off: bool, limit: int, effort: str = "") -> dict[str, Any]:
     from app.agent.tools import ToolContext, execute_tool
     from app.attachments import sanitize_uploads
     from app.pipeline.preprocess import preprocess_attachments
@@ -147,7 +187,8 @@ async def run_bbox(path: Path, task: str, thinking_off: bool, limit: int) -> dic
     attachments = await preprocess_attachments(sanitize_uploads([upload_of(path)]))
     provider, calls = new_provider(), []
     watch(provider, calls, grounding=True)
-    context = ToolContext(provider=provider, attachments=attachments, image_mode="tile", disable_thinking=thinking_off)
+    context = ToolContext(provider=provider, attachments=attachments, image_mode="tile", disable_thinking=thinking_off,
+                          reasoning_effort=effort)
     started = time.time()
     try:
         raw = await execute_tool(context, ToolCall("inspect_visual", {"name": path.name, "task": task}))
@@ -173,7 +214,7 @@ async def run_bbox(path: Path, task: str, thinking_off: bool, limit: int) -> dic
     }
 
 
-async def run_ocr(path: Path, thinking_off: bool, limit: int, expected: list[str]) -> dict[str, Any]:
+async def run_ocr(path: Path, thinking_off: bool, limit: int, expected: list[str], effort: str = "") -> dict[str, Any]:
     from app.attachments import sanitize_uploads
     from app.pipeline.images import TileSource, VisionUsage
     from app.pipeline.ocr import OcrCache, build_ocr_reader, prepare_visual_ocr_evidence
@@ -189,12 +230,13 @@ async def run_ocr(path: Path, thinking_off: bool, limit: int, expected: list[str
     async def load(page):
         return TileSource(kind="pdf", data=source, page_number=page.page_number or 1)
 
-    reader = build_ocr_reader(provider, image_mode="tile", load_tile_source=load, usage=usage, disable_thinking=thinking_off)
+    reader = build_ocr_reader(provider, image_mode="tile", load_tile_source=load, usage=usage, disable_thinking=thinking_off,
+                              reasoning_effort=effort)
     started = time.time()
     try:
         output, _ = await prepare_visual_ocr_evidence(
             attachments, read_image=reader, cache=OcrCache(), cache_namespace=provider.cache_namespace,
-            image_mode="tile", thinking=not thinking_off)
+            image_mode="tile", thinking=not thinking_off, reasoning_effort="" if thinking_off else effort)
     finally:
         await provider.aclose()
     text = "\n\n".join(item.text for item in output if item.name.endswith("visual OCR"))
@@ -211,8 +253,9 @@ async def run_ocr(path: Path, thinking_off: bool, limit: int, expected: list[str
     return result
 
 
-def run_chat(path: Path | None, question: str) -> dict[str, Any]:
-    """실제 `/api/chat` 경로. 답변 호출은 추론을 켜고 출력 상한 없이 나간다 — 추론 예산·반복 감지(Step 6)만 건다."""
+def run_chat(path: Path | None, question: str, effort: str = "") -> dict[str, Any]:
+    """실제 `/api/chat` 경로. 답변 호출은 추론을 켜고 출력 상한 없이 나간다 — 추론 예산·반복 감지(Step 6)만 건다.
+    effort: 추론 수준(Step 6 2차). 주면 세 호출 종류 모두에 같은 값을 싣는다(추론을 켠 호출에만 실린다)."""
     scratch = Path(tempfile.mkdtemp(prefix="docchat-runaway-"))
     os.environ["DOCCHAT_DB_PATH"] = str(scratch / "check.sqlite")
     os.environ["DOCCHAT_FILES_DIR"] = str(scratch / "files")
@@ -223,6 +266,8 @@ def run_chat(path: Path | None, question: str) -> dict[str, Any]:
 
     body = {**CONNECTION, "model": MODEL, "contextSize": CONTEXT, "imageMode": "tile", "disableThinking": False,
             "messages": [{"role": "user", "content": question}], "attachments": [upload_of(path)] if path else []}
+    if effort:
+        body.update(reasoningEffortAnswer=effort, reasoningEffortGrounding=effort, reasoningEffortOcr=effort)
 
     def post() -> dict[str, Any]:
         with TestClient(create_app()) as client:
@@ -236,7 +281,8 @@ def run_chat(path: Path | None, question: str) -> dict[str, Any]:
             document = client.get(f"/api/traces/{trace_id}").json() if trace_id else {}
             data["answerCalls"] = [
                 {key: event["data"].get(key) for key in ("reasoningTokens", "reasoningSeconds", "forced", "runaway",
-                                                           "finishReason", "promptTokens", "completionTokens")}
+                                                           "finishReason", "promptTokens", "completionTokens",
+                                                           "reasoningEffort")}
                 for event in document.get("events", []) if event["kind"] == "model" and event["data"].get("kind") == "answer"]
             return data
 
@@ -259,8 +305,17 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1, help="횟수를 적지 않은 조건의 되풀이 횟수")
     parser.add_argument("--limit", type=int, help="조건의 출력 상한을 이 값으로 바꾼다(0 = 상한 없음)")
     parser.add_argument("--budget", type=int, default=500, help="SOFT 조건의 답변 호출 추론 예산(토큰)")
+    parser.add_argument("--effort", default="", help="추론을 켠 호출에 실을 추론 수준(reasoning_effort). 예: low")
+    parser.add_argument("--levels", default="low,medium,xhigh", help="LEVELS 조건에서 보낼 추론 수준(쉼표로 구분)")
+    parser.add_argument("--invalid", default="", help="LEVELS 조건에서 '모델이 받지 않는 값'으로 보낼 수준(쉼표로 구분)")
     parser.add_argument("--out", help="결과 폴더(기본 samples/compare/runaway-<시각>)")
     arguments = parser.parse_args()
+    try:
+        effort = config.normalize_reasoning_effort(arguments.effort)
+        levels = [config.normalize_reasoning_effort(item) for item in arguments.levels.split(",") if item.strip()]
+        invalid = [config.normalize_reasoning_effort(item) for item in arguments.invalid.split(",") if item.strip()]
+    except ValueError as error:
+        parser.error(f"추론 수준 값이 올바르지 않습니다: {error}")
 
     plan: list[tuple[str, int]] = []
     for item in arguments.conditions.split(","):
@@ -276,6 +331,7 @@ def main() -> int:
 
     print(f"대상: {CONNECTION['provider']} · {CONNECTION['baseUrl']} · {MODEL}")
     print(f"결과 폴더: {out}")
+    level = f" · 추론 수준 {effort}" if effort else ""
     results: list[dict[str, Any]] = []
     for name, count in plan:
         kind, thinking_off, limit = CONDITIONS[name]
@@ -286,26 +342,32 @@ def main() -> int:
             if kind == "chat":
                 if not arguments.image or not arguments.question:
                     parser.error("CHAT 조건에는 --image와 --question이 필요합니다.")
-                print(f"\n── {label}: /api/chat · 타일 모드 · 추론 끄기(모든 호출) 해제 · 호출별 선택은 서버 기본값", flush=True)
-                result = run_chat(Path(arguments.image), arguments.question)
+                print(f"\n── {label}: /api/chat · 타일 모드 · 추론 끄기(모든 호출) 해제 · 호출별 선택은 서버 기본값{level}", flush=True)
+                result = run_chat(Path(arguments.image), arguments.question, effort)
             elif kind == "plain":
                 if not arguments.question:
                     parser.error("SOFT·FULL 조건에는 --question이 필요합니다.")
                 config.REASONING_BUDGET_ANSWER = arguments.budget if name == "SOFT" else 0
                 print(f"\n── {label}: /api/chat · 첨부 없음 · 답변 호출 추론 켬 · 추론 예산 "
-                      f"{config.REASONING_BUDGET_ANSWER or '없음'}", flush=True)
-                result = run_chat(None, arguments.question)
+                      f"{config.REASONING_BUDGET_ANSWER or '없음'}{level}", flush=True)
+                result = run_chat(None, arguments.question, effort)
+            elif kind == "levels":
+                print(f"\n── {label}: 추론 수준 전달 확인 · 출력 1토큰 · 수준 {', '.join(levels) or '(없음)'}"
+                      + (f" · 받지 않을 값 {', '.join(invalid)}" if invalid else ""), flush=True)
+                result = asyncio.run(run_levels(levels, invalid))
             elif kind == "bbox":
                 if not arguments.image or not arguments.task:
                     parser.error("조건 A·B·C에는 --image와 --task가 필요합니다.")
-                print(f"\n── {label}: bbox · 추론 {'끔' if thinking_off else '켬'} · 상한 {limit or '없음'}", flush=True)
-                result = asyncio.run(run_bbox(Path(arguments.image), arguments.task, thinking_off, limit))
+                print(f"\n── {label}: bbox · 추론 {'끔' if thinking_off else '켬'} · 상한 {limit or '없음'}"
+                      f"{'' if thinking_off else level}", flush=True)
+                result = asyncio.run(run_bbox(Path(arguments.image), arguments.task, thinking_off, limit, effort))
             else:
                 if not arguments.pdf:
                     parser.error("조건 D·E에는 --pdf가 필요합니다.")
-                print(f"\n── {label}: 전사 · 추론 {'끔' if thinking_off else '켬'} · 상한 {limit or '없음'}", flush=True)
-                result = asyncio.run(run_ocr(Path(arguments.pdf), thinking_off, limit, expected))
-            result.update(condition=name, attempt=attempt, thinkingDisabled=thinking_off, limit=limit)
+                print(f"\n── {label}: 전사 · 추론 {'끔' if thinking_off else '켬'} · 상한 {limit or '없음'}"
+                      f"{'' if thinking_off else level}", flush=True)
+                result = asyncio.run(run_ocr(Path(arguments.pdf), thinking_off, limit, expected, effort))
+            result.update(condition=name, attempt=attempt, thinkingDisabled=thinking_off, limit=limit, effort=effort or None)
             results.append(result)
             summarize(label, "chat" if kind == "plain" else kind, result)
             (out / "result.json").write_text(json.dumps({
@@ -322,6 +384,18 @@ def main() -> int:
 
 
 def summarize(label: str, kind: str, result: dict[str, Any]) -> None:
+    if kind == "levels":
+        rows = result["levels"]
+        accepted = {row["level"]: row.get("promptTokens") for row in rows if row["accepted"]}
+        print(f"   {label}: 입력 토큰 수 {accepted}")
+        if len(set(accepted.values())) <= 1 and len(accepted) > 1:
+            print("   수준을 바꿔도 입력 토큰 수가 같다 → 이 모델의 템플릿은 값을 쓰지 않는다(무시) — 받았다고 적용된 것은 아니다.")
+        for row in rows:
+            if row["expectRefusal"]:
+                verdict = "추론 수준 오류로 끝남(기대대로)" if row.get("refused") else (
+                    "거절되지 않았다 — 이 모델은 이 값을 받거나 무시한다" if row["accepted"] else "다른 오류로 끝남")
+                print(f"   받지 않을 값 {row['level']}: {verdict}")
+        return
     if kind == "chat":
         if result.get("timedOut"):
             print(f"   {label}: {CHAT_TIMEOUT_SECONDS}초 안에 끝나지 않음")
@@ -329,7 +403,8 @@ def summarize(label: str, kind: str, result: dict[str, Any]) -> None:
         meta = result.get("meta") or {}
         vision = meta.get("vision") or {}
         print(f"   {label}: HTTP {result.get('status')} · {result.get('seconds')}초 · 추론 끔 기록 {meta.get('thinkingDisabled')}"
-              f" · 출력 상한 {meta.get('visionMaxTokens')} · 추론 예산 {(meta.get('reasoning') or {}).get('budget')}")
+              f" · 출력 상한 {meta.get('visionMaxTokens')} · 추론 예산 {(meta.get('reasoning') or {}).get('budget')}"
+              f" · 추론 수준 {meta.get('reasoningEffort') or '보내지 않음'}")
         print(f"   비전 호출: {vision}")
         for index, call in enumerate(result.get("answerCalls") or [], start=1):
             print(f"   답변 호출 #{index}: 추론 {call.get('reasoningTokens')}토큰 · {call.get('reasoningSeconds')}초 · "

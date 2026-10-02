@@ -110,6 +110,20 @@ uv run python run.py
 - 이어 쓰기 요청 형식(`continue_final_message`)은 vLLM에서 확인했습니다. Ollama·llama.cpp처럼 그 필드를 모르는 서버는 assistant 메시지를 이력으로 보고 새로 답할 수도, 빈 답을 낼 수도 있습니다(빈 답이면 하드로 끝납니다, 미실측). 클라우드 provider에는 적용되지 않습니다.
 - 실제 서버에서 확인하려면 `scripts/check_runaway.py`(3.4절)의 `SOFT`/`FULL` 조건을 씁니다.
 
+### 추론 수준 — `reasoning_effort` (Step 6 2차)
+
+추론을 켜고 끄는 것 말고 **얼마나 길게 생각할지**를 받는 모델이 있습니다(예: Qwen3.8-27B의 채팅 템플릿은 `low` / `medium` / `xhigh`를 받고, 안 보내면 가장 긴 `xhigh`). ⚙ 모델 설정의 "추론 수준"에서 **호출 종류별로**(답변 · 위치 확인 · 전사) 적습니다.
+
+- **비우면 보내지 않습니다**(모델의 기본 수준 — 지금까지의 동작). 값은 모델마다 달라 목록에서 고르지 않고 글자로 적습니다(영문 소문자·숫자·`-`·`_`, 24자까지).
+- **추론을 켠 로컬 호출에만** 실립니다(`chat_template_kwargs.reasoning_effort`). 그 호출의 추론이 꺼져 있으면 칸이 잠기고, 요청은 이전과 똑같이 나갑니다. 클라우드 provider에는 연결돼 있지 않습니다.
+- 화면에서 고른 값은 **모델 이름별로** 브라우저에 저장됩니다 — 모델을 바꾸면 그 모델에서 고른 값이 따라옵니다. 한 번도 고르지 않은 모델은 서버 기본값(`.env`의 `DOCCHAT_REASONING_EFFORT_ANSWER` / `_GROUNDING` / `_OCR`, 기본은 빈 값)을 씁니다.
+- **서버가 받지 않는 값이면 그 턴은 오류로 끝납니다**(예: Qwen3.8에 `high`). 값을 빼고 다시 보내지 않습니다 — 그러면 모델 기본 수준으로 돌아 오래 걸리고, 답에는 요청한 수준이 적혀 비교 기록이 틀어집니다. 오류 문구에 서버가 한 말이 그대로 나옵니다. 이미 끝난 전사는 저장돼 있으므로 값을 고쳐 다시 보내면 됩니다.
+- **"받았다"와 "적용됐다"는 다릅니다.** 수준이 없는 모델(Qwen3.5 등)은 값을 거절하지 않고 무시합니다. 효과는 "과정 보기"의 추론 토큰 수로 확인하세요.
+- 답변 아래에 `답변 호출 1회 (추론 끄지 않음, 추론 수준 low)`처럼 표시되고, 답변의 `meta.reasoningEffort`(실어 보낸 호출 종류와 값)와 트레이스의 호출별 `추론 수준` 칩에 남습니다.
+- 전사의 수준은 OCR 캐시 키에 들어가므로, 추론을 켠 전사의 수준을 바꾸면 그 쪽은 다시 전사합니다.
+- 추론 예산·반복 감지(위)는 수준과 무관하게 그대로 작동합니다. 수준은 "모델에게 짧게 생각하라고 부탁"하는 것이고, 예산은 "넘으면 끊는" 것입니다.
+- 실제 서버에서 값이 닿는지는 `scripts/check_runaway.py --conditions LEVELS`(3.4절)로 봅니다.
+
 ### 턴 과정 보기 — 개발용 트레이스
 
 도면을 왜 잘/못 읽었는지, 어떤 정보를 어디서 가져왔는지, 왜 느렸는지를 **한 턴 단위로** 볼 수 있습니다. `.env`에 `DOCCHAT_DEBUG_TRACE=1`을 적고 서버를 다시 띄우면 켜집니다(기본은 꺼짐, 꺼져 있으면 아무것도 기록하지 않습니다).
@@ -191,6 +205,7 @@ uv run pytest
 | `tests/test_trace.py` | 턴 트레이스: 꺼져 있으면 아무것도 기록하지 않음, 한 턴의 입력→전처리→전사→증거→모델 호출→도구→답변 기록, 도구 아래 자식 호출, 진행 중인 턴의 `running` 호출과 취소 시 `cancelled`, API key·base64 미기록, 대화 삭제 시 함께 삭제 |
 | `tests/test_answer_images.py` | 답변 호출 이미지(Step 8): 기본값은 이전 동작 그대로, 전체 모드는 전사 뒤 쪽 이미지를 쪽 순서로 싣고 네이티브 쪽을 렌더해 저장, 상한 안에서만 렌더, 루프의 매 호출에 실림, 끔 모드에서도 bbox 도구 동작, 렌더한 쪽이 기본 모드로 새지 않음, 트레이스 기록 |
 | `tests/test_reasoning_control.py` | 추론 제어(Step 6): 실측 반복 표본을 3번째 순환에서 잡고 정상 추론·짧은 줄은 오인하지 않음, 조각·글자 수로 토큰 세기, 본문 속 `<think>` 가르기, 추론을 켠 로컬 호출만 스트리밍, 도구 호출 델타 조립, 예산 초과·반복 → 이어 쓰기 요청 형식(`</think>` 접두 + `continue_final_message`), 이어 쓰기 실패 → 하드 중단(반복·빈 답·거절), 상한 = 예산 + 출력 몫, 전사·bbox 호출의 실패 처리와 재시도 없음, `/api/chat`의 메타·live 진행·안내문, 트레이스 기록 |
+| `tests/test_reasoning_effort.py` | 추론 수준(Step 6 2차): 값의 모양 검사, 추론을 켠 로컬 호출에만 `chat_template_kwargs.reasoning_effort`가 실리는지(추론을 끈 호출·클라우드는 이전과 같은 요청), 이어 쓰기 요청도 같은 수준, 서버가 받지 않는 값 → 오류(빼고 다시 보내지 않음, 같은 값을 다시 묻지 않음), 다른 원인의 거절을 수준 탓으로 돌리지 않음(1토큰 확인 요청), 전사 3회 재시도·도구 오류·타일 일부 실패에 묻히지 않음, 호출 종류별 값과 `meta.reasoningEffort`, 수준을 바꾸면 다시 전사, 트레이스 기록 |
 
 특정 테스트만: `uv run pytest tests/test_pdf_pipeline.py -k classification -v`
 
@@ -238,8 +253,13 @@ uv run python scripts/check_runaway.py --pdf samples/large_scanned_plan.pdf --ex
 uv run python scripts/check_runaway.py --question "17 곱하기 23은? 숫자만 답해 줘." --conditions SOFT:3,FULL --budget 500
 # 실제 /api/chat 경로로 한 턴(타일 모드, "추론 끄기 — 모든 호출" 해제)
 uv run python scripts/check_runaway.py --image plan.png --question "문 심볼을 찾아 표시해 줘" --conditions CHAT
+# 추론 수준(Step 6 2차): 값이 모델에 닿는지(수준별 입력 토큰 수, 출력 1토큰이라 몇 초)와 받지 않는 값이 오류로 끝나는지
+uv run python scripts/check_runaway.py --conditions LEVELS --levels low,medium,xhigh --invalid high
+# 추론 수준을 실어 한 턴 — 수준별 추론 토큰·시간 비교(--effort는 B·C·E·CHAT·SOFT·FULL의 추론을 켠 호출에 실린다)
+uv run python scripts/check_runaway.py --question "17 곱하기 23은? 숫자만 답해 줘." --conditions FULL:2 --effort low
 ```
 
+- `LEVELS`는 같은 짧은 질문을 수준만 바꿔 보내 **입력 토큰 수**를 적습니다. 템플릿이 수준에 따라 지시문을 넣는 모델이면 수가 달라지고(Qwen3.8: `medium` < `low`·`xhigh`, 미지정 = `xhigh`), 전부 같으면 그 모델은 값을 무시하는 것입니다.
 - 호출마다 타일·종료 사유(`stop`/`length`)·출력 토큰·시간이 찍히고, `result.json`에 본문과 추론의 끝부분이 남습니다.
 - `--limit 1000`처럼 상한을 바꿔 상한 도달을 일부러 만들 수 있습니다.
 - 같은 조건이어도 어느 타일이 상한에 닿는지는 실행마다 달라집니다(동시에 나가는 호출의 영향).
@@ -270,8 +290,8 @@ curl -X POST http://127.0.0.1:8000/api/test-connection -H "Content-Type: applica
 
 | 메서드 · 경로 | 설명 |
 |---|---|
-| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`; `progress`에 `live: true`가 있으면 "추론 중… n토큰"처럼 같은 줄을 갱신하는 문구). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`(답변 호출에 실을 이미지, 비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
-| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 추론 예산·반복 기준(`reasoning`), 트레이스 켬 여부(`debugTrace`) |
+| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`; `progress`에 `live: true`가 있으면 "추론 중… n토큰"처럼 같은 줄을 갱신하는 문구). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`(답변 호출에 실을 이미지, 비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). `reasoningEffortAnswer` · `reasoningEffortGrounding` · `reasoningEffortOcr`(호출 종류별 추론 수준. 없으면 서버 기본값, `""`이면 보내지 않음, 추론을 켠 로컬 호출에만 실림 — 서버가 받지 않는 값이면 400). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·실어 보낸 추론 수준(`reasoningEffort`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
+| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 추론 예산·반복 기준(`reasoning`), 추론 수준의 서버 기본값(`reasoningEffort`), 트레이스 켬 여부(`debugTrace`) |
 | `GET /api/traces/{id}` | 턴 트레이스 JSON(진행 중이면 그때까지의 기록). `?download=1`이면 파일로 |
 | `GET /api/sessions/{id}/traces` | 그 대화의 트레이스 목록(id·시각·상태) |
 | `GET /api/sessions` · `POST /api/sessions` · `DELETE /api/sessions` | 목록 · 생성 · 선택/전체 삭제(`{ids}` 또는 `{all:true}`) |

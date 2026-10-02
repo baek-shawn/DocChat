@@ -100,9 +100,10 @@ class AnthropicProvider(Provider):
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
                       disable_thinking: bool = False, max_tokens: int | None = None,
-                      reasoning_budget: int | None = None, on_reasoning: Any = None) -> ModelResponse:
-        # disable_thinking·max_tokens·reasoning_budget·on_reasoning은 로컬 provider용이다. 여기서는 쓰지 않는다(확장 추론을 요청하지 않고,
-        # 출력 상한은 MAX_OUTPUT_TOKENS로 이미 있다).
+                      reasoning_budget: int | None = None, on_reasoning: Any = None,
+                      reasoning_effort: str | None = None) -> ModelResponse:
+        # disable_thinking·max_tokens·reasoning_budget·on_reasoning·reasoning_effort는 로컬 provider용이다. 여기서는 쓰지 않는다
+        # (확장 추론을 요청하지 않고, 출력 상한은 MAX_OUTPUT_TOKENS로 이미 있다).
         try:
             return await self._complete(messages, images, tools, temperature)
         except ContextWindowError:

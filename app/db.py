@@ -221,6 +221,19 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
         if all(number is not None for number in budgets.values()) and all(number is not None for number in settings.values()):
             meta["reasoning"] = {"budget": {kind: int(number) for kind, number in budgets.items()},
                                  **{name: int(number) for name, number in settings.items()}}
+    # 호출 종류별로 실어 보낸 추론 수준(Step 6 2차). 모양이 맞는 값만 남긴다.
+    effort = value.get("reasoningEffort")
+    if isinstance(effort, dict):
+        levels = {}
+        for kind in config.REASONING_KINDS:
+            try:
+                level = config.normalize_reasoning_effort(effort.get(kind)) if isinstance(effort.get(kind), str) else ""
+            except ValueError:
+                level = ""
+            if level:
+                levels[kind] = level
+        if levels:
+            meta["reasoningEffort"] = levels
     actions = value.get("reasoningActions")
     if isinstance(actions, list):
         kept = [{"kind": item["kind"], "image": str(item.get("image") or "")[:300],

@@ -18,7 +18,8 @@ from ..pipeline.evidence import attachment_root_name, page_image_name
 from ..pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
 from ..pipeline.pdf import PdfError
 from ..pipeline.preprocess import render_page_attachment
-from ..providers.base import Provider, ToolCall, ToolSpec, is_output_length_stop, is_reasoning_runaway
+from ..providers.base import (Provider, ReasoningEffortError, ToolCall, ToolSpec, is_output_length_stop,
+                              is_reasoning_runaway)
 from ..providers.reasoning import describe_reasoning_progress
 from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
                         valid_box)
@@ -94,6 +95,8 @@ class ToolContext:
     disable_thinking: bool = False
     # 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6). 단계 알림(on_progress)과 다르다.
     on_live: Callable[[str], None] | None = None
+    # 추론을 켠 bbox 호출에 실을 추론 수준(Step 6 2차, 요청마다 고른다). 비어 있으면 보내지 않는다.
+    reasoning_effort: str = ""
 
 
 def available_tools(attachments: list[Attachment]) -> list[ToolSpec]:
@@ -224,6 +227,7 @@ async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, 
     part = VisualInspection()
     # 추론을 켠 bbox 호출의 추론 예산(Step 6). 넘거나 반복하면 provider가 추론을 끊고 답만 이어 쓰게 한다.
     budget = config.reasoning_budget("grounding") if not context.disable_thinking else None
+    effort = (context.reasoning_effort or None) if not context.disable_thinking else None      # 추론 수준(Step 6 2차)
     watch = (lambda info: context.on_live(describe_reasoning_progress(info))) if context.on_live is not None else None
     for attempt in range(1 + config.GROUNDING_RETRY_COUNT):
         instruction = grounding_instruction(task, surface.name, tile=image.tile is not None)
@@ -235,6 +239,7 @@ async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, 
                 [{"role": "system", "content": GROUNDING_SYSTEM_PROMPT}, {"role": "user", "content": instruction}],
                 images=[image], temperature=0.0, disable_thinking=context.disable_thinking,
                 max_tokens=config.vision_max_tokens(), reasoning_budget=budget, on_reasoning=watch,
+                reasoning_effort=effort,
             )
         context.usage.count_reasoning("grounding", response, image.name)
         if is_reasoning_runaway(response.finish_reason):
@@ -278,7 +283,8 @@ async def _inspect_tiles(context: ToolContext, surface: Attachment, images: list
 
     outcomes = await asyncio.gather(*(one(image) for image in images), return_exceptions=True)
     for outcome in outcomes:
-        if isinstance(outcome, asyncio.CancelledError):
+        # 취소, 그리고 서버가 추론 수준을 받지 않은 경우(설정 오류 — 모든 타일이 같은 값이다)는 "일부 타일 실패"가 아니다.
+        if isinstance(outcome, (asyncio.CancelledError, ReasoningEffortError)):
             raise outcome
     errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
     parts = [outcome for outcome in outcomes if isinstance(outcome, VisualInspection)]
