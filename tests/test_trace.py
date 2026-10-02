@@ -61,7 +61,8 @@ async def test_recording_outside_a_turn_is_a_no_op():
 def test_a_scanned_pdf_turn_is_traced_from_input_to_answer(traced, mock_llm):
     mock_llm.reset(seeing_model)
     assert traced.get("/api/health").json()["debugTrace"] is True
-    body = chat_body(mock_llm, "도면 번호 알려줘", [upload("scan.pdf", scanned_drawing(), PDF)], apiKey=SECRET,
+    scan = scanned_drawing()      # 한 번만 만든다 — 다시 만들면 바이트 수가 1바이트 달라질 때가 있다(가끔 실패하던 원인)
+    body = chat_body(mock_llm, "도면 번호 알려줘", [upload("scan.pdf", scan, PDF)], apiKey=SECRET,
                      contextSize=16384, disableThinking=False)
     data = traced.post("/api/chat", json=body).json()
     trace_id = data["meta"]["traceId"]
@@ -76,7 +77,7 @@ def test_a_scanned_pdf_turn_is_traced_from_input_to_answer(traced, mock_llm):
 
     (entry,) = events_of(document, "input")
     assert entry["data"]["question"] == "도면 번호 알려줘" and entry["data"]["model"] == "mock-vlm"
-    assert entry["data"]["attachments"] == [{"name": "scan.pdf", "kind": "pdf", "mime": PDF, "size": len(scanned_drawing())}]
+    assert entry["data"]["attachments"] == [{"name": "scan.pdf", "kind": "pdf", "mime": PDF, "size": len(scan)}]
     assert entry["data"]["thinkingDisabled"] == {"answer": False, "grounding": True, "ocr": True}
     assert entry["data"]["contextSize"] == 16384 and entry["data"]["visionMaxTokens"] == 4096
 

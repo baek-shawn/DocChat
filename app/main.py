@@ -91,6 +91,8 @@ def create_app() -> FastAPI:
                 "disableThinkingOcr": config.OCR_DISABLE_THINKING,
                 "maxTokens": config.VISION_MAX_TOKENS,
             },
+            # 추론 제어(Step 6): 추론을 켠 로컬 호출의 호출 종류별 추론 예산과 반복 감지 기준(설정 화면 표시용)
+            "reasoning": config.reasoning_settings(),
             # 개발용 턴 트레이스(Step 7)가 켜져 있는지 — 화면이 "과정 보기"를 안내할 때 쓴다
             "debugTrace": config.debug_trace_enabled(),
         }

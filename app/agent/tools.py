@@ -18,7 +18,8 @@ from ..pipeline.evidence import attachment_root_name, page_image_name
 from ..pipeline.images import ImageError, ModelImage, TileSource, VisionUsage, assemble_model_images
 from ..pipeline.pdf import PdfError
 from ..pipeline.preprocess import render_page_attachment
-from ..providers.base import Provider, ToolCall, ToolSpec, is_output_length_stop
+from ..providers.base import Provider, ToolCall, ToolSpec, is_output_length_stop, is_reasoning_runaway
+from ..providers.reasoning import describe_reasoning_progress
 from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
                         valid_box)
 from .prompts import GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, grounding_instruction
@@ -91,6 +92,8 @@ class ToolContext:
     on_tiles: Callable[[str, str, list[ModelImage]], Awaitable[None]] | None = None
     # bbox 호출의 추론을 끈다(요청마다 고른다, Step 6-0). 출력 상한은 `config.VISION_MAX_TOKENS`.
     disable_thinking: bool = False
+    # 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6). 단계 알림(on_progress)과 다르다.
+    on_live: Callable[[str], None] | None = None
 
 
 def available_tools(attachments: list[Attachment]) -> list[ToolSpec]:
@@ -219,6 +222,9 @@ async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, 
     어느 타일이 끊기는지는 실행마다 달랐다(Qwen3.5 실측) — 다시 물으면 될 수도 있지만 시간을 보장할 수 없다.
     """
     part = VisualInspection()
+    # 추론을 켠 bbox 호출의 추론 예산(Step 6). 넘거나 반복하면 provider가 추론을 끊고 답만 이어 쓰게 한다.
+    budget = config.reasoning_budget("grounding") if not context.disable_thinking else None
+    watch = (lambda info: context.on_live(describe_reasoning_progress(info))) if context.on_live is not None else None
     for attempt in range(1 + config.GROUNDING_RETRY_COUNT):
         instruction = grounding_instruction(task, surface.name, tile=image.tile is not None)
         if attempt:
@@ -228,8 +234,13 @@ async def _ground(context: ToolContext, surface: Attachment, image: ModelImage, 
             response = await context.provider.analyze(
                 [{"role": "system", "content": GROUNDING_SYSTEM_PROMPT}, {"role": "user", "content": instruction}],
                 images=[image], temperature=0.0, disable_thinking=context.disable_thinking,
-                max_tokens=config.vision_max_tokens(),
+                max_tokens=config.vision_max_tokens(), reasoning_budget=budget, on_reasoning=watch,
             )
+        context.usage.count_reasoning("grounding", response, image.name)
+        if is_reasoning_runaway(response.finish_reason):
+            # 추론이 끝나지 않아 이어 쓰기로도 답을 받지 못했다(Step 6) → 상한 도달과 같이 다시 묻지 않는다.
+            trace.note("tool", f"추론이 끝나지 않아 중단 → 다시 묻지 않음 · {image.name}", reason=response.runaway)
+            return VisualInspection(runaway=True)
         if is_output_length_stop(response.finish_reason):
             context.usage.grounding_length_stops += 1
             trace.note("tool", f"출력 상한에서 끊김 → 다시 묻지 않음 · {image.name}", finishReason=response.finish_reason)
@@ -281,16 +292,20 @@ async def _inspect_tiles(context: ToolContext, surface: Attachment, images: list
         notes = list(dict.fromkeys(part.text.strip() for part in parts if part.text.strip()))[:3]
     unreadable = len(images) - len(structured)
     cut = sum(1 for part in parts if part.cut_off)
+    looped = sum(1 for part in parts if part.runaway)
     warning = ""
     if structured and unreadable:
         warning = (f"{unreadable} of {len(images)} tiles did not return structured regions, "
                    "so targets inside those tiles may be missing.")
-    elif cut:
+    elif cut or looped:
         warning = "The vision model did not return structured regions for any tile; no boxes could be measured."
     if cut:
         warning += (f" {cut} of {len(images)} tiles stopped at {_limit_words()} before answering and were not retried.")
+    if looped:
+        warning += (f" {looped} of {len(images)} tiles were stopped because the model's reasoning did not finish "
+                    "(it repeated itself or exceeded its budget) and were not retried.")
     return VisualInspection(text="\n".join(notes), boxes=boxes, structured=bool(structured),
-                            cut_off=bool(cut) and not structured), warning
+                            cut_off=bool(cut) and not structured, runaway=bool(looped) and not structured), warning
 
 
 async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> str:
@@ -320,13 +335,16 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
         if inspection.cut_off:
             warning = (f"The vision model stopped at {_limit_words()} before answering, so no boxes could be measured. "
                        "The call was not retried.")
+        elif inspection.runaway:
+            warning = ("The vision model's reasoning did not finish (it repeated itself or exceeded its budget) and was "
+                       "stopped, so no boxes could be measured. The call was not retried.")
     else:
         inspection, warning = await _inspect_tiles(context, surface, images, task)
 
     regions = [box for box in inspection.boxes if valid_box(box)]
     trace.note("tool", f"inspect_visual 결과 · 영역 {len(regions)}개" + (" · 경고 있음" if warning else ""),
-               structured=inspection.structured, cutOff=inspection.cut_off, boxes=len(regions), warning=warning or None,
-               text=trace.clip(inspection.text))
+               structured=inspection.structured, cutOff=inspection.cut_off, runaway=inspection.runaway or None,
+               boxes=len(regions), warning=warning or None, text=trace.clip(inspection.text))
     artifact: dict[str, Any] = {
         "name": surface.name, "mime": surface.mime, "view": "image",
         "title": f"시각 검사 · {surface.name}", "task": task, "text": inspection.text[:20_000],

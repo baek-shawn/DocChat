@@ -15,8 +15,10 @@ from typing import Any
 from .. import trace
 from ..pipeline.images import ModelImage
 from .base import Message, ModelResponse, Provider, ToolSpec
+from .reasoning import OnReasoning, ReasoningProgress
 
 _LABELS = {"answer": "답변 호출", "ocr": "전사 호출", "grounding": "위치 확인 호출"}
+_REASONS = {"budget": "추론 예산 초과", "repeat": "추론 반복"}
 
 
 class TracedProvider(Provider):
@@ -60,7 +62,8 @@ class TracedProvider(Provider):
 
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
-                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
+                      disable_thinking: bool = False, max_tokens: int | None = None,
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
         kind, label = self._kind()
         number = self.turn.count(f"model:{kind}")
         image_notes = self.turn.describe_images(images)
@@ -75,10 +78,28 @@ class TracedProvider(Provider):
             messages=trace.describe_messages(messages), images=image_notes, tile=tile,
             tools=trace.describe_tools(tools), temperature=temperature, disableThinking=thinking_off,
             thinkingControl=control, maxTokens=max_tokens if self.is_local else None,
+            reasoningBudget=reasoning_budget if (self.is_local and not thinking_off) else None,
         )
+
+        def watched(info: ReasoningProgress) -> None:
+            """추론 진행은 호출 이벤트에 덧쓰고(진행 중에도 보이게), 소프트·하드 조치는 따로 한 줄 남긴다."""
+            self.turn.update(event, reasoningTokens=info.tokens, reasoningSeconds=round(info.seconds, 1),
+                             reasoningStage=info.stage)
+            if info.stage == "forced":
+                self.turn.update(event, forcedCycle=info.cycle or None)      # 반복이면 되풀이된 묶음의 첫 줄
+                self.turn.note("cleanup", f"{_REASONS.get(info.reason, info.reason)} → 추론을 끊고 답으로 넘김" + (f" · {where}" if where else ""),
+                               reason=info.reason, tokens=info.tokens, seconds=round(info.seconds, 1),
+                               cycle=info.cycle or None)
+            elif info.stage == "runaway":
+                self.turn.note("cleanup", "이어 쓰기로도 답을 받지 못해 중단" + (f" · {where}" if where else ""),
+                               reason=info.reason, tokens=info.tokens)
+            if on_reasoning is not None:
+                on_reasoning(info)
+
         try:
             response = await self.inner.analyze(messages, images, tools, temperature=temperature,
-                                                disable_thinking=disable_thinking, max_tokens=max_tokens)
+                                                disable_thinking=disable_thinking, max_tokens=max_tokens,
+                                                reasoning_budget=reasoning_budget, on_reasoning=watched)
         except asyncio.CancelledError:
             self.turn.finish(event, "cancelled", reason=trace.CANCELLED_REASON)
             raise
@@ -97,4 +118,7 @@ class TracedProvider(Provider):
             "toolCalls": [trace.describe_tool_call(call) for call in response.tool_calls] or None,
             "finishReason": response.finish_reason or None,
             "promptTokens": response.prompt_tokens, "completionTokens": response.completion_tokens,
+            "reasoningTokens": response.reasoning_tokens, "reasoningSeconds": response.reasoning_seconds,
+            "reasoningStage": "done" if response.reasoning_tokens is not None else None,
+            "forced": response.forced or None, "runaway": response.runaway or None,
         }

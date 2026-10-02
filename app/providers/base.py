@@ -5,6 +5,9 @@
     disable_thinking  : 이 호출만 추론을 끈다(Step 6-0). provider를 만들 때 이미 껐다면 그대로 꺼져 있다.
                         추론을 끄는 방법이 있는 로컬(OpenAI 호환) provider만 따르고 나머지는 무시한다
     max_tokens        : 이 호출의 출력 토큰 상한(추론 토큰 포함). None이면 보내지 않는다. 역시 로컬 provider만 따른다
+    reasoning_budget  : 이 호출의 추론 토큰 예산(Step 6). 추론을 켠 로컬 호출만 스트리밍으로 받으며 센다 — 넘거나 반복이
+                        보이면 추론을 끊고 답만 이어 쓰게 한 뒤(소프트), 그래도 안 되면 finish_reason="reasoning_runaway"(하드)
+    on_reasoning      : 추론 진행(토큰 수·초)과 소프트/하드 조치를 알리는 콜백(`reasoning.ReasoningProgress`)
 
 내부 메시지 형식(모든 provider가 공유):
     {"role": "system",    "content": str}
@@ -23,8 +26,11 @@ from typing import Any
 
 from ..pipeline.evidence import clip
 from ..pipeline.images import ModelImage
+from .reasoning import OnReasoning
 
 Message = dict[str, Any]
+# 추론이 끝나지 않아(예산 초과·반복) 소프트 조치로도 답을 받지 못한 호출의 finish_reason(Step 6).
+REASONING_RUNAWAY = "reasoning_runaway"
 
 
 @dataclass
@@ -53,6 +59,11 @@ class ModelResponse:
     # 서버가 알려 준 토큰 수(없으면 None). 출력 토큰에는 추론 토큰이 포함된다.
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # 추론 제어(Step 6): 추론을 켠 로컬 호출을 스트리밍으로 받았을 때만 채워진다.
+    reasoning_tokens: int | None = None     # 추론 토큰 수(스트림 조각 수 기준, 근사)
+    reasoning_seconds: float | None = None  # 호출 시작부터 추론이 끝나기(또는 끊기)까지
+    forced: str = ""                        # 추론을 끊고 답으로 넘겼으면 그 사유: "budget" | "repeat"
+    runaway: str = ""                       # 하드 중단 사유(finish_reason == REASONING_RUNAWAY): "budget" | "repeat" | "empty" | "rejected"
 
 
 class ProviderError(Exception):
@@ -85,6 +96,11 @@ def looks_like_tools_unsupported(status: int | None, message: str) -> bool:
 
 def is_output_length_stop(reason: str) -> bool:
     return str(reason or "").lower() in {"length", "max_tokens", "max_output_tokens"}
+
+
+def is_reasoning_runaway(reason: str) -> bool:
+    """추론이 끝나지 않아 하드 중단한 호출인가(Step 6). 다시 보내지 않고 실패로 다룬다."""
+    return str(reason or "") == REASONING_RUNAWAY
 
 
 def last_user_index(messages: list[Message]) -> int:
@@ -151,7 +167,8 @@ class Provider(ABC):
     @abstractmethod
     async def analyze(self, messages: list[Message], images: list[ModelImage] | None = None,
                       tools: list[ToolSpec] | None = None, *, temperature: float = 0.2,
-                      disable_thinking: bool = False, max_tokens: int | None = None) -> ModelResponse:
+                      disable_thinking: bool = False, max_tokens: int | None = None,
+                      reasoning_budget: int | None = None, on_reasoning: OnReasoning | None = None) -> ModelResponse:
         ...
 
     @abstractmethod

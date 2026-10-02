@@ -37,6 +37,12 @@ def approx(box, **expected):
     return all(box[key] == pytest.approx(value, abs=1e-6) for key, value in expected.items())
 
 
+# 추론 제어(Step 6)의 소프트·하드 조치가 한 번도 없었을 때의 카운터(답변 메타데이터 `vision`의 나머지 항목).
+NO_REASONING_ACTIONS = {"answerReasoningForced": 0, "groundingReasoningForced": 0, "ocrReasoningForced": 0,
+                        "answerReasoningStops": 0, "groundingReasoningStops": 0, "ocrReasoningStops": 0,
+                        "reasoningTokens": 0}
+
+
 class SeeingProvider(Provider):
     """받은 이미지를 보고 답하는 가짜 모델. 타일 호출은 동시에 나가므로 순서가 아니라 내용으로 답을 정한다."""
     name = "seeing"
@@ -46,9 +52,9 @@ class SeeingProvider(Provider):
         self.reply, self.calls = reply, []
 
     async def analyze(self, messages, images=None, tools=None, *, temperature=0.2, disable_thinking=False,
-                      max_tokens=None):
+                      max_tokens=None, reasoning_budget=None, on_reasoning=None):
         call = {"messages": messages, "images": images, "tools": tools, "temperature": temperature,
-                "disable_thinking": disable_thinking, "max_tokens": max_tokens}
+                "disable_thinking": disable_thinking, "max_tokens": max_tokens, "reasoning_budget": reasoning_budget}
         self.calls.append(call)
         reply = self.reply(call)
         if isinstance(reply, Exception):
@@ -798,7 +804,8 @@ def test_tile_mode_is_chosen_per_request_and_recorded_on_the_answer(client, mock
 
     assert data["meta"]["imageMode"] == "tile" and data["meta"]["tiling"]["tileSize"] == 1536
     assert data["meta"]["vision"] == {"ocrCalls": 3, "groundingCalls": 0, "answerCalls": 1, "tiledImages": 1,
-                                      "tiles": 3, "blankTiles": 3, "ocrLengthStops": 0, "groundingLengthStops": 0}
+                                      "tiles": 3, "blankTiles": 3, "ocrLengthStops": 0, "groundingLengthStops": 0,
+                                      **NO_REASONING_ACTIONS}
     assert data["meta"]["elapsedMs"] >= 0
     saved = client.get(f"/api/sessions/{data['conversationId']}").json()["messages"]
     assert saved[0]["meta"] == {} and saved[1]["meta"] == data["meta"]      # 답변과 함께 저장된다
@@ -813,7 +820,8 @@ def test_whole_mode_is_the_default_and_behaves_as_before(client, mock_llm):
     assert "TILED TRANSCRIPTION" not in all_text(mock_llm.requests[-1])
     assert data["meta"]["imageMode"] == "whole" and "tiling" not in data["meta"]
     assert data["meta"]["vision"] == {"ocrCalls": 1, "groundingCalls": 0, "answerCalls": 1, "tiledImages": 0,
-                                      "tiles": 0, "blankTiles": 0, "ocrLengthStops": 0, "groundingLengthStops": 0}
+                                      "tiles": 0, "blankTiles": 0, "ocrLengthStops": 0, "groundingLengthStops": 0,
+                                      **NO_REASONING_ACTIONS}
 
 
 def test_default_mode_comes_from_config_and_unknown_modes_are_rejected(client, mock_llm, monkeypatch):
@@ -879,7 +887,8 @@ def test_bbox_in_tile_mode_is_measured_on_the_stored_original(client, mock_llm, 
     assert found["x"] == pytest.approx(0.75, abs=0.002) and found["y"] == pytest.approx(0.75, abs=0.002)
     assert found["w"] == pytest.approx(0.05, abs=0.002) and found["h"] == pytest.approx(0.10, abs=0.002)
     assert data["meta"]["vision"] == {"ocrCalls": 0, "groundingCalls": 1, "answerCalls": 2, "tiledImages": 1,
-                                      "tiles": 1, "blankTiles": 5, "ocrLengthStops": 0, "groundingLengthStops": 0}
+                                      "tiles": 1, "blankTiles": 5, "ocrLengthStops": 0, "groundingLengthStops": 0,
+                                      **NO_REASONING_ACTIONS}
     # 뷰어가 보여 주는 이미지는 사본이고 박스는 분수 좌표라 그대로 맞는다.
     with Image.open(io.BytesIO(client.get(f"/api/attachments/{artifact['attachmentId']}/content").content)) as shown:
         assert shown.size == (3072, 1536)
