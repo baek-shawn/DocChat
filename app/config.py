@@ -200,13 +200,15 @@ def resolve_image_mode(requested: str | None) -> str:
     return value
 
 
-# --------------------------------------------------------------------------- 답변(추론) 호출의 이미지 (Step 8)
+# --------------------------------------------------------------------------- 답변(추론) 호출의 이미지 (Step 8 · Step 10)
 # 답변 호출에 어떤 이미지를 싣는가. 위의 이미지 처리 방식(전사·bbox 호출의 전체/타일)과는 별개의 축이다.
 #   off     : 이미지 없음 — 텍스트(네이티브·전사)와 bbox 도구만
 #   uploads : 업로드 이미지는 전체 한 장, PDF 쪽은 싣지 않는다 — 계획서 §5.3·§5.4의 동작(Step 8 이전과 같다)
 #   whole   : 업로드 이미지와 PDF의 모든 쪽(네이티브 쪽 포함)을 전체 한 장씩. MAX_MODEL_IMAGES 안에서 쪽 순서로
+#   auto    : uploads와 같이 시작하고, PDF 쪽은 답변 모델이 보기 도구(`view_page`)로 필요할 때 한 쪽씩 요청한다(Step 10).
+#             요청한 쪽은 그 턴 안에서 쌓여 다음 호출부터 모두 실린다. 상한은 MAX_VIEWED_PAGES(MAX_MODEL_IMAGES와 별개)
 # 요청마다 고를 수 있고(`answerImageMode`), 요청에 없으면 아래 기본값을 쓴다. 답변 호출은 캐시하지 않으므로 캐시 키는 없다.
-ANSWER_IMAGE_MODES = ("off", "uploads", "whole")
+ANSWER_IMAGE_MODES = ("off", "uploads", "whole", "auto")
 _configured_answer_mode = str(os.environ.get("DOCCHAT_ANSWER_IMAGE_MODE") or "").strip().lower()
 DEFAULT_ANSWER_IMAGE_MODE = _configured_answer_mode if _configured_answer_mode in ANSWER_IMAGE_MODES else "uploads"
 
@@ -219,6 +221,37 @@ def resolve_answer_image_mode(requested: str | None) -> str:
     if value not in ANSWER_IMAGE_MODES:
         raise ValueError(value)
     return value
+
+
+def answer_mode_offers_view_tool(mode: str) -> bool:
+    """이 답변 이미지 모드에서 보기 도구(`view_page`)를 모델에게 내놓는가(Step 10). 자동 모드뿐이다 —
+    끔 / 업로드만 / 전체는 실험 ①의 비교 기준이라 Step 8의 동작 그대로 둔다."""
+    return mode == "auto"
+
+
+# 보기 도구(Step 10)로 한 턴에 모을 수 있는 쪽 수 상한. 모은 쪽은 그 뒤의 답변 호출마다 다시 실리므로 비용은 장 수 × 호출 수다.
+# Step 8 "전체" 모드의 MAX_MODEL_IMAGES와는 따로 둔다(그건 처음부터 싣는 수, 이건 모델이 요청해 쌓는 수).
+MAX_VIEWED_PAGES = _int("DOCCHAT_MAX_VIEWED_PAGES", 12, low=1, high=200)
+
+# "그림이 있는 쪽" 판정(Step 10, 매니페스트의 판단 재료). 래스터 **개수**가 아니라 쪽에서 차지하는 **면적 비율**로 본다 —
+# 머리글 로고는 0.1~0.2%, 본문 그림은 3% 이상이었다(2026-10-06, 53쪽 교재 PDF 실측). 벡터는 경로 페인팅 연산 수로 본다 —
+# 글 쪽의 표 테두리·밑줄은 1~44개, 벡터 데이터시트 66개, CAD 도면은 수천 개. 글자 없이 벡터만 있는 쪽(`vector-outlines`)은
+# 연산 수와 무관하게 그림이다.
+DRAWING_MIN_RASTER_AREA = _float("DOCCHAT_DRAWING_MIN_RASTER_AREA", 0.02, low=0.0, high=1.0)
+DRAWING_MIN_VECTOR_OPERATIONS = _int("DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS", 100, low=1)
+
+
+def is_drawing_page(*, raster_area: float, vector_operations: int, classification: str = "") -> bool:
+    """쪽에 그림(래스터 그림 또는 벡터 도면)이 있다고 볼 것인가. 전사 대상 여부와는 별개다."""
+    if classification in ("vector-outlines", "scanned-raster"):
+        return True
+    return float(raster_area or 0.0) >= DRAWING_MIN_RASTER_AREA or int(vector_operations or 0) >= DRAWING_MIN_VECTOR_OPERATIONS
+
+
+def view_settings() -> dict[str, float | int]:
+    """보기 도구(Step 10)의 설정 — /api/health와 트레이스 입력이 같은 값을 본다."""
+    return {"maxViewedPages": MAX_VIEWED_PAGES, "drawingMinRasterArea": DRAWING_MIN_RASTER_AREA,
+            "drawingMinVectorOperations": DRAWING_MIN_VECTOR_OPERATIONS}
 
 
 def tile_settings() -> dict[str, float | int]:

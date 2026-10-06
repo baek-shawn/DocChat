@@ -10,12 +10,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
+from .. import config
 from ..attachments import Attachment
 
 CHILD_SEPARATOR = " · "
 VISUAL_OCR_SUFFIX = "visual OCR"
 _CHILD_PATTERN = re.compile(r" · (?:page \d+|visual OCR)", re.IGNORECASE)
 _VISUAL_SOURCE_LINE = re.compile(r"^\[VISUAL SOURCE: .+\]$", re.MULTILINE)
+# 쪽별 판별 값이 메타데이터에 없는 옛 PDF 첨부(Step 10 이전에 올린 것)는 본문의 [PAGE ANALYSIS] 줄에서 읽는다.
+_PAGE_ANALYSIS_LINE = re.compile(
+    r"^Page (?P<page>\d+): (?P<classification>[\w-]+); native characters=(?P<chars>\d+); raster images=(?P<raster>\d+); "
+    r"vector operations=(?P<vector>\d+); vision OCR=(?P<vlm>required|skipped)$", re.MULTILINE)
 
 
 def attachment_root_name(name: str) -> str:
@@ -42,14 +47,74 @@ def merge_attachment_sets(previous: list[Attachment], incoming: list[Attachment]
     return kept + incoming, removed
 
 
-def attachment_manifest(attachments: list[Attachment]) -> str:
-    """시스템 프롬프트에 넣는 한 줄 요약. 모델이 정확한 첨부 이름을 알 수 있게 한다."""
+def page_analysis_of(pdf: Attachment) -> list[dict]:
+    """PDF 첨부의 쪽별 판별 값. 메타데이터(`page_analysis`)가 있으면 그것, 없으면(옛 첨부) 본문의 [PAGE ANALYSIS] 줄.
+
+    옛 첨부에는 래스터 면적이 없어 래스터 개수로 대신한다(로고만 있는 쪽도 그림으로 보일 수 있다 — 다시 올리면 정확해진다).
+    """
+    if pdf.page_analysis:
+        return [item for item in pdf.page_analysis if isinstance(item.get("page"), int)]
+    pages = []
+    for match in _PAGE_ANALYSIS_LINE.finditer(pdf.text or ""):
+        raster = int(match["raster"])
+        pages.append({"page": int(match["page"]), "classification": match["classification"], "chars": int(match["chars"]),
+                      "raster": raster, "rasterArea": 1.0 if raster else 0.0, "vector": int(match["vector"]),
+                      "vlm": match["vlm"] == "required"})
+    return pages
+
+
+def drawing_pages(pdf: Attachment) -> list[dict]:
+    """그림(래스터 그림·벡터 도면)이 있다고 판정한 쪽들(Step 10). 판정 기준은 `config.is_drawing_page`."""
+    return [page for page in page_analysis_of(pdf)
+            if config.is_drawing_page(raster_area=float(page.get("rasterArea") or 0.0),
+                                      vector_operations=int(page.get("vector") or 0),
+                                      classification=str(page.get("classification") or ""))]
+
+
+def page_ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 5, 7, 8] → "1-3, 5, 7-8" (긴 PDF의 쪽 목록을 짧게)."""
+    ordered = sorted(set(numbers))
+    spans: list[list[int]] = []
+    for number in ordered:
+        if spans and number == spans[-1][1] + 1:
+            spans[-1][1] = number
+        else:
+            spans.append([number, number])
+    return ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in spans)
+
+
+def drawing_cue(pdf: Attachment) -> str:
+    """매니페스트에 덧붙이는 판단 재료(Step 10): 어느 쪽에 그림이 있고 그 쪽의 글이 무엇을 담는지.
+
+    모델이 "글로 충분한가"를 추측하지 않게 한다 — 전사한 쪽의 글은 보이는 라벨을 옮겨 적은 것일 뿐이고, 네이티브 글이 있는
+    쪽도 그림 자체(형상·배치·개수·어느 대상의 치수인지)는 글에 없다. 그림이 없으면 빈 문자열.
+    """
+    pages = drawing_pages(pdf)
+    if not pages:
+        return ""
+    transcribed = [page["page"] for page in pages if page.get("vlm")]
+    native = [page["page"] for page in pages if not page.get("vlm")]
+    parts = []
+    if transcribed:
+        parts.append(f"{page_ranges(transcribed)} (text = transcription of the visible labels only)")
+    if native:
+        parts.append(f"{page_ranges(native)} (native text beside the drawing)")
+    return (f"drawings on pages {'; '.join(parts)} - the shapes, their positions and counts, and which label or "
+            "dimension belongs to which feature are NOT in the text; call view_page to see such a page")
+
+
+def attachment_manifest(attachments: list[Attachment], *, drawing_cues: bool = False) -> str:
+    """시스템 프롬프트에 넣는 한 줄 요약. 모델이 정확한 첨부 이름을 알 수 있게 한다.
+
+    drawing_cues: 보기 도구를 내놓는 턴(답변 이미지 모드 자동, Step 10)에만 True — PDF마다 그림이 있는 쪽을 덧붙인다.
+    다른 모드의 매니페스트는 Step 8까지와 같다(실험 ①의 비교 기준).
+    """
     if not attachments:
         return "none"
-    groups: dict[str, dict[str, int]] = {}
+    groups: dict[str, dict] = {}
     for item in attachments:
         group = groups.setdefault(attachment_root_name(item.name), {
-            "parts": 0, "images": 0, "text": 0, "visual_ocr": 0, "pending": 0, "pages": 0,
+            "parts": 0, "images": 0, "text": 0, "visual_ocr": 0, "pending": 0, "pages": 0, "cue": "",
         })
         group["parts"] += 1
         if item.is_image:
@@ -61,12 +126,15 @@ def attachment_manifest(attachments: list[Attachment]) -> str:
             group["pending"] += 1
         if item.kind == "pdf":
             group["pages"] = item.total_pages
+            if drawing_cues:
+                group["cue"] = drawing_cue(item)
     lines = []
     for name, group in groups.items():
         pages = f", pages={group['pages']}" if group["pages"] else ""
+        cue = f"; {group['cue']}" if group["cue"] else ""
         lines.append(
             f'"{name}": parts={group["parts"]}{pages}, images={group["images"]}, parsedText={group["text"]} chars, '
-            f'visualOcr={group["visual_ocr"]} chars, pendingVision={group["pending"]}'
+            f'visualOcr={group["visual_ocr"]} chars, pendingVision={group["pending"]}{cue}'
         )
     return "; ".join(lines)
 
@@ -116,7 +184,8 @@ def is_pending_page_image(item: Attachment) -> bool:
 def _answer_image_groups(candidates: list[Attachment], answer_images: str) -> dict[str, list[Attachment]]:
     """답변 이미지 모드(Step 8)에 따라 실을 수 있는 이미지를 업로드 묶음별로 모은다.
 
-    off: 없음 · uploads: 업로드 이미지만(§5.4) · whole: 업로드 이미지 + PDF의 모든 쪽(렌더하지 않은 쪽은 자리표시).
+    off: 없음 · uploads: 업로드 이미지만(§5.4) · whole: 업로드 이미지 + PDF의 모든 쪽(렌더하지 않은 쪽은 자리표시)
+    · auto(Step 10): 처음에는 uploads와 같다 — PDF 쪽은 답변 모델이 보기 도구로 요청할 때 루프가 더한다.
     """
     groups: dict[str, list[Attachment]] = {}
     if answer_images == "off":

@@ -254,6 +254,14 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
                 **{name: int(number) for name, number in counts.items()},
                 "names": [str(item)[:300] for item in names[:200] if isinstance(item, str)] if isinstance(names, list) else [],
             }
+    # 보기 도구(Step 10, 답변 이미지 모드 자동)로 모델이 본 쪽: 이름, 상한, 상한에 걸려 붙이지 못한 요청 수
+    viewed = value.get("viewedPages")
+    if isinstance(viewed, dict):
+        counts = {name: _bounded_number(viewed.get(name), 100_000) for name in ("limit", "refused")}
+        names = viewed.get("names")
+        if all(number is not None for number in counts.values()) and isinstance(names, list):
+            meta["viewedPages"] = {"names": [str(item)[:300] for item in names[:200] if isinstance(item, str)],
+                                   **{name: int(number) for name, number in counts.items()}}
     # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
     if valid_id(value.get("traceId")):
         meta["traceId"] = value["traceId"]

@@ -9,8 +9,8 @@
   const PROVIDER_LABELS = { openaiCompatible: '로컬 API', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini' };
   const TYPE_LABELS = { text: '텍스트', object: '객체', table: '표', dimension: '치수', stamp: '도장', signature: '서명', diagram: '다이어그램', other: '기타' };
   const IMAGE_MODE_LABELS = { whole: '전체', tile: '타일' };
-  // 답변(추론) 호출에 싣는 이미지(Step 8) — app/config.py의 ANSWER_IMAGE_MODES와 짝이다.
-  const ANSWER_IMAGE_LABELS = { off: '끔', uploads: '업로드 이미지만', whole: '전체' };
+  // 답변(추론) 호출에 싣는 이미지(Step 8 · Step 10) — app/config.py의 ANSWER_IMAGE_MODES와 짝이다.
+  const ANSWER_IMAGE_LABELS = { off: '끔', uploads: '업로드 이미지만', whole: '전체', auto: '자동' };
   // 턴 트레이스(Step 7)의 이벤트 종류·상태 — app/trace.py의 KINDS·STATUSES와 짝이다.
   const TRACE_KINDS = { input: '입력', preprocess: '전처리', ocr: '전사', evidence: '증거', model: '모델', tool: '도구', loop: '루프', cleanup: '정리', progress: '진행', files: '파일', answer: '답변' };
   const TRACE_STATUS = { running: '진행 중', done: '완료', failed: '실패', cancelled: '취소', interrupted: '중단됨' };
@@ -48,6 +48,7 @@
     answerImageMode: store.get('answerImageMode', ''),   // '' = 고른 적 없음 → 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE)
     serverAnswerImageMode: 'uploads',
     maxModelImages: 12,                      // 답변 호출 한 번에 싣는 이미지 수 상한(/api/health)
+    maxViewedPages: 12,                      // 자동 모드에서 보기 도구로 한 턴에 모을 수 있는 쪽 수(/api/health, Step 10)
     // 호출 종류별 추론 끄기. 'true' | 'false' | ''(고른 적 없음 → 서버 기본값)
     disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
@@ -251,6 +252,7 @@
       state.tiling = health.tiling || null;
       if (ANSWER_IMAGE_LABELS[health.answerImageMode]) state.serverAnswerImageMode = health.answerImageMode;
       if (Number(health.maxModelImages) > 0) state.maxModelImages = Number(health.maxModelImages);
+      if (Number(health.view?.maxViewedPages) > 0) state.maxViewedPages = Number(health.view.maxViewedPages);
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
       state.serverReasoning = health.reasoning || null;
       if (health.reasoningEffort) state.serverReasoningEffort = { ...state.serverReasoningEffort, ...health.reasoningEffort };
@@ -339,7 +341,9 @@
     els.answerImageMode.value = answerImageMode();
     els.answerImageHelp.textContent = '답변(추론) 호출에 어떤 이미지를 실을지입니다. "끔"은 텍스트(네이티브·전사)와 위치 확인 도구만 씁니다. "업로드 이미지만"은 지금까지의 동작입니다(PDF 쪽은 텍스트만). '
       + '"전체"는 PDF의 모든 쪽(글자가 충분한 쪽도)을 한 장씩 실어 그림에만 있는 것(형상·심볼·배치)을 볼 수 있게 하지만, 도구 루프의 호출마다 이미지 토큰이 들고 컨텍스트가 작은 로컬 모델은 넘칠 수 있습니다. '
-      + `한 번에 최대 ${state.maxModelImages}장(.env의 DOCCHAT_MAX_MODEL_IMAGES), 넘치면 쪽 순서로 앞에서부터. 요청마다 적용되므로 같은 질문을 방식별로 비교할 수 있습니다.`;
+      + `한 번에 최대 ${state.maxModelImages}장(.env의 DOCCHAT_MAX_MODEL_IMAGES), 넘치면 쪽 순서로 앞에서부터. `
+      + `"자동"은 업로드 이미지만 싣고 시작하되, 모델이 답하려면 그림을 봐야 한다고 판단한 쪽을 보기 도구로 한 장씩 요청해 그 턴 안에서 모아 봅니다(최대 ${state.maxViewedPages}장, .env의 DOCCHAT_MAX_VIEWED_PAGES). `
+      + '위치 확인(bbox) 도구는 어느 방식이든 "표시해줘·시각화해줘"처럼 보여 달라고 할 때만 씁니다. 요청마다 적용되므로 같은 질문을 방식별로 비교할 수 있습니다.';
     els.traceHelp.textContent = state.serverDebugTrace
       ? '턴 과정 기록(개발용)이 켜져 있습니다. 답변마다 "과정 보기"로 전처리·전사·모델 호출·도구 실행을 시간순으로 볼 수 있습니다(.env의 DOCCHAT_DEBUG_TRACE).'
       : '턴 과정 기록(개발용)은 꺼져 있습니다. 켜려면 .env에 DOCCHAT_DEBUG_TRACE=1을 적고 서버를 다시 띄우세요.';
@@ -443,8 +447,9 @@
           item.status = report.visualPages > 0 ? `${pages} · ${report.visualPages}쪽은 비전 전사 필요` : `${pages} · 네이티브 텍스트 ${report.parsedCharacters.toLocaleString()}자`;
           item.tone = report.visualPages > 0 ? 'warn' : '';
           if (report.truncated) item.status += ` (앞 ${report.processedPages}쪽만 검사)`;
-          // 답변 호출 이미지 "전체"(Step 8)면 글자가 충분한 쪽도 이미지로 실린다.
+          // 답변 호출 이미지 "전체"(Step 8)면 글자가 충분한 쪽도 이미지로 실린다. "자동"(Step 10)은 모델이 필요할 때 요청한다.
           if (answerImageMode() === 'whole') item.status += ` · 답변 호출에 쪽 이미지 포함(최대 ${state.maxModelImages}장)`;
+          if (answerImageMode() === 'auto') item.status += ` · 쪽 그림은 모델이 필요할 때 요청(한 턴에 최대 ${state.maxViewedPages}장)`;
         } else {
           item.status = report.resized ? `${report.sourceWidth}×${report.sourceHeight} → ${report.width}×${report.height}로 축소해 전달` : `${report.width}×${report.height} 원본 그대로 전달`;
           if (answerImageMode() === 'off') item.status += ' · 답변 호출에는 싣지 않음(끔)';
@@ -642,21 +647,32 @@
     return text;
   }
 
+  // 보기 도구(Step 10, 자동 모드)로 모델이 본 쪽: "그림 확인: spec.pdf 2쪽, 3쪽" + 상한에 걸린 요청 수. 안 봤으면 "그림 확인 없음".
+  const pageLabel = (name) => { const match = /^(.*) · page (\d+)$/.exec(String(name || '')); return match ? `${match[1]} ${match[2]}쪽` : String(name || ''); };
+  function describeViewedPages(info) {
+    const names = info.names || [];
+    let text = names.length ? `그림 확인: ${names.length <= 6 ? names.map(pageLabel).join(', ') : `${names.length}장 (${names.slice(0, 3).map(pageLabel).join(', ')} …)`}` : '그림 확인 없음';
+    if (info.refused) text += ` · 상한 ${info.limit}장에 걸려 ${info.refused}번 보지 못함`;
+    return text;
+  }
+
   // 이 답을 어떤 방식으로 만들었는지. 비전 호출도 답변 호출 이미지도 없었던 기본 설정의 답변(일반 대화)에는 표시하지 않는다.
   function describeProcessing(meta) {
     if (!meta || !IMAGE_MODE_LABELS[meta.imageMode]) return '';
     const vision = meta.vision || {};
     const calls = (vision.ocrCalls || 0) + (vision.groundingCalls || 0);
     const answerImages = meta.answerImages || null;
-    // 기본이 아닌 모드(끔·전체)를 골랐으면 이미지가 없어도 적는다 — 방식을 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 보이게.
+    // 기본이 아닌 모드(끔·전체·자동)를 골랐으면 이미지가 없어도 적는다 — 방식을 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 보이게.
     const showAnswerImages = !!answerImages && (answerImages.sent > 0 || answerImages.candidates > 0 || (!!meta.answerImageMode && meta.answerImageMode !== 'uploads'));
+    const viewed = meta.viewedPages && Array.isArray(meta.viewedPages.names) ? meta.viewedPages : null;
     // 추론 제어(Step 6)의 조치가 있었으면 일반 대화 답변에도 적는다.
     const answerActions = (vision.answerReasoningForced || 0) + (vision.answerReasoningStops || 0);
     // 추론 수준(Step 6 2차): 호출 종류별로 실어 보낸 값. 답변 호출에 실었으면 일반 대화 답변에도 적는다(수준별 비교용).
     const effort = meta.reasoningEffort || {};
-    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !answerActions && !vision.reasoningTokens && !effort.answer) return '';
+    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !viewed && !answerActions && !vision.reasoningTokens && !effort.answer) return '';
     const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
     if (showAnswerImages) parts.push(describeAnswerImages(meta.answerImageMode, answerImages));
+    if (viewed) parts.push(describeViewedPages(viewed));
     if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
     // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다),
     // 추론을 끊고 답으로 넘기거나(소프트) 끝내 중단한(하드) 호출이 있었는지(Step 6)

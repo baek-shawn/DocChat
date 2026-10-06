@@ -54,6 +54,8 @@ class Attachment:
     source_mime: str | None = None
     # 이 쪽을 전사할 때 쓴 이미지 처리 방식(`config.image_mode_variant`). 요청 모드가 달라지면 다시 전사한다.
     ocr_variant: str | None = None
+    # PDF 원본에만: 쪽별 판별 값(`PageAnalysis.to_public()` 목록, Step 10). 매니페스트가 "그림이 있는 쪽"을 알려 주는 재료다.
+    page_analysis: list[dict[str, Any]] | None = None
 
     @property
     def is_image(self) -> bool:
@@ -78,6 +80,7 @@ class Attachment:
             "totalPages": self.total_pages or None,
             "sourceMime": self.source_mime,
             "ocrVariant": self.ocr_variant,
+            "pageAnalysis": self.page_analysis or None,
         }
         return {key: value for key, value in pairs.items() if value is not None}
 
@@ -94,6 +97,8 @@ class Attachment:
         self.total_pages = int(meta.get("totalPages") or 0)
         self.source_mime = meta.get("sourceMime")
         self.ocr_variant = meta.get("ocrVariant")
+        pages = meta.get("pageAnalysis")
+        self.page_analysis = [item for item in pages if isinstance(item, dict)] if isinstance(pages, list) else None
         return self
 
     def to_public(self) -> dict[str, Any]:

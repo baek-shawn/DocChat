@@ -46,6 +46,19 @@ class PageAnalysis:
     vector_operations: int
     needs_vlm: bool
     native_text: str = ""
+    # 쪽에 박힌 래스터 이미지가 쪽 넓이에서 차지하는 비율(0~1, 겹치면 1을 넘지 않게 자른다). 그림이 있는 쪽인지를
+    # 개수가 아니라 이 값으로 본다(Step 10 — 머리글 로고는 0.1~0.2%, 본문 그림은 3% 이상).
+    raster_area: float = 0.0
+
+    def is_drawing(self) -> bool:
+        return config.is_drawing_page(raster_area=self.raster_area, vector_operations=self.vector_operations,
+                                      classification=self.classification)
+
+    def to_public(self) -> dict[str, Any]:
+        """첨부 메타데이터에 남기는 쪽별 판별 값(Step 10의 매니페스트 판단 재료). 글은 넣지 않는다."""
+        return {"page": self.page_number, "classification": self.classification, "chars": self.native_characters,
+                "raster": self.raster_images, "rasterArea": round(float(self.raster_area), 4),
+                "vector": self.vector_operations, "vlm": bool(self.needs_vlm)}
 
 
 @dataclass
@@ -145,17 +158,33 @@ def _count_vector_operations(document: pymupdf.Document, page: pymupdf.Page) -> 
     return total
 
 
+def raster_area_ratio(page: pymupdf.Page, infos: list[dict[str, Any]]) -> float:
+    """박힌 래스터 이미지들이 쪽 위에서 차지하는 넓이의 합 ÷ 쪽 넓이(1을 넘지 않게). transform의 열 벡터 길이가 놓인 크기다."""
+    page_area = abs(page.rect.width * page.rect.height) or 1.0
+    covered = 0.0
+    for info in infos:
+        try:
+            a, b, c, d = (float(value) for value in info["transform"][:4])
+        except (KeyError, TypeError, ValueError):
+            continue
+        covered += math.hypot(a, b) * math.hypot(c, d)
+    return max(0.0, min(1.0, covered / page_area))
+
+
 def inspect_page(document: pymupdf.Document, page: pymupdf.Page, page_number: int) -> PageAnalysis:
     native_text = _normalize_native_text(page.get_text("text", sort=True) or "")
     native_characters = count_alnum(native_text)
     try:
-        raster_images = len(page.get_image_info())
+        infos = page.get_image_info()
+        raster_images = len(infos)
+        raster_area = raster_area_ratio(page, infos)
     except Exception:
         raster_images = len(page.get_images(full=True))
+        raster_area = 1.0 if raster_images else 0.0      # 놓인 크기를 모르면 "있다"는 쪽으로 — 로고보다 그림을 놓치는 편이 나쁘다
     vector_operations = _count_vector_operations(document, page)
     classification, needs_vlm = classify_page(native_characters, raster_images, vector_operations)
     return PageAnalysis(page_number, classification, native_characters, raster_images,
-                        vector_operations, needs_vlm, native_text)
+                        vector_operations, needs_vlm, native_text, raster_area=raster_area)
 
 
 # --------------------------------------------------------------------------- 렌더링
