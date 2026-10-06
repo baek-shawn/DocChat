@@ -114,13 +114,12 @@ def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", v
         # Step 10: bbox 도구는 "보여 달라"는 요청에만. 그림을 읽는 용도(표·치수·도장·다이어그램 확인)는 문구에서 뺐다 —
         # 그 용도는 보기 도구가 맡는다(자동 모드). 프롬프트 변경이라 통제 비교가 필요하다(STEPS.md Step 10 실험 ②).
         parts.append(
-            "TOOLS. Call inspect_visual only when the request needs to confirm WHERE something appears: marking or "
-            "highlighting a location, detecting objects, or checking tables, dimensions, stamps, signatures or diagrams "
-            "visually. It accepts an uploaded image or any page of an uploaded PDF, measures the regions itself and "
-            "opens the result in the viewer. You cannot display, mark or highlight anything on an image yourself - only "
-            "inspect_visual can - so when the user asks to show, mark, highlight, point out or locate something on an "
-            "image or page, you must call it before answering. Never estimate or invent coordinates yourself, and do "
-            "not call it for questions that the parsed text already answers."
+            "TOOLS. inspect_visual measures bounding boxes on an uploaded image or on one page of an uploaded PDF and "
+            "shows them in the viewer. Call it only when the user asks you to show, mark, highlight, box, point out, "
+            "draw or visualize where something is on the image or page. You cannot display, mark or highlight anything "
+            "yourself - only inspect_visual can - so for such a request you must call it before answering, and never "
+            "estimate or invent coordinates. It only measures boxes: do not call it to read, inspect or analyze a "
+            "drawing, and do not call it for questions that the parsed text already answers."
         )
         if view_tool:
             parts.append(

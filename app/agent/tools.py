@@ -35,12 +35,13 @@ class ToolError(Exception):
     """모델에게 되돌려 줄 도구 오류(모델이 인자를 고쳐 다시 부를 수 있게 한다)."""
 
 
+# Step 10: 설명을 "보여 달라는 요청"으로 좁혔다(표·치수·도장·다이어그램 확인 용도는 뺐다 — 그 용도는 view_page).
 INSPECT_VISUAL = ToolSpec(
     name="inspect_visual",
     description=(
-        "Inspect an uploaded image, or one page of an uploaded PDF, and measure where things are. Use it to mark a "
-        "location, detect objects, or verify tables, dimensions, stamps, signatures or diagrams. The tool measures the "
-        "bounding boxes itself and shows them in the viewer; never estimate boxes yourself."
+        "Measure bounding boxes on an uploaded image, or on one page of an uploaded PDF, and show them in the viewer. "
+        "Use it only when the user asks to show, mark, highlight, box or visualize where something is. It does not "
+        "describe or analyze the picture; never estimate boxes yourself."
     ),
     parameters={
         "type": "object",
