@@ -22,12 +22,14 @@ from ..providers.base import (Message, ModelResponse, Provider, ReasoningEffortE
                               ToolsUnsupportedError, is_output_length_stop, is_reasoning_runaway, last_user_index)
 from ..providers.reasoning import describe_reasoning_progress
 from .prompts import (AFTER_TOOL_RESULT, CONTINUE_ANSWER, FORCE_FINAL_ANSWER, RESEND_VALID_TOOL_JSON,
-                      json_tool_protocol, json_tool_reminder)
+                      attached_images_note, json_tool_protocol, json_tool_reminder)
 
 _MAX_MALFORMED_ENVELOPES = 2
 
 ExecuteTool = Callable[[ToolCall], Awaitable[str]]
 Progress = Callable[[str], None]
+# 보기 도구(Step 10)로 이 턴에 모은 쪽 이미지를 돌려주는 함수. 호출마다 다시 묻는다(도구 실행 뒤 늘어 있을 수 있다).
+ViewedImages = Callable[[], list[ModelImage]]
 
 # 추론 제어(Step 6)로 답을 받지 못했을 때 사용자에게 보이는 안내문. 추론 글은 답으로 내보내지 않는다.
 REASONING_RUNAWAY_NOTICE = ("모델의 추론이 끝나지 않아(같은 내용을 반복하거나 추론 예산을 넘어) 답변을 받지 못했습니다. "
@@ -226,10 +228,14 @@ async def run_tool_loop(
     language_hint: str = "",
     on_live: Progress | None = None,
     reasoning_effort: str = "",
+    viewed_images: ViewedImages | None = None,
 ) -> LoopResult:
     """language_hint: "최종 답변을 한국어로" 같은 한 줄. 메시지에 미리 박지 않고 루프가 상황을 보고 붙인다.
     on_live: 생성 중의 추론 진행("추론 중… n토큰")처럼 같은 줄을 갱신해 보여 줄 문구(Step 6).
     reasoning_effort: 답변 호출에 실을 추론 수준(Step 6 2차). 비어 있으면 보내지 않는다.
+    viewed_images: 보기 도구(Step 10)로 모은 쪽 이미지. 호출마다 다시 물어 `images` 뒤에 붙여 보낸다 — 모은 쪽은 그 뒤의
+        모든 호출(도구 결과 뒤, 강제 종료, 이어 쓰기)에 실리고, 원래 질문 끝에 "몇 번째 이미지가 어느 쪽인지" 한 줄이 붙는다.
+        provider마다 이미지를 붙이는 자리가 달라도(모두 원래 질문에 붙인다) `analyze()`는 바꾸지 않는다.
 
     gemma3 실측(각 6회): JSON 폴백에서 도구를 제공하는 호출의 user 턴에 언어 지시가 **어디에든** 있으면
     도구 호출이 0/6으로 죽고, 빼면 위치 질문 6/6 · 비위치 질문 오호출 0/6이었다. 그래서
@@ -260,10 +266,15 @@ async def run_tool_loop(
     # 추론을 켠 답변 호출의 추론 예산(Step 6). 넘거나 반복하면 provider가 추론을 끊고 답만 이어 쓰게 한다.
     watch = (lambda info: on_live(describe_reasoning_progress(info))) if on_live is not None else None
 
+    def viewed() -> list[ModelImage]:
+        return list(viewed_images()) if viewed_images is not None else []
+
     async def ask(request: list[Message], offered: list[ToolSpec] | None) -> ModelResponse:
         nonlocal model_calls, reasoning_forced
         model_calls += 1
-        reply = await provider.analyze(request, images, offered, temperature=temperature,
+        # 보기 도구로 모은 쪽(Step 10)은 처음부터 실린 이미지 뒤에 붙는다. 이미지는 provider가 원래 질문(닻)에 붙인다.
+        attached = [*(images or []), *viewed()] or None
+        reply = await provider.analyze(request, attached, offered, temperature=temperature,
                                        reasoning_budget=config.reasoning_budget("answer"), on_reasoning=watch,
                                        reasoning_effort=reasoning_effort or None)
         if reply.forced:
@@ -271,12 +282,21 @@ async def run_tool_loop(
         responses.append(reply)
         return reply
 
+    def current_base() -> list[Message]:
+        """원래 메시지의 사본. 보기 도구로 모은 쪽이 있으면 원래 질문(anchor) 끝에 "몇 번째 이미지가 어느 쪽인지"를 붙인다."""
+        copy = [dict(message) for message in base]
+        extra = viewed()
+        if extra and anchor >= 0:
+            names = [image.name for image in (images or [])] + [image.name for image in extra]
+            note = attached_images_note(names, [image.name for image in extra])
+            copy[anchor]["content"] = f"{copy[anchor].get('content') or ''}\n\n{note}"
+        return copy
+
     def hinted() -> list[Message]:
         """원래 질문(anchor) 끝에 언어 힌트를 붙인 사본."""
-        if not language_hint or anchor < 0:
-            return base
-        copy = [dict(message) for message in base]
-        copy[anchor]["content"] = f"{copy[anchor].get('content') or ''}\n\n{language_hint}"
+        copy = current_base()
+        if language_hint and anchor >= 0:
+            copy[anchor]["content"] = f"{copy[anchor].get('content') or ''}\n\n{language_hint}"
         return copy
 
     async def call_model(with_tools: bool) -> ModelResponse:
@@ -290,7 +310,7 @@ async def run_tool_loop(
                 trace.note("loop", "네이티브 도구 호출 거절 → JSON 방식으로 전환", error=str(error)[:500])
         if with_tools:
             # 도구가 이미 한 번 실행된 뒤라면(transcript 있음) 최종 답을 기대하는 상황이라 힌트는 결과 뒤에 붙어 있다.
-            return await ask(_with_protocol(base, tools) + transcript, None)
+            return await ask(_with_protocol(current_base(), tools) + transcript, None)
         return await ask(hinted() + _plain(transcript), None)
 
     response = ModelResponse()

@@ -111,6 +111,9 @@ def test_example_file_shows_the_real_defaults():
         "DOCCHAT_REASONING_REPEAT_LINES": config.REASONING_REPEAT_LINES,
         "DOCCHAT_REASONING_REPEAT_COUNT": config.REASONING_REPEAT_COUNT,
         "DOCCHAT_REASONING_REPEAT_MIN_CHARS": config.REASONING_REPEAT_MIN_CHARS,
+        "DOCCHAT_MAX_VIEWED_PAGES": config.MAX_VIEWED_PAGES,
+        "DOCCHAT_DRAWING_MIN_RASTER_AREA": config.DRAWING_MIN_RASTER_AREA,
+        "DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS": config.DRAWING_MIN_VECTOR_OPERATIONS,
     }
     assert {name: float(example[name]) for name in defaults} == {name: float(value) for name, value in defaults.items()}
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST

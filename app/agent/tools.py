@@ -1,6 +1,10 @@
 """온디맨드 도구.
 
 - inspect_visual     : bbox 전용 **별도 호출**. 이미지 한 장만 떼어 grounding 프롬프트로 다시 묻는다(§6).
+                       사용자가 보여 달라고 할 때만(Step 10의 역할 분담).
+- view_page          : 보기 도구(Step 10). 모델이 답을 내려면 그림을 봐야 할 때 쪽(또는 업로드 이미지) **한 장**을 골라
+                       **답변 모델 자신의 다음 호출부터** 붙인다. 해석을 다른 VLM에 맡기지 않는다. 턴 안에서 쌓이고
+                       상한(`config.MAX_VIEWED_PAGES`)을 넘으면 붙이지 않고 알려만 준다. 답변 이미지 모드 자동에서만 제공.
 - read_attachment    : 프롬프트 예산 때문에 잘린 문서의 전체 텍스트를 구간별로 읽는다.
 - search_attachments : 긴 문서에서 값의 위치를 찾는다.
 """
@@ -23,7 +27,8 @@ from ..providers.base import (Provider, ReasoningEffortError, ToolCall, ToolSpec
 from ..providers.reasoning import describe_reasoning_progress
 from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
                         valid_box)
-from .prompts import GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, grounding_instruction
+from .prompts import (GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, grounding_instruction, view_page_already_attached,
+                      view_page_limit_reached, view_page_result)
 
 
 class ToolError(Exception):
@@ -45,6 +50,24 @@ INSPECT_VISUAL = ToolSpec(
             "task": {"type": "string", "description": "What to detect, transcribe or verify visually."},
         },
         "required": ["name", "task"],
+    },
+)
+
+VIEW_PAGE = ToolSpec(
+    name="view_page",
+    description=(
+        "Attach the image of one page of an uploaded PDF (or an uploaded image) to your own next call so that you can "
+        "look at it. Use it when the answer depends on what is drawn - shapes, positions, counts, which feature a "
+        "dimension belongs to, or comparing pages - and the text cannot tell you. One page per call; the pages you "
+        "request stay attached for this turn, so call it again (or several times in one reply) to see more pages."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Exact attachment name from the attachment manifest."},
+            "page": {"type": "integer", "minimum": 1, "description": "1-based page number when the attachment is a PDF."},
+        },
+        "required": ["name"],
     },
 )
 
@@ -97,12 +120,26 @@ class ToolContext:
     on_live: Callable[[str], None] | None = None
     # 추론을 켠 bbox 호출에 실을 추론 수준(Step 6 2차, 요청마다 고른다). 비어 있으면 보내지 않는다.
     reasoning_effort: str = ""
+    # 보기 도구(Step 10): 이 턴에서 모델이 요청해 모은 쪽 이미지(순서대로). 루프가 다음 답변 호출부터 모두 싣는다.
+    viewed: list[ModelImage] = field(default_factory=list)
+    view_refusals: int = 0                    # 상한에 걸려 붙이지 못한 요청 수(답변 메타에 적는다)
+    # 처음부터 답변 호출에 실려 있는 이미지 이름(업로드 이미지). 같은 것을 다시 요청하면 "이미 붙어 있다"고 알려 준다.
+    base_image_names: list[str] = field(default_factory=list)
+
+    def viewed_names(self) -> list[str]:
+        return [image.name for image in self.viewed]
+
+    def attached_image_names(self) -> list[str]:
+        """지금 답변 호출에 실리는 이미지 이름 — 처음부터 실린 것 + 보기 도구로 모은 것(이 순서로 붙는다)."""
+        return [*self.base_image_names, *self.viewed_names()]
 
 
-def available_tools(attachments: list[Attachment]) -> list[ToolSpec]:
-    """첨부가 없으면 도구도 없다(순수 대화). 볼 수 있는 면이 있을 때만 inspect_visual을 내놓는다."""
+def available_tools(attachments: list[Attachment], *, view_tool: bool = False) -> list[ToolSpec]:
+    """첨부가 없으면 도구도 없다(순수 대화). 볼 수 있는 면이 있을 때만 inspect_visual(과, 자동 모드면 view_page)을 내놓는다."""
     tools: list[ToolSpec] = []
     if any(item.is_image or item.is_pdf for item in attachments):
+        if view_tool:
+            tools.append(VIEW_PAGE)
         tools.append(INSPECT_VISUAL)
     if any(item.text and not item.is_image for item in attachments):
         tools += [READ_ATTACHMENT, SEARCH_ATTACHMENTS]
@@ -113,6 +150,9 @@ def describe_tool_call(call: ToolCall) -> str:
     if call.name == "inspect_visual":
         page = f" {call.arguments.get('page')}쪽" if call.arguments.get("page") else ""
         return f"이미지에서 위치를 확인하는 중… ({call.arguments.get('name', '')}{page})"
+    if call.name == "view_page":
+        page = f" {call.arguments.get('page')}쪽" if call.arguments.get("page") else ""
+        return f"그림을 보는 중… ({call.arguments.get('name', '')}{page})"
     if call.name == "read_attachment":
         return f"문서 본문을 읽는 중… ({call.arguments.get('name', '')})"
     if call.name == "search_attachments":
@@ -124,6 +164,7 @@ async def execute_tool(context: ToolContext, call: ToolCall) -> str:
     """도구 하나를 실행해 모델에게 돌려줄 문자열을 만든다. 오류도 문자열로 돌려준다."""
     handlers = {
         "inspect_visual": _inspect_visual,
+        "view_page": _view_page,
         "read_attachment": _read_attachment,
         "search_attachments": _search_attachments,
     }
@@ -366,6 +407,43 @@ async def _inspect_visual(context: ToolContext, arguments: dict[str, Any]) -> st
     elif warning:
         result["warning"] = warning
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------------- view_page (Step 10)
+async def _view_page(context: ToolContext, arguments: dict[str, Any]) -> str:
+    """쪽(또는 업로드 이미지) 한 장을 골라 이 턴의 "보고 있는 쪽" 목록에 더한다. 이미지 조립은 답변 호출과 같은 규칙(전체 한 장).
+
+    모델 호출은 여기서 일어나지 않는다 — 다음 답변 호출부터 루프가 `context.viewed`를 `images`에 더해 싣는다.
+    """
+    record = _find(context.attachments, str(arguments.get("name") or ""))
+    if record is None:
+        raise ToolError(f'No attachment named "{arguments.get("name")}". Exact names: {_known_names(context.attachments)}.')
+    page = arguments.get("page")
+    page_number = int(page) if isinstance(page, (int, float)) and page >= 1 else None
+    if record.is_pdf and page_number is None and (record.total_pages or 0) > 1:
+        raise ToolError(f'"{record.name}" has {record.total_pages} pages: pass "page" (1-based) to choose one page per call.')
+    wanted = page_image_name(record.name, page_number) if record.is_pdf and page_number else record.name
+    if wanted in context.attached_image_names():
+        # 이미 실려 있다(처음부터 실린 업로드 이미지이거나 이 턴에서 이미 요청한 쪽) → 더하지 않고 자리만 알려 준다.
+        trace.note("tool", f"{wanted}은(는) 이미 답변 호출에 실려 있음 → 더하지 않음", attached=context.attached_image_names())
+        return view_page_already_attached(wanted, context.attached_image_names())
+    if len(context.viewed) >= config.MAX_VIEWED_PAGES:
+        context.view_refusals += 1
+        trace.note("tool", f"보기 상한({config.MAX_VIEWED_PAGES}장)에 닿아 {wanted}을(를) 붙이지 않음",
+                   limit=config.MAX_VIEWED_PAGES, viewed=context.viewed_names())
+        return view_page_limit_reached(wanted, config.MAX_VIEWED_PAGES)
+    surface = await _resolve_visual_surface(context, record, page_number)
+    # 답변 호출의 이미지는 모드와 무관하게 전체 한 장이다(Step 8과 같은 규칙). 타일은 전사·bbox 호출에만.
+    images = await assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="analysis",
+                                         mode=context.image_mode)
+    context.viewed += images
+    names = context.attached_image_names()
+    remaining = config.MAX_VIEWED_PAGES - len(context.viewed)
+    trace.note("tool", f"{surface.name}을(를) 다음 답변 호출부터 실음 ({len(context.viewed)}/{config.MAX_VIEWED_PAGES}장)",
+               surface=surface.name, attachmentId=surface.id, width=surface.width, height=surface.height,
+               attached=names, remaining=remaining)
+    context.on_progress(f"그림을 보는 중… {surface.name} ({len(context.viewed)}/{config.MAX_VIEWED_PAGES}장)")
+    return view_page_result(surface.name, names, remaining)
 
 
 # --------------------------------------------------------------------------- 텍스트 도구

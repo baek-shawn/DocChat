@@ -67,9 +67,12 @@ def _describe_inspection(inspection: PdfInspection) -> dict:
         "visualPages": inspection.visual_pages, "truncated": inspection.truncated,
         "nativeChars": len(inspection.native_text), "metadata": inspection.metadata, "renderDpi": config.PDF_RENDER_DPI,
         "thresholds": {"nativeMinChars": config.NATIVE_MIN_CHARS, "sparseOverlayChars": config.SPARSE_OVERLAY_CHARS},
+        "drawingThresholds": {"minRasterArea": config.DRAWING_MIN_RASTER_AREA,
+                              "minVectorOperations": config.DRAWING_MIN_VECTOR_OPERATIONS},
         "pages": [{
             "page": page.page_number, "classification": page.classification, "nativeCharacters": page.native_characters,
-            "rasterImages": page.raster_images, "vectorOperations": page.vector_operations, "needsVlm": page.needs_vlm,
+            "rasterImages": page.raster_images, "rasterArea": round(page.raster_area, 4),
+            "vectorOperations": page.vector_operations, "needsVlm": page.needs_vlm, "drawing": page.is_drawing(),
             "rendered": ({"width": rendered[page.page_number].width, "height": rendered[page.page_number].height}
                          if page.page_number in rendered else None),
         } for page in inspection.page_analysis],
@@ -97,6 +100,8 @@ def _describe_pdf(upload: Attachment, inspection: PdfInspection) -> Attachment:
                    f"[PAGE ANALYSIS]\n{page_summary}\n\n{body}").strip()
     upload.visual_pages = inspection.visual_pages
     upload.total_pages = inspection.total_pages
+    # 쪽별 판별 값은 메타데이터로도 남긴다 — 매니페스트가 "그림이 있는 쪽"을 다음 턴에도 알려 줄 수 있게(Step 10).
+    upload.page_analysis = [page.to_public() for page in inspection.page_analysis]
     return upload
 
 

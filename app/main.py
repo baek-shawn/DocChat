@@ -85,6 +85,8 @@ def create_app() -> FastAPI:
             # 답변 호출의 이미지(Step 8): 요청에 answerImageMode가 없을 때의 기본값과 한 호출에 싣는 이미지 수 상한
             "answerImageMode": config.DEFAULT_ANSWER_IMAGE_MODE,
             "maxModelImages": config.MAX_MODEL_IMAGES,
+            # 보기 도구(Step 10, 자동 모드): 한 턴에 모을 수 있는 쪽 수 상한과 "그림이 있는 쪽" 판정 기준
+            "view": config.view_settings(),
             # 전사·bbox 호출의 폭주 막기(Step 6-0): 호출별 추론 끄기의 기본값과 출력 상한(0 = 상한 없음)
             "vision": {
                 "disableThinkingGrounding": config.GROUNDING_DISABLE_THINKING,

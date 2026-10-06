@@ -28,12 +28,12 @@
 웹검색 / web_fetch / 논문 검색, deepagents·langchain 멀티 서브에이전트, 문서 생성(PDF/DOCX/PPTX)·차트 도구, 정식 SSE·WebSocket.
 → 필요해 보여도 **먼저 사용자에게 묻는다.**
 - 타일링은 원래 제외 항목이었으나 **2026-09-29 사용자 결정으로 해제**됐다(STEPS.md Step 5, 구현됨). 계획서에 없던 항목은 STEPS.md의 Step·Experiments에 적힌 범위까지만 한다.
-  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출에 **어떤 이미지를 실을지**는 별개의 축 `answerImageMode`(끔 / 업로드 이미지만 / 전체, Step 8 1차)로 고른다. 답변 호출의 이미지는 어느 모드든 전체 한 장이다 — 타일 계열(타일 / 타일+전체 / 개요+확대)은 Step 8 나머지의 범위다.
+  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출에 **어떤 이미지를 실을지**는 별개의 축 `answerImageMode`(끔 / 업로드 이미지만 / 전체, Step 8 1차 · 자동 = 업로드 이미지만 + 보기 도구, Step 10)로 고른다. 답변 호출의 이미지는 어느 모드든 전체 한 장이다 — 타일 계열(타일 / 타일+전체 / 개요+확대)은 Step 8 나머지의 범위다.
   - 타일 경계에서 잘린 대상을 하나로 잇는 것(분할 박스 병합)은 범위 밖이다 — 겹침 영역의 **중복**만 합친다.
 
 ### 3.3 구조 원칙
 - **단일 tool-calling 루프**만 둔다: 모델 호출 → tool_call 감지 → 실행 → 결과 재주입 → 반복. 프레임워크 금지.
-- **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다.
+- **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다. 반대로 **그림을 읽어 답하는 것은 답변 모델 자신**이 한다(보기 도구 `view_page`, Step 10) — 해석을 다른 VLM 호출에 맡기지 않는다.
 - 통신은 **동기 HTTP**가 기본. 진행률이 필요할 때만 `StreamingResponse`로 **NDJSON 한 줄씩** 흘린다(`data:` 접두사·`text/event-stream` 쓰지 않음).
 - 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`, `reasoning_budget`, `on_reasoning`, `reasoning_effort`)은 키워드 인자로만 받는다. 서버↔모델 구간의 스트리밍(추론을 켠 로컬 호출만)은 provider 안에서 끝나고 호출 지점은 완성된 `ModelResponse`만 본다.
 - "페이지 이미지 준비"(`pipeline/images.py`, `pipeline/pdf.py`)와 "VLM에 보낼 이미지 목록 조립"(`assemble_model_images`)을 **분리 유지**한다 — 전체/타일 모드가 갈리는 곳은 `assemble_model_images` 한 곳이다.
@@ -114,12 +114,26 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 
 | 상수 | 값 | 의미 |
 |---|---|---|
-| `DEFAULT_ANSWER_IMAGE_MODE` | `uploads` | `off`(이미지 없음) / `uploads`(업로드 이미지만 — 계획서 §5.3·§5.4, Step 8 이전과 같은 동작) / `whole`(업로드 이미지 + PDF 모든 쪽) (`DOCCHAT_ANSWER_IMAGE_MODE`) |
+| `DEFAULT_ANSWER_IMAGE_MODE` | `uploads` | `off`(이미지 없음) / `uploads`(업로드 이미지만 — 계획서 §5.3·§5.4, Step 8 이전과 같은 동작) / `whole`(업로드 이미지 + PDF 모든 쪽) / `auto`(업로드 이미지만 + 보기 도구, Step 10) (`DOCCHAT_ANSWER_IMAGE_MODE`) |
 | `MAX_MODEL_IMAGES` | 12 | 답변 호출 한 번에 싣는 이미지 수 상한. `whole`에서 넘치면 쪽 순서로 앞에서부터 |
 
 - 어떤 첨부를 실을지는 `evidence.attachment_context_for_prompt(answer_images=…)` **한 곳**에서 정한다. 아직 렌더하지 않은 PDF 쪽은 자리표시(`pending_page_image`)로 나오고 `chat_service._render_pending_pages`가 실을 것만 그려 첨부로 저장한다(bbox 도구의 즉석 렌더와 같은 `preprocess.render_page_attachment`).
 - 쪽 이미지(`send_to_model=False`)는 어느 모드에서도 스스로 답변 호출에 실리지 않는다 — `send_to_model=True`는 업로드 이미지에만 있다. 렌더해 둔 쪽이 기본 모드로 새면 안 된다(`tests/test_answer_images.py`).
 - 쪽 이미지가 실릴 때만 질문 끝에 `[PAGE IMAGES: …]` 한 줄이 붙는다. 기본 모드의 프롬프트는 바꾸지 않는다. 이미지 토큰은 예산에 넣지 않는다(모델마다 달라 추정하지 않음).
+
+필요할 때만 그림을 보기(Step 10) — 답변 이미지 모드 `auto`에서만 보기 도구 `view_page`를 내놓는다.
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `MAX_VIEWED_PAGES` | 12 | 보기 도구로 한 턴에 모을 수 있는 쪽 수. `MAX_MODEL_IMAGES`(전체 모드가 처음부터 싣는 수)와 **별개** (`DOCCHAT_MAX_VIEWED_PAGES`) |
+| `DRAWING_MIN_RASTER_AREA` / `DRAWING_MIN_VECTOR_OPERATIONS` | 0.02 / 100 | 매니페스트에 "그림이 있는 쪽"으로 적는 기준 — 래스터가 쪽 넓이에서 차지하는 비율(개수가 아니다: 로고 0.001~0.002, 본문 그림 0.03 이상) / 벡터 경로 연산 수(표 테두리 1~44, 데이터시트 66, CAD 도면 수천). `vector-outlines`·`scanned-raster` 쪽은 무조건 그림 |
+
+- **역할 분담**: `view_page`는 답을 내려면 그림을 봐야 할 때(형상·배치·개수·어느 대상의 치수인지·여러 쪽 비교), `inspect_visual`(bbox)은 **보여 달라고 할 때만**("표시해줘", "박스로", "시각화해줘"). "어디 있어?"처럼 말로 답하면 되는 질문은 보기 도구다. 두 도구의 문구를 바꾸는 것은 프롬프트 변경이다(통제 비교, STEPS.md Step 10 실험 ②).
+- 보기 도구는 **한 번에 한 쪽**을 받고 모델 호출을 하지 않는다. 요청한 쪽은 `ToolContext.viewed`에 쌓이고, 루프가 **다음 답변 호출부터** `images` 뒤에 붙여 보낸다(`run_tool_loop(viewed_images=…)`). 이미지는 provider마다 **원래 질문(닻)** 에 붙으므로 그 질문 끝에 `[IMAGES ATTACHED TO THIS MESSAGE, in this order - …]` 한 줄을 호출마다 다시 만들어 붙인다(`prompts.attached_images_note`). `analyze()`는 바꾸지 않는다. 5단계 "첨부를 볼 수 없다" 재요청에도 같은 이미지를 보낸다.
+- 상한을 넘으면 그 요청은 실행하지 않고 "더 볼 수 없다, 지금 보는 쪽으로 답하라"를 돌려준다(`view_refusals`에 세어 `meta.viewedPages.refused`). 같은 쪽·이미 실린 업로드 이미지를 다시 요청하면 더하지 않고 자리만 알려 준다. 쪽을 하나씩 부르면 `MAX_TOOL_STEPS`(8)에 먼저 걸린다 — 한 응답에 여러 호출을 담을 수 있다고 도구 설명에 적어 두었다.
+- 이전 턴에서 본 쪽은 다음 턴에 자동으로 실리지 않는다(모델이 다시 요청하면 렌더해 둔 첨부를 다시 쓴다). 보기 도구로 그린 쪽은 bbox 도구처럼 첨부로 저장된다(`_resolve_visual_surface` 공유).
+- **판단 재료**: `auto`에서만 매니페스트에 `drawings on pages …`를 덧붙인다(`evidence.drawing_cue`). 재료는 `PageAnalysis.to_public()`(래스터 면적 비율 포함)을 PDF 첨부의 메타데이터 `pageAnalysis`에 남긴 것이고, 그게 없는 옛 첨부는 본문의 `[PAGE ANALYSIS]` 줄에서 읽는다(면적을 몰라 개수로 대신). 다른 모드의 매니페스트·시스템 프롬프트는 Step 8까지와 같아야 한다(실험 ①의 비교 기준 — `tests/test_view_tool.py`가 지킨다).
+- 메타 `viewedPages{names, limit, refused}`는 `auto`에서만 적는다(한 쪽도 안 봤어도 — "안 봤다"도 결과다). 화면은 `그림 확인: a.pdf 2쪽, 3쪽` / `그림 확인 없음`.
 
 개발용 턴 트레이스(Step 7) — `DOCCHAT_DEBUG_TRACE=1`일 때만 기록한다(`config.debug_trace_enabled()`, 요청마다 읽는다).
 
@@ -209,7 +223,7 @@ app/
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)
                      / preprocess(업로드 펼치기, 쪽 즉석 렌더) / ocr(전사·타일 전사 병합) / evidence(증거 예산·답변 호출 이미지 선택)
-  agent/             prompts / tools / grounding(bbox 파싱·타일 박스 병합) / loop(단일 tool-calling 루프)
+  agent/             prompts / tools(bbox·보기·읽기·검색 도구) / grounding(bbox 파싱·타일 박스 병합) / loop(단일 tool-calling 루프, 본 쪽 싣기)
 static/              index.html, styles.css, js/app.js
 tests/               pytest (mock_openai.py = OpenAI 호환 mock 서버, pdf_factory.py = 합성 PDF·큰 도면)
 scripts/             make_samples.py(샘플 생성), e2e_check.py(실모델 점검), compare_tiling.py(전체 vs 타일 비교),

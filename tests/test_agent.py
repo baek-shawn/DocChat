@@ -314,6 +314,8 @@ def test_tools_are_offered_only_when_they_can_work():
     pdf = [Attachment(name="a.pdf", kind="pdf", mime="application/pdf", text="body")]
     assert [tool.name for tool in available_tools(pdf)] == ["inspect_visual", "read_attachment", "search_attachments"]
     assert INSPECT_VISUAL.parameters["required"] == ["name", "task"]
+    # 보기 도구(Step 10)는 요청받은 턴(답변 이미지 모드 자동)에만, 볼 수 있는 면이 있을 때만 앞에 붙는다.
+    assert [tool.name for tool in available_tools(image_only, view_tool=True)] == ["view_page", "inspect_visual"]
 
 
 async def test_inspect_visual_makes_a_separate_grounding_call_on_one_image():

@@ -36,8 +36,8 @@ class ChatBody(BaseModel):
     disableThinkingOcr: bool | None = None
     # 이미지 처리 방식: "whole"(전체) | "tile"(타일). 비우면 서버 기본값(DOCCHAT_IMAGE_MODE).
     imageMode: str = ""
-    # 답변(추론) 호출의 이미지(Step 8): "off"(끔) | "uploads"(업로드 이미지만) | "whole"(전체, PDF 쪽 포함).
-    # 비우면 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE).
+    # 답변(추론) 호출의 이미지(Step 8): "off"(끔) | "uploads"(업로드 이미지만) | "whole"(전체, PDF 쪽 포함)
+    # | "auto"(자동 — 업로드 이미지만 + 모델이 보기 도구로 쪽을 요청, Step 10). 비우면 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE).
     answerImageMode: str = ""
     # 호출 종류별 추론 수준(Step 6 2차): 모델의 채팅 템플릿이 받는 값(예: Qwen3.8의 "low" | "medium" | "xhigh").
     # 비우면(null) 서버 기본값(DOCCHAT_REASONING_EFFORT_*), ""이면 보내지 않는다. 추론을 켠 로컬 호출에만 실린다.

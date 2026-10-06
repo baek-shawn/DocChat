@@ -276,6 +276,61 @@ def main() -> int:
               sent.get("sent", 0) >= 1 and bool(data.get("artifacts")),
               f"실은 이미지 {sent.get('sent')}장 · 아티팩트 {len(data.get('artifacts', []))}건")
 
+        # 10) 보기 도구(Step 10) — 답변 이미지 모드 "자동". 기준 V1~V5는 STEPS.md "Step 10 실모델 확인 기준"에 결과를 보기 전에
+        #     고정했다. 질문은 셋으로 나눈다: 그림 필요(보기 도구) / 글로 충분(아무 도구도 안 부름) / 시각화 요청(bbox 도구).
+        #     gemma3는 JSON 폴백 경로다. 1회 실행이라 비율은 "죽지 않았다"의 근거이지 효과 측정이 아니다(효과는 Experiments).
+        print("\n── 10) 자동 모드: 보기 도구와 bbox 도구의 역할 분담")
+        need_picture = [("scanned_drawing.pdf", "이 도면에 그려진 부품의 형상(어떤 도형들로 이루어졌는지)을 한 줄로 설명해 줘."),
+                        ("mixed_3pages.pdf", "3쪽 도면에는 세로선이 몇 개 그려져 있어?"),
+                        ("mixed_3pages.pdf", "2쪽 도면에서 부품표는 그림의 어느 쪽(왼쪽/오른쪽/위/아래)에 있어?")]
+        text_enough = [("scanned_drawing.pdf", "이 도면의 DWG NO와 REV를 알려 줘."),
+                       ("native_spec.pdf", "이 문서의 도면 번호(DRAWING NO)를 알려 줘."),
+                       ("mixed_3pages.pdf", "1쪽에 적힌 도면 번호(DRAWING NO)는?")]
+        visualize = [("native_spec.pdf", "도면 번호(DRAWING NO)가 적힌 위치를 이미지 위에 표시해 줘."),
+                     ("sheet_with_stamp.png", "승인 도장(APPROVED) 위치를 박스로 표시해 줘.")]
+        viewed_of = lambda reply: ((reply.get("meta") or {}).get("viewedPages") or {}).get("names", [])  # noqa: E731
+        tally = {"picture": {"view": 0, "bbox": 0}, "text": {"view": 0, "bbox": 0}, "visual": {"view": 0, "bbox": 0}}
+        labels = {"picture": "그림필요", "text": "글로충분", "visual": "시각화  "}
+        viewed_turn: dict | None = None
+        for kind, items in (("picture", need_picture), ("text", text_enough), ("visual", visualize)):
+            for name, question in items:
+                reply = ask(client, question, [name], answer_images="auto")
+                viewed, bbox = viewed_of(reply), bool(reply.get("artifacts"))
+                tally[kind]["view"] += bool(viewed)
+                tally[kind]["bbox"] += bbox
+                if kind == "picture" and viewed and viewed_turn is None:
+                    viewed_turn = {"reply": reply, "question": question, "name": name}
+                print(f"   [{labels[kind]}] 보기 {'호출' if viewed else '미호출'} · bbox {'호출' if bbox else '미호출'} {reply['_seconds']:5.1f}s  {name} — {question}")
+                print(f"            ↳ {str(reply.get('text', reply.get('error', ''))).strip().splitlines()[0][:90] if reply.get('text') or reply.get('error') else ''}"
+                      + (f"  (본 쪽: {', '.join(viewed)})" if viewed else ""))
+        check("V1: 그림 필요 질문에서 보기 도구 호출 (기준 ≥2/3)", tally["picture"]["view"] >= 2, f"{tally['picture']['view']}/3")
+        wrong = max(tally["text"]["view"], tally["text"]["bbox"])
+        check("V2: 글로 충분 질문에서 보기·bbox 미호출 (기준 오호출 ≤1/3)", wrong <= 1,
+              f"보기 {tally['text']['view']}/3 · bbox {tally['text']['bbox']}/3")
+        check("V3: 시각화 요청에서 bbox 도구 호출 (기준 ≥1/2)", tally["visual"]["bbox"] >= 1,
+              f"bbox {tally['visual']['bbox']}/2 · 보기 {tally['visual']['view']}/2")
+        # V4) 본 쪽이 다음 답변 호출부터 실린다 — 보기 도구를 부른 턴의 트레이스: 첫 답변 호출 0장, 그 뒤 호출에 ≥1장.
+        if viewed_turn is None:
+            check("V4: 본 쪽이 다음 답변 호출부터 실림", False, "V1에서 보기 도구를 부른 턴이 없어 확인 불가")
+        else:
+            document = trace_of(client, viewed_turn["reply"])
+            answers = model_events(document, "answer") if document else []
+            views = [event for event in (document or {}).get("events", []) if event["kind"] == "tool" and event["data"].get("name") == "view_page"
+                     and str(event["data"].get("result", "")).startswith("Attached")]
+            counts = [len(call["data"].get("images", [])) for call in answers]
+            check("V4: 본 쪽이 다음 답변 호출부터 실림", bool(views) and len(counts) >= 2 and counts[0] == 0 and max(counts[1:]) >= 1,
+                  f"보기 도구 {len(views)}건 · 답변 호출별 이미지 {counts}")
+            # V5) 후속 턴: 이전 턴에서 본 쪽은 자동으로 실리지 않고(첫 답변 호출 0장), 모델이 다시 요청할 수 있다(비율은 참고용).
+            follow = ask(client, "그 그림에서 원은 사각형의 안쪽에 있어, 바깥쪽에 있어?", conversation_id=viewed_turn["reply"].get("conversationId", ""),
+                         history=[{"role": "user", "content": viewed_turn["question"]},
+                                  {"role": "assistant", "content": viewed_turn["reply"].get("text", "")}], answer_images="auto")
+            show("10-V5) 후속 턴 (자동) — 이전 턴에서 본 쪽은 자동으로 실리지 않는다", follow)
+            document = trace_of(client, follow)
+            answers = model_events(document, "answer") if document else []
+            counts = [len(call["data"].get("images", [])) for call in answers]
+            check("V5: 후속 턴의 첫 답변 호출에 이전 턴의 쪽이 실리지 않음", bool(counts) and counts[0] == 0,
+                  f"답변 호출별 이미지 {counts} · 다시 요청 {'함' if viewed_of(follow) else '안 함'}({', '.join(viewed_of(follow))})")
+
     failed = [name for name, passed, _ in results if not passed]
     print(f"\n결과: {len(results) - len(failed)}/{len(results)} 통과" + (f" · 실패: {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0
