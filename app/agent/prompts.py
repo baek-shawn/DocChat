@@ -190,13 +190,17 @@ def attached_images_note(names: list[str], viewed: list[str]) -> str:
 
 
 def view_page_result(name: str, names: list[str], remaining: int) -> str:
-    """보기 도구가 모델에게 돌려주는 글: 어디에 어떤 순서로 붙었는지, 더 볼 수 있는 쪽 수."""
+    """보기 도구가 모델에게 돌려주는 글: 이번에 붙인 쪽과 그 번호, 지금 붙어 있는 전체 목록(순서대로), 더 볼 수 있는 쪽 수.
+
+    Step 10 2차에서 "이번에 붙인 쪽"과 "전체 목록"을 나눠 적었다 — 누적 목록만 적으면 트레이스에서 호출마다 목록이 늘어나는
+    것이 쪽을 따로따로 본 것처럼 읽힌다(2026-10-06 사용자 혼동).
+    """
     position = names.index(name) + 1 if name in names else len(names)
     listing = "; ".join(f"{index}: {item}" for index, item in enumerate(names, start=1))
     more = (f" You may request up to {remaining} more page{'s' if remaining != 1 else ''} this turn."
             if remaining > 0 else " No more pages can be attached this turn.")
-    return (f"Attached {name} to the user's message as image #{position} (images attached, in order: {listing}). "
-            f"Look at it now and answer from what you see.{more}")
+    return (f"Attached {name} now as image #{position} of the user's message. All images attached to that message so far, "
+            f"in order: {listing}. Look at the attached pages now and answer from what you see.{more}")
 
 
 def view_page_already_attached(name: str, names: list[str]) -> str:

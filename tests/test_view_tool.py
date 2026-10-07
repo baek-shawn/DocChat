@@ -115,12 +115,14 @@ def test_view_page_attaches_the_page_to_the_next_call_and_pages_accumulate(clien
     assert "[IMAGES ATTACHED TO THIS MESSAGE, in this order - 1: spec.pdf · page 2 (requested with view_page)." in anchor_text(second)
     assert isinstance(second["messages"][1]["content"], list)
     result = tool_results(second)[0]
-    assert result.startswith("Attached spec.pdf · page 2 to the user's message as image #1 (images attached, in order: 1: spec.pdf · page 2).")
+    assert result.startswith("Attached spec.pdf · page 2 now as image #1 of the user's message. All images attached to that message so far, "
+                             "in order: 1: spec.pdf · page 2. Look at the attached pages now")
     assert f"up to {config.MAX_VIEWED_PAGES - 1} more pages this turn" in result
-    # 두 번째 보기 → 쌓여서 두 장이 모두, 요청한 순서로 실린다.
+    # 두 번째 보기 → 쌓여서 두 장이 모두, 요청한 순서로 실린다. 결과 글은 "이번에 붙인 쪽"과 "전체 목록"을 나눠 적는다(2차).
     assert image_count(third) == 2
     assert "1: spec.pdf · page 2 (requested with view_page); 2: spec.pdf · page 3 (requested with view_page)." in anchor_text(third)
-    assert "image #2 (images attached, in order: 1: spec.pdf · page 2; 2: spec.pdf · page 3)" in tool_results(third)[1]
+    assert ("Attached spec.pdf · page 3 now as image #2 of the user's message. All images attached to that message so far, "
+            "in order: 1: spec.pdf · page 2; 2: spec.pdf · page 3.") in tool_results(third)[1]
     pages = {item["name"]: item for item in data["attachments"] if item.get("pageNumber")}
     assert sorted(pages) == ["spec.pdf · page 2", "spec.pdf · page 3"]          # 1쪽은 그리지 않았다
     assert [image.size for image in request_images(third)] == [(pages[name]["width"], pages[name]["height"])
@@ -264,7 +266,8 @@ async def test_view_page_tool_renders_the_page_and_reports_its_position():
     pdf = Attachment(name="spec.pdf", kind="pdf", mime=PDF, data=build_pdf("native", "native"), text="t", total_pages=2)
     context = ToolContext(provider=ScriptedProvider([]), attachments=[pdf], base_image_names=["pic.png"])
     result = await execute_tool(context, ToolCall(name="view_page", arguments={"name": "spec.pdf", "page": 2}))
-    assert result.startswith("Attached spec.pdf · page 2 to the user's message as image #2 (images attached, in order: 1: pic.png; 2: spec.pdf · page 2).")
+    assert result.startswith("Attached spec.pdf · page 2 now as image #2 of the user's message. All images attached to that message so far, "
+                             "in order: 1: pic.png; 2: spec.pdf · page 2.")
     assert [image.name for image in context.viewed] == ["spec.pdf · page 2"] and context.viewed[0].tile is None
     rendered = context.attachments[-1]
     assert rendered.name == "spec.pdf · page 2" and rendered.data.startswith(b"\x89PNG") and not rendered.send_to_model
