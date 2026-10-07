@@ -165,23 +165,29 @@ def _limit_words() -> str:
     return f"the output limit of {limit} tokens" if limit else "the model's output limit"
 
 
-def cut_off_transcription(provider: Provider, response: ModelResponse, *, thinking_disabled: bool) -> str:
-    """출력 상한에서 끊긴 응답에서 **전사의 앞부분**만 건진다. 건질 것이 없으면 빈 문자열.
+def cut_off_answer(provider: Provider, response: ModelResponse, *, thinking_disabled: bool) -> str:
+    """출력 상한에서 끊긴 응답에서 **답 부분**만 건진다(정리하지 않은 글). 건질 것이 없으면 빈 문자열.
 
-    끊긴 글이 추론일 수 있으면 쓰지 않는다 — 추론 글이 전사로 둔갑해 증거에 들어가면 안 된다.
+    끊긴 글이 추론일 수 있으면 쓰지 않는다 — 추론 글이 답으로 둔갑하면 안 된다.
       - `</think>`가 있으면 그 뒤가 답이다. `<think>`가 열린 채 끝났으면 답은 시작도 못 했다.
       - 태그가 없을 때: 서버가 추론을 따로 떼어 줬거나(reasoning), 추론을 끄고 보냈거나, 추론을 본문에 섞지 않는
         클라우드 provider면 본문은 답이다. 그 밖에는(추론을 켠 로컬 모델, 추론을 떼어 주지 않는 서버) 가릴 수 없다.
+    전사(`cut_off_transcription`)와 따로 보기 도구(`agent/tools.py`)가 같이 쓴다.
     """
     raw = str(response.text or "")
     closed = list(_THINK_CLOSE.finditer(raw))
     if closed:
-        raw = raw[closed[-1].end():]
-    elif _THINK_OPEN.search(raw):
+        return raw[closed[-1].end():]
+    if _THINK_OPEN.search(raw):
         return ""
-    elif provider.is_local and not response.reasoning and not (thinking_disabled and provider.can_disable_thinking()):
+    if provider.is_local and not response.reasoning and not (thinking_disabled and provider.can_disable_thinking()):
         return ""
-    text = clean_transcription(raw)
+    return raw
+
+
+def cut_off_transcription(provider: Provider, response: ModelResponse, *, thinking_disabled: bool) -> str:
+    """출력 상한에서 끊긴 응답에서 **전사의 앞부분**만 건진다. 건질 것이 없으면 빈 문자열(판단은 `cut_off_answer`)."""
+    text = clean_transcription(cut_off_answer(provider, response, thinking_disabled=thinking_disabled))
     return text if is_usable_ocr_response(text) else ""
 
 

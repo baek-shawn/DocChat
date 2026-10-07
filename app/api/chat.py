@@ -39,6 +39,8 @@ class ChatBody(BaseModel):
     # 답변(추론) 호출의 이미지(Step 8): "off"(끔) | "uploads"(업로드 이미지만) | "whole"(전체, PDF 쪽 포함)
     # | "auto"(자동 — 업로드 이미지만 + 모델이 보기 도구로 쪽을 요청, Step 10). 비우면 서버 기본값(DOCCHAT_ANSWER_IMAGE_MODE).
     answerImageMode: str = ""
+    # 따로 보기 도구 analyze_pages(Step 10 2차) — 자동 모드에서만 의미 있다. 비우면(null) 서버 기본값(DOCCHAT_ANALYZE_TOOL).
+    analyzeTool: bool | None = None
     # 호출 종류별 추론 수준(Step 6 2차): 모델의 채팅 템플릿이 받는 값(예: Qwen3.8의 "low" | "medium" | "xhigh").
     # 비우면(null) 서버 기본값(DOCCHAT_REASONING_EFFORT_*), ""이면 보내지 않는다. 추론을 켠 로컬 호출에만 실린다.
     reasoningEffortAnswer: str | None = None
@@ -54,7 +56,7 @@ def _to_request(body: ChatBody) -> ChatRequest:
         provider=body.provider, api_key=body.apiKey, base_url=body.baseUrl, model=body.model,
         conversation_id=body.conversationId, context_size=body.contextSize, disable_thinking=body.disableThinking,
         disable_thinking_grounding=body.disableThinkingGrounding, disable_thinking_ocr=body.disableThinkingOcr,
-        image_mode=body.imageMode, answer_image_mode=body.answerImageMode,
+        image_mode=body.imageMode, answer_image_mode=body.answerImageMode, analyze_tool=body.analyzeTool,
         reasoning_effort_answer=body.reasoningEffortAnswer, reasoning_effort_grounding=body.reasoningEffortGrounding,
         reasoning_effort_ocr=body.reasoningEffortOcr, messages=body.messages, attachments=body.attachments,
     )

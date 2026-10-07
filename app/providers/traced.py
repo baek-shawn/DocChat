@@ -17,7 +17,7 @@ from ..pipeline.images import ModelImage
 from .base import Message, ModelResponse, Provider, ToolSpec
 from .reasoning import OnReasoning, ReasoningProgress
 
-_LABELS = {"answer": "답변 호출", "ocr": "전사 호출", "grounding": "위치 확인 호출"}
+_LABELS = {"answer": "답변 호출", "ocr": "전사 호출", "grounding": "위치 확인 호출", "analysis": "따로 보기 호출"}
 _REASONS = {"budget": "추론 예산 초과", "repeat": "추론 반복"}
 
 
@@ -60,6 +60,8 @@ class TracedProvider(Provider):
             tool = str(parent.data.get("name") or "")
             if tool == "inspect_visual":
                 return "grounding", _LABELS["grounding"]
+            if tool == "analyze_pages":
+                return "analysis", _LABELS["analysis"]        # 따로 보기(Step 10 2차): 쪽마다 하나씩, 도구 이벤트의 자식
             return f"tool:{tool}", f"{tool} 안의 모델 호출"
         return "answer", _LABELS["answer"]
 

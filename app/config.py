@@ -254,6 +254,25 @@ def view_settings() -> dict[str, float | int]:
             "drawingMinVectorOperations": DRAWING_MIN_VECTOR_OPERATIONS}
 
 
+# 따로 보기 도구(`analyze_pages`, Step 10 2차) — 보기 도구와 달리 쪽마다 **별도 VLM 호출**을 돌려 글을 받는다.
+# 자동 모드에서만, 요청 옵션(`analyzeTool`)으로 끄고 켤 수 있다(실험에서 "같이 보기만" / "따로 보기 포함"을 가르기 위해).
+# 상한 둘은 이유가 다르다: 한 호출에 받는 쪽 수는 "끊어 보기" 단위이고, 한 턴의 총 쪽 수는 **시간 상한**이다(쪽마다 호출이
+# 실제로 돈다). 전체를 훑어야 하는 질문이 있으므로 총 쪽 수는 전처리 전사 상한(DEFAULT_PDF_VISUAL_PAGES)과 같은 선에 둔다.
+ANALYZE_TOOL = _switch("DOCCHAT_ANALYZE_TOOL", True)
+ANALYZE_PAGES_PER_CALL = _int("DOCCHAT_ANALYZE_PAGES_PER_CALL", 10, low=1, high=200)
+MAX_ANALYZED_PAGES = _int("DOCCHAT_MAX_ANALYZED_PAGES", 60, low=1, high=1000)
+
+
+def answer_mode_offers_analyze_tool(mode: str, requested: bool | None = None) -> bool:
+    """이 턴에 따로 보기 도구를 내놓는가 — 자동 모드이고 요청(없으면 서버 기본값)이 켜져 있을 때."""
+    return answer_mode_offers_view_tool(mode) and resolve_switch(requested, ANALYZE_TOOL)
+
+
+def analyze_settings() -> dict[str, bool | int]:
+    """따로 보기 도구의 설정 — /api/health와 트레이스 입력이 같은 값을 본다."""
+    return {"enabled": ANALYZE_TOOL, "pagesPerCall": ANALYZE_PAGES_PER_CALL, "maxPages": MAX_ANALYZED_PAGES}
+
+
 def tile_settings() -> dict[str, float | int]:
     """지금 적용 중인 타일 설정 — 답변 메타데이터, /api/health, 비교 스크립트가 같은 값을 본다."""
     return {

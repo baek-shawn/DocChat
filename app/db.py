@@ -90,10 +90,11 @@ _ADDED_COLUMNS = (
 _ID_PATTERN = re.compile(r"^[a-zA-Z0-9-]{8,80}$")
 _BOX_KEYS = ("x", "y", "w", "h")
 _PAGE_IMAGE_NAME = re.compile(r"^(?P<root>.*) · page (?P<number>\d+)$")
-_META_COUNTERS = ("ocrCalls", "groundingCalls", "answerCalls", "tiledImages", "tiles", "blankTiles",
-                  "ocrLengthStops", "groundingLengthStops",
-                  "answerReasoningForced", "groundingReasoningForced", "ocrReasoningForced",
-                  "answerReasoningStops", "groundingReasoningStops", "ocrReasoningStops", "reasoningTokens")
+_META_COUNTERS = ("ocrCalls", "groundingCalls", "answerCalls", "analysisCalls", "tiledImages", "tiles", "blankTiles",
+                  "ocrLengthStops", "groundingLengthStops", "analysisLengthStops",
+                  "answerReasoningForced", "groundingReasoningForced", "ocrReasoningForced", "analysisReasoningForced",
+                  "answerReasoningStops", "groundingReasoningStops", "ocrReasoningStops", "analysisReasoningStops",
+                  "reasoningTokens")
 _META_REASONING_SETTINGS = ("repeatLines", "repeatCount", "repeatMinChars")
 _META_TILE_SETTINGS = ("tileSize", "overlap", "renderDpi", "minSourceEdge", "maxTiles")
 _META_THINKING_CALLS = ("answer", "grounding", "ocr")
@@ -262,6 +263,15 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
         if all(number is not None for number in counts.values()) and isinstance(names, list):
             meta["viewedPages"] = {"names": [str(item)[:300] for item in names[:200] if isinstance(item, str)],
                                    **{name: int(number) for name, number in counts.items()}}
+    # 따로 보기 도구(Step 10 2차, 자동 모드): 도구를 내놓았는지, 따로 본 쪽, 도구 호출 수, 상한, 상한에 걸려 보지 못한 요청 수
+    analyzed = value.get("analyzedPages")
+    if isinstance(analyzed, dict) and isinstance(analyzed.get("enabled"), bool):
+        counts = {name: _bounded_number(analyzed.get(name), 100_000) for name in ("calls", "limit", "refused")}
+        names = analyzed.get("names")
+        if all(number is not None for number in counts.values()) and isinstance(names, list):
+            meta["analyzedPages"] = {"enabled": analyzed["enabled"],
+                                     "names": [str(item)[:300] for item in names[:1000] if isinstance(item, str)],
+                                     **{name: int(number) for name, number in counts.items()}}
     # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
     if valid_id(value.get("traceId")):
         meta["traceId"] = value["traceId"]

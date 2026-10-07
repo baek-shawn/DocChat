@@ -58,13 +58,15 @@ def follow_up(mock, text: str, conversation_id: str, previous: list[tuple[str, s
 
 # --------------------------------------------------------------------------- 모드: 자동에서만 보기 도구와 판단 재료
 def test_auto_mode_offers_the_view_tool_and_marks_drawing_pages(client, mock_llm):
+    """1차의 자동 모드(같이 보기만). 따로 보기 도구(2차)는 끈다 — 그 조건의 도구 목록·프롬프트는 `test_analyze_tool.py`."""
     mock_llm.reset(lambda body: "OCR TEXT" if is_ocr_call(body) else "answer")
     data = client.post("/api/chat", json=chat_body(mock_llm, "이 도면의 형상은?", [upload("scan.pdf", build_pdf("native", "scanned"), PDF)],
-                                                   answerImageMode="auto")).json()
+                                                   answerImageMode="auto", analyzeTool=False)).json()
     (main,) = main_calls(mock_llm)
     assert tool_names(main) == ["view_page", "inspect_visual", "read_attachment", "search_attachments"]
     system = system_text(main)
     assert "view_page attaches the image of one page" in system and f"up to {config.MAX_VIEWED_PAGES} pages" in system
+    assert "analyze_pages" not in system
     # 판단 재료: 그림이 있는 쪽과 그 쪽의 글이 무엇을 담는지(전사한 2쪽) — 네이티브 1쪽은 그림이 없다.
     assert ('"scan.pdf": parts=3, pages=2, images=1, parsedText=' in system
             and "drawings on pages 2 (text = transcription of the visible labels only) - the shapes" in system)

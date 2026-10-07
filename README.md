@@ -62,12 +62,13 @@ uv run python run.py
 | | 끔(`off`) | 업로드 이미지만(`uploads`, 기본) | 전체(`whole`) | 자동(`auto`) |
 |---|---|---|---|---|
 | 업로드 이미지 | 싣지 않음 | 전체 한 장 | 전체 한 장 | 전체 한 장 |
-| PDF 쪽 | 싣지 않음 | 싣지 않음(텍스트만) | **모든 쪽**을 한 장씩 — 글자가 충분해 전사하지 않은 쪽도 | **모델이 보기 도구(`view_page`)로 요청한 쪽만**, 한 번에 한 쪽씩 |
-| 답변 모델이 보는 것 | 네이티브 텍스트 + 전사 글 + 위치 확인 도구 | 위 + 업로드 이미지 | 위 + 쪽 그림(형상·심볼·배치) | 위 + 모델이 필요하다고 판단한 쪽 그림 |
+| PDF 쪽 | 싣지 않음 | 싣지 않음(텍스트만) | **모든 쪽**을 한 장씩 — 글자가 충분해 전사하지 않은 쪽도 | **모델이 보기 도구(`view_page`)로 요청한 쪽만**, 한 번에 한 쪽씩. 따로 보기 도구(`analyze_pages`, 기본 켬)로는 쪽마다 별도 호출의 **글**을 받는다 |
+| 답변 모델이 보는 것 | 네이티브 텍스트 + 전사 글 + 위치 확인 도구 | 위 + 업로드 이미지 | 위 + 쪽 그림(형상·심볼·배치) | 위 + 모델이 필요하다고 판단한 쪽 그림(같이 보기) 또는 쪽마다 따로 본 답 글(따로 보기) |
 
 - 기본값은 지금까지의 동작입니다(계획서 §5.3·§5.4). "전체"는 그림에만 있는 것(벽·창 형상, 무엇의 치수인지, 심볼 개수)을 답하게 하려는 실험용 모드입니다 — 효과는 모델·도면으로 직접 재 보세요.
 - **"자동"(Step 10)**: 모델에게 보기 도구 `view_page`를 내놓습니다. 모델이 "답을 내려면 그림을 봐야 한다"고 판단하면(형상·배치·개수·어느 대상의 치수인지·여러 쪽 비교) 쪽을 한 장씩 요청하고, 요청한 쪽은 **그 턴 안에서 쌓여 다음 호출부터 모두** 실립니다(여러 쪽 비교는 차례로 모아 한 호출에서 나란히 봅니다). 한 턴에 최대 `DOCCHAT_MAX_VIEWED_PAGES`(기본 12)장 — 넘으면 붙이지 않고 "더 볼 수 없다"고 알려 줍니다. 이전 턴에서 본 쪽은 다음 턴에 자동으로 실리지 않지만 모델이 다시 요청할 수 있습니다(렌더해 둔 쪽을 다시 씁니다). 판단을 돕기 위해 매니페스트에 **그림이 있는 쪽**과 그 쪽의 글이 무엇을 담는지(전사한 라벨뿐인지, 네이티브 글인지)를 적습니다 — "그림 있음"은 래스터 개수가 아니라 쪽에서 차지하는 면적 비율(`DOCCHAT_DRAWING_MIN_RASTER_AREA`)과 벡터 연산 수(`DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS`)로 판정합니다. 답변 아래에 `그림 확인: spec.pdf 2쪽, 3쪽`(또는 `그림 확인 없음`)이 붙고 `meta.viewedPages`에 남습니다. 끔·업로드만·전체의 프롬프트는 바뀌지 않았습니다(비교 기준).
-- 위치 확인(bbox) 도구 `inspect_visual`은 어느 방식이든 **보여 달라고 할 때만**("표시해줘", "박스로", "시각화해줘") 씁니다 — Step 10에서 문구를 좁혔습니다. 그림을 읽어 답하는 용도는 보기 도구의 몫입니다("어디 있어?"처럼 말로 답하면 되는 질문도 보기 도구).
+- **"자동"의 따로 보기 도구 `analyze_pages`(Step 10 2차, 기본 켬)**: 보기 도구가 "요청한 쪽을 모아 답변 모델이 직접 본다"(같이 보기)라면, 따로 보기는 쪽(하나 또는 `"1-10"` 같은 범위, 업로드 이미지도 가능)마다 **비전 모델을 따로 불러** 모델이 넘긴 질문에 답하게 하고 그 **글만** 답변 호출에 돌려줍니다 — 쪽마다 독립인 질문("각 도면 쪽의 R 값")이나 후보가 많아 전부 훑어야 하는 질문("구멍 네 개 판 도면은 몇 쪽")용입니다. 어느 쪽을 쓸지, 몇 쪽을 끊어 훑을지는 **모델이 고릅니다**(좁혀지지 않으면 끊어서 전부 훑고, 따로 본 글로 애매하면 `view_page`로 그 쪽을 직접 봅니다). 한 호출에 최대 `DOCCHAT_ANALYZE_PAGES_PER_CALL`(기본 10)쪽 — 넘치면 앞에서부터 보고 다음 범위를 알려 줍니다 — 한 턴에 최대 `DOCCHAT_MAX_ANALYZED_PAGES`(기본 60)쪽(시간 상한). 추론 끄기·출력 상한·추론 수준은 위치 확인(bbox) 호출의 설정을 따르고, 끊긴·실패한 쪽은 그 쪽의 글로 표시하고 다시 보내지 않습니다. 설정 창의 체크박스(요청의 `analyzeTool`)로 끄면 1차의 자동 모드(같이 보기만)와 같아져 실험의 비교 기준이 됩니다. 답변 아래에 `따로 보기: spec.pdf 1-10쪽 (10쪽, 호출 1번)`(또는 `따로 보기 없음` / `따로 보기 꺼짐`)이 붙고 `meta.analyzedPages`에 남습니다.
+- 위치 확인(bbox) 도구 `inspect_visual`은 어느 방식이든 **보여 달라고 할 때만**("표시해줘", "박스로", "시각화해줘") 씁니다 — Step 10에서 문구를 좁혔습니다. 그림을 읽어 답하는 용도는 보기 도구·따로 보기 도구의 몫입니다("어디 있어?"처럼 말로 답하면 되는 질문도 보기 도구).
 - "전체"에서 전처리 때 렌더하지 않은 쪽은 답변 직전에 렌더해 첨부로 저장합니다(뷰어에서 열리고, 다음 턴에 다시 그리지 않습니다). 한 번에 최대 `DOCCHAT_MAX_MODEL_IMAGES`(기본 12)장, 넘치면 **쪽 순서로 앞에서부터** 싣고 뺀 수를 답변 아래에 적습니다. 실을 쪽만 렌더합니다.
 - 쪽 이미지가 실릴 때는 질문 끝에 `[PAGE IMAGES: 1: a.pdf · page 1; …]` 한 줄이 붙어 모델이 몇 번째 이미지가 어느 쪽인지 알 수 있습니다. 기본 모드의 프롬프트는 바뀌지 않습니다.
 - 비용: 이미지는 도구 루프의 **호출마다** 다시 갑니다(3072px 도면 한 장 ≈ Qwen3.5 입력 6,500토큰). 이미지 토큰은 예산 계산에 넣지 않으므로 컨텍스트가 작은 로컬 모델(8192)은 "전체"에서 넘쳐 오류가 날 수 있습니다.
@@ -161,6 +162,8 @@ Copy-Item .env.example .env
 | `DOCCHAT_MAX_MODEL_IMAGES` | `12` | 답변 호출 한 번에 싣는 이미지 수 상한(업로드 이미지 + `whole`의 PDF 쪽) |
 | `DOCCHAT_MAX_VIEWED_PAGES` | `12` | `auto`에서 보기 도구로 한 턴에 모을 수 있는 쪽 수(모은 쪽은 그 뒤 호출마다 다시 실림) |
 | `DOCCHAT_DRAWING_MIN_RASTER_AREA` / `DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS` | `0.02` / `100` | `auto`의 매니페스트에 "그림이 있는 쪽"으로 적는 기준(래스터 면적 비율 / 벡터 경로 연산 수) |
+| `DOCCHAT_ANALYZE_TOOL` | `1` | `auto`에서 따로 보기 도구 `analyze_pages`를 내놓을지의 기본값(요청의 `analyzeTool`이 우선) |
+| `DOCCHAT_ANALYZE_PAGES_PER_CALL` / `DOCCHAT_MAX_ANALYZED_PAGES` | `10` / `60` | 따로 보기 한 호출이 받는 쪽 수(끊어 보기 단위) / 한 턴에 따로 보는 총 쪽 수(시간 상한) |
 | `DOCCHAT_TILE_SIZE` | `1536` | 타일 한 변의 상한(px) |
 | `DOCCHAT_TILE_OVERLAP` | `0.125` | 이웃 타일과 겹치는 비율(타일 크기 대비) |
 | `DOCCHAT_TILE_RENDER_DPI` | `200` | PDF 타일 렌더 DPI(스캔 쪽은 박힌 이미지 해상도가 상한) |
@@ -210,6 +213,7 @@ uv run pytest
 | `tests/test_answer_images.py` | 답변 호출 이미지(Step 8): 기본값은 이전 동작 그대로, 전체 모드는 전사 뒤 쪽 이미지를 쪽 순서로 싣고 네이티브 쪽을 렌더해 저장, 상한 안에서만 렌더, 루프의 매 호출에 실림, 끔 모드에서도 bbox 도구 동작, 렌더한 쪽이 기본 모드로 새지 않음, 트레이스 기록 |
 | `tests/test_reasoning_control.py` | 추론 제어(Step 6): 실측 반복 표본을 3번째 순환에서 잡고 정상 추론·짧은 줄은 오인하지 않음, 조각·글자 수로 토큰 세기, 본문 속 `<think>` 가르기, 추론을 켠 로컬 호출만 스트리밍, 도구 호출 델타 조립, 예산 초과·반복 → 이어 쓰기 요청 형식(`</think>` 접두 + `continue_final_message`), 이어 쓰기 실패 → 하드 중단(반복·빈 답·거절), 상한 = 예산 + 출력 몫, 전사·bbox 호출의 실패 처리와 재시도 없음, `/api/chat`의 메타·live 진행·안내문, 트레이스 기록 |
 | `tests/test_view_tool.py` | 보기 도구(Step 10): 자동 모드에서만 `view_page`와 매니페스트의 "그림이 있는 쪽"(다른 모드의 프롬프트는 그대로), 본 쪽이 다음 호출부터 원래 질문에 붙고 쌓임, 상한·중복·이미 실린 업로드 이미지, 후속 턴은 자동으로 싣지 않되 다시 요청 가능(다시 그리지 않음), bbox 호출과 섞이지 않음, JSON 폴백 경로, 트레이스, 래스터 면적·벡터 수로 그림 판정, 옛 첨부의 폴백, `meta.viewedPages` |
+| `tests/test_analyze_tool.py` | 따로 보기 도구(Step 10 2차): 자동 모드 + `analyzeTool`에서만 `analyze_pages`(끄면 1차와 프롬프트가 문단 하나 차이), 쪽마다 별도 호출·답변 호출에는 글만, 한 호출·한 턴 상한, 같은 쪽·같은 질문 재요청, 업로드 이미지, 따로 보기 뒤 `view_page`, bbox 호출의 추론 설정을 따름, JSON 폴백, 트레이스의 자식 호출, 인자 검사·없는 쪽, 쪽별 끊김·중단·예외, `meta.analyzedPages` |
 | `tests/test_reasoning_effort.py` | 추론 수준(Step 6 2차): 값의 모양 검사, 추론을 켠 로컬 호출에만 `chat_template_kwargs.reasoning_effort`가 실리는지(추론을 끈 호출·클라우드는 이전과 같은 요청), 이어 쓰기 요청도 같은 수준, 서버가 받지 않는 값 → 오류(빼고 다시 보내지 않음, 같은 값을 다시 묻지 않음), 다른 원인의 거절을 수준 탓으로 돌리지 않음(1토큰 확인 요청), 전사 3회 재시도·도구 오류·타일 일부 실패에 묻히지 않음, 호출 종류별 값과 `meta.reasoningEffort`, 수준을 바꾸면 다시 전사, 트레이스 기록 |
 
 특정 테스트만: `uv run pytest tests/test_pdf_pipeline.py -k classification -v`
@@ -221,7 +225,7 @@ uv run python scripts/make_samples.py     # samples/ 에 시험용 PDF·이미�
 uv run python scripts/e2e_check.py        # 기본: Ollama의 gemma3:latest
 ```
 
-트레이스를 켠 채 돌아가며(`DOCCHAT_DEBUG_TRACE=1`) 기존 항목에 더해 트레이스 항목 T1~T4(STEPS.md "Step 7 실모델 확인 기준"), 답변 호출 이미지 항목 A1~A4(STEPS.md "Step 8 1차 실모델 확인 기준"), 보기 도구 항목 V1~V5(STEPS.md "Step 10 실모델 확인 기준" — 자동 모드에서 그림 필요 / 글로 충분 / 시각화 질문별 도구 선택)를 확인합니다.
+트레이스를 켠 채 돌아가며(`DOCCHAT_DEBUG_TRACE=1`) 기존 항목에 더해 트레이스 항목 T1~T4(STEPS.md "Step 7 실모델 확인 기준"), 답변 호출 이미지 항목 A1~A4(STEPS.md "Step 8 1차 실모델 확인 기준"), 보기 도구 항목 V1~V5(STEPS.md "Step 10 실모델 확인 기준" — 자동 모드에서 그림 필요 / 글로 충분 / 시각화 질문별 도구 선택), 따로 보기 항목 P1~P5(STEPS.md "Step 10 2차 실모델 확인 기준" — 쪽마다 독립·전부 훑기 질문에서 `analyze_pages`, 끈 조건, 음성 대조)를 확인합니다.
 
 다른 모델로: `$env:DOCCHAT_E2E_BASE_URL="http://127.0.0.1:8080/v1"; $env:DOCCHAT_E2E_MODEL="qwen2.5-vl"; uv run python scripts/e2e_check.py`
 클라우드로: `$env:DOCCHAT_E2E_PROVIDER="gemini"; $env:DOCCHAT_E2E_API_KEY="…"; $env:DOCCHAT_E2E_MODEL="gemini-2.5-flash"`
@@ -295,8 +299,8 @@ curl -X POST http://127.0.0.1:8000/api/test-connection -H "Content-Type: applica
 
 | 메서드 · 경로 | 설명 |
 |---|---|
-| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`; `progress`에 `live: true`가 있으면 "추론 중… n토큰"처럼 같은 줄을 갱신하는 문구). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`/`auto`(답변 호출에 실을 이미지, 비우면 서버 기본값. `auto`는 보기 도구로 모델이 쪽을 요청). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). `reasoningEffortAnswer` · `reasoningEffortGrounding` · `reasoningEffortOcr`(호출 종류별 추론 수준. 없으면 서버 기본값, `""`이면 보내지 않음, 추론을 켠 로컬 호출에만 실림 — 서버가 받지 않는 값이면 400). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·실어 보낸 추론 수준(`reasoningEffort`)·(자동 모드) 보기 도구로 본 쪽(`viewedPages{names, limit, refused}`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
-| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 보기 도구의 상한과 그림 판정 기준(`view`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 추론 예산·반복 기준(`reasoning`), 추론 수준의 서버 기본값(`reasoningEffort`), 트레이스 켬 여부(`debugTrace`) |
+| `POST /api/chat` | 한 턴 실행. `stream:false`(기본)면 JSON 한 번, `stream:true`면 NDJSON(`conversation` → `progress`… → `final`; `progress`에 `live: true`가 있으면 "추론 중… n토큰"처럼 같은 줄을 갱신하는 문구). `imageMode`: `whole`/`tile`(비우면 서버 기본값). `answerImageMode`: `off`/`uploads`/`whole`/`auto`(답변 호출에 실을 이미지, 비우면 서버 기본값. `auto`는 보기 도구로 모델이 쪽을 요청). `analyzeTool`: `auto`에서 따로 보기 도구를 내놓을지(비우면 서버 기본값). `disableThinking`(모든 호출) · `disableThinkingGrounding` · `disableThinkingOcr`(비우면 서버 기본값). `reasoningEffortAnswer` · `reasoningEffortGrounding` · `reasoningEffortOcr`(호출 종류별 추론 수준. 없으면 서버 기본값, `""`이면 보내지 않음, 추론을 켠 로컬 호출에만 실림 — 서버가 받지 않는 값이면 400). 응답의 `meta`에 처리 방식·답변 호출 이미지(`answerImageMode`, `answerImages{sent, candidates, names}`)·비전 호출 수·출력 상한에 닿은 호출 수·호출별 추론 끔 여부(`thinkingDisabled`)·실어 보낸 추론 수준(`reasoningEffort`)·(자동 모드) 보기 도구로 본 쪽(`viewedPages{names, limit, refused}`)과 따로 보기(`analyzedPages{enabled, names, calls, limit, refused}`)·걸린 시간·(트레이스 켬) `traceId`. `conversation` 이벤트에도 `traceId`가 실려 진행 중에 조회할 수 있다 |
+| `GET /api/health` | 임계값(`limits`), 기본 이미지 처리 방식(`imageMode`), 타일 설정(`tiling`), 답변 호출 이미지의 기본값과 상한(`answerImageMode`, `maxModelImages`), 보기 도구의 상한과 그림 판정 기준(`view`), 따로 보기 도구의 기본 켬/끔과 상한 둘(`analyze`), 호출별 추론 끄기의 기본값과 출력 상한(`vision`), 추론 예산·반복 기준(`reasoning`), 추론 수준의 서버 기본값(`reasoningEffort`), 트레이스 켬 여부(`debugTrace`) |
 | `GET /api/traces/{id}` | 턴 트레이스 JSON(진행 중이면 그때까지의 기록). `?download=1`이면 파일로 |
 | `GET /api/sessions/{id}/traces` | 그 대화의 트레이스 목록(id·시각·상태) |
 | `GET /api/sessions` · `POST /api/sessions` · `DELETE /api/sessions` | 목록 · 생성 · 선택/전체 삭제(`{ids}` 또는 `{all:true}`) |

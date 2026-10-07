@@ -114,6 +114,8 @@ def test_example_file_shows_the_real_defaults():
         "DOCCHAT_MAX_VIEWED_PAGES": config.MAX_VIEWED_PAGES,
         "DOCCHAT_DRAWING_MIN_RASTER_AREA": config.DRAWING_MIN_RASTER_AREA,
         "DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS": config.DRAWING_MIN_VECTOR_OPERATIONS,
+        "DOCCHAT_ANALYZE_TOOL": config.ANALYZE_TOOL, "DOCCHAT_ANALYZE_PAGES_PER_CALL": config.ANALYZE_PAGES_PER_CALL,
+        "DOCCHAT_MAX_ANALYZED_PAGES": config.MAX_ANALYZED_PAGES,
     }
     assert {name: float(example[name]) for name in defaults} == {name: float(value) for name, value in defaults.items()}
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST

@@ -4,6 +4,8 @@
   - grounding     : 이미지 한 장만 보고 0~1000 정수 좌표의 JSON만 돌려주게 한다.
   - 메인 분석      : 파싱된 증거를 근거로 답하고, 표시 요청일 때만 inspect_visual을, 그림을 봐야 답할 수 있을 때만
                     view_page(보기 도구, 답변 이미지 모드 자동에서만 제공)를 부르게 한다(Step 10의 역할 분담).
+  - 따로 보기      : 쪽 한 장만 보고 모델이 넘긴 질문에 답하게 한다(analyze_pages, Step 10 2차). 옮겨 적기가 아니라
+                    질문에 답하기, 보이는 것만, 없으면 없다고.
 
 프롬프트는 영어로 쓴다(로컬 소형 모델이 가장 안정적으로 따른다). 답변 언어는 사용자 언어를 따르게 한다.
 """
@@ -85,8 +87,30 @@ def grounding_instruction(task: str, name: str, *, tile: bool = False) -> str:
     return "\n".join(lines)
 
 
-def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", view_tool: bool = False) -> str:
-    """view_tool: 보기 도구(`view_page`)를 내놓는 턴인가(답변 이미지 모드 자동, Step 10). 그때만 그 안내가 붙는다."""
+# 따로 보기 도구(Step 10 2차)의 쪽별 호출. 전사(옮겨 적기)·bbox(좌표 JSON)와 달리 **질문에 답하는** 호출이다.
+PAGE_ANALYSIS_SYSTEM_PROMPT = (
+    "You are a visual analysis engine. Answer one question about the single attached image, which is one complete page of "
+    "the user's document (or one uploaded image). Look only at this image. Answer from what is visible: describe shapes, "
+    "layout, symbols, counts, labels and dimensions exactly as they appear, read values exactly as printed, and say which "
+    "feature a label or dimension belongs to when you can see it. If the page does not contain what the question asks "
+    "about, say so plainly. Never guess from prior knowledge, never invent content that is not visible, and never bring in "
+    "other pages. Reply in plain text, concise and factual: no preface, no Markdown, no code fences."
+)
+
+
+def page_analysis_instruction(question: str, name: str) -> str:
+    return "\n".join([
+        f"Question: {question}",
+        f"Source: {name}",
+        "Answer about this page only, from what is visible in the attached image. If nothing on this page is relevant to "
+        "the question, say so in one sentence.",
+    ])
+
+
+def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", view_tool: bool = False,
+                  analyze_tool: bool = False) -> str:
+    """view_tool: 보기 도구(`view_page`)를 내놓는 턴인가(답변 이미지 모드 자동, Step 10). 그때만 그 안내가 붙는다.
+    analyze_tool: 따로 보기 도구(`analyze_pages`)도 내놓는가(Step 10 2차). 끄면 1차의 자동 모드 프롬프트와 같다(실험 ③의 비교 기준)."""
     served_by = (f' You are served by the model "{model_name}"; mention that only when the user asks which model '
                  "this is.") if model_name else ""
     parts = [
@@ -131,6 +155,22 @@ def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", v
                 f"more pages (they stay attached for this turn, up to {config.MAX_VIEWED_PAGES} pages). Do not call it "
                 "when the parsed text already answers the question, and do not call inspect_visual just to look at a page."
             )
+        if view_tool and analyze_tool:
+            # Step 10 2차: 같이 보기(view_page)와 따로 보기(analyze_pages) 중 무엇을 쓸지는 모델이 고른다. "좁혀지지 않으면
+            # 후보 일부만 보고 단정하지 말고 끊어서 전부 훑어라"와 "따로 본 글만으로 애매하면 view_page로 다시 같이 보기"가 핵심.
+            parts.append(
+                "analyze_pages looks at pages for you in separate calls: each requested page (one page, or a range such as "
+                f'"11-20", up to {config.ANALYZE_PAGES_PER_CALL} pages per call) is sent to the vision model together with '
+                "your question, and you receive one text answer per page; those pages are not attached to your own call. "
+                "Use it when each page can be judged on its own - reading a value or a feature from every drawing, checking "
+                "which pages show something - or when there are too many candidate pages to attach. Write the question "
+                "concretely (what to look for and what to report), because it decides the result. If the text and the "
+                "manifest do not narrow the pages down, or the question can only be answered by covering every page, do not "
+                "conclude from a few candidates: go through all the pages in ranges, calling it again for the next range, up "
+                f"to {config.MAX_ANALYZED_PAGES} pages per turn. If the per-page answers leave the decision ambiguous, call "
+                "view_page on the decisive pages and judge them yourself together with those answers; use view_page from the "
+                "start when pages must be compared side by side."
+            )
         parts.append(
             "If a supplied excerpt is truncated, call read_attachment with increasing start offsets until hasMore is "
             "false before claiming a complete extraction; use search_attachments to locate a value in long documents."
@@ -170,6 +210,45 @@ def view_page_limit_reached(name: str, limit: int) -> str:
             f"Answer from the pages you can see, and tell the user that only {limit} pages were viewed.")
 
 
+def analyze_pages_result(name: str, question: str, answers: list[tuple[str, str]], *, remaining: int, limit: int,
+                         deferred: str = "", not_analyzed: str = "", beyond: int = 0, per_call: int = 0) -> str:
+    """따로 보기 도구(Step 10 2차)가 모델에게 돌려주는 글: 쪽마다 `[page n] 답`, 그리고 다음에 할 일.
+
+    answers: (쪽 표식, 답) — 표식은 PDF 쪽이면 "page 3", 업로드 이미지면 그 이름.
+    deferred: 한 호출의 쪽 수 상한 때문에 이번에 보지 않은 쪽 범위(비어 있으면 없음). not_analyzed: 턴 상한에 걸려 보지 않은 쪽 범위.
+    beyond: PDF에 없는 쪽을 요청해 무시한 수.
+    """
+    count = len(answers)
+    lines = [f'Analyzed {count} page{"s" if count != 1 else ""} of {name} with the question: "{question}". Each answer below '
+             "comes from a separate look at that page only; the pages are not attached to your call."]
+    for marker, answer in answers:
+        lines.append(f"[{marker}] {answer}")
+    notes: list[str] = []
+    if beyond:
+        notes.append(f"{beyond} requested page{'s' if beyond != 1 else ''} beyond the end of the document {'were' if beyond != 1 else 'was'} ignored.")
+    if deferred:
+        notes.append(f"Only the first {per_call} requested pages were analyzed in this call; call analyze_pages again with "
+                     f'pages "{deferred}" to continue.')
+    if not_analyzed:
+        notes.append(f"The per-turn limit of {limit} analyzed pages is now reached; the remaining requested pages ({not_analyzed}) "
+                     f"were not analyzed. Answer from what you have, and tell the user that only {limit} pages could be analyzed this turn.")
+    elif remaining > 0:
+        notes.append(f"You may analyze up to {remaining} more page{'s' if remaining != 1 else ''} this turn.")
+    else:
+        notes.append(f"No more pages can be analyzed this turn (limit {limit}).")
+    if not not_analyzed:
+        notes.append("If these answers leave the question ambiguous, call view_page on the decisive pages to look at them "
+                     "yourself; if more pages must be covered, call analyze_pages again with the next range.")
+    lines.append(" ".join(notes))
+    return "\n".join(lines)
+
+
+def analyze_pages_limit_reached(name: str, pages: str, limit: int) -> str:
+    where = f"{name} (pages {pages})" if pages else name
+    return (f"Page limit reached: {limit} pages have already been analyzed this turn, so {where} was not analyzed. "
+            f"Answer from the results you already have, and tell the user that only {limit} pages could be analyzed.")
+
+
 FALSE_REFUSAL_CORRECTION = (
     "RUNTIME CORRECTION: the attached files have already been parsed and their actual content is included in this "
     "request. Answer the original request from that content now. Do not ask the user to paste the file and do not say "
@@ -197,6 +276,10 @@ def json_tool_reminder(tool_names: list[str]) -> str:
         # Step 10: gemma3 같은 폴백 모델에도 보기 도구를 쓸 길을 한 줄로 준다(위치 요청 문장은 그대로 둔다 — 실험 ②).
         lines.append("If answering needs the drawing itself (shapes, counts, which feature a value belongs to) and the "
                      "text does not say, reply with ONLY the view_page tool-call JSON for that page.")
+    if "analyze_pages" in tool_names:
+        # Step 10 2차: 폴백 모델에게도 쪽을 훑는 길을 한 줄로 준다.
+        lines.append("If the answer needs every page checked one by one, or a value read from each page, reply with ONLY the "
+                     "analyze_pages tool-call JSON with a page range and a concrete question.")
     lines.append("If no tool is needed, answer normally.]")
     return " ".join(lines)
 

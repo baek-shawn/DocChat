@@ -40,7 +40,9 @@ def approx(box, **expected):
 # 추론 제어(Step 6)의 소프트·하드 조치가 한 번도 없었을 때의 카운터(답변 메타데이터 `vision`의 나머지 항목).
 NO_REASONING_ACTIONS = {"answerReasoningForced": 0, "groundingReasoningForced": 0, "ocrReasoningForced": 0,
                         "answerReasoningStops": 0, "groundingReasoningStops": 0, "ocrReasoningStops": 0,
-                        "reasoningTokens": 0}
+                        "reasoningTokens": 0,
+                        # 따로 보기 도구(Step 10 2차)는 자동 모드에서만 돈다 — 이 테스트들에서는 호출이 없다
+                        "analysisCalls": 0, "analysisLengthStops": 0, "analysisReasoningForced": 0, "analysisReasoningStops": 0}
 
 
 class SeeingProvider(Provider):
