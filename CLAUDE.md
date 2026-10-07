@@ -28,12 +28,12 @@
 웹검색 / web_fetch / 논문 검색, deepagents·langchain 멀티 서브에이전트, 문서 생성(PDF/DOCX/PPTX)·차트 도구, 정식 SSE·WebSocket.
 → 필요해 보여도 **먼저 사용자에게 묻는다.**
 - 타일링은 원래 제외 항목이었으나 **2026-09-29 사용자 결정으로 해제**됐다(STEPS.md Step 5, 구현됨). 계획서에 없던 항목은 STEPS.md의 Step·Experiments에 적힌 범위까지만 한다.
-  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출에 **어떤 이미지를 실을지**는 별개의 축 `answerImageMode`(끔 / 업로드 이미지만 / 전체, Step 8 1차 · 자동 = 업로드 이미지만 + 보기 도구, Step 10)로 고른다. 답변 호출의 이미지는 어느 모드든 전체 한 장이다 — 타일 계열(타일 / 타일+전체 / 개요+확대)은 Step 8 나머지의 범위다.
+  - 타일은 **전사(OCR)와 bbox 호출에만** 적용한다. 답변(추론) 호출에 **어떤 이미지를 실을지**는 별개의 축 `answerImageMode`(끔 / 업로드 이미지만 / 전체, Step 8 1차 · 자동 = 업로드 이미지만 + 보기 도구, Step 10 · 자동에서 따로 보기 도구는 요청 옵션 `analyzeTool`, Step 10 2차)로 고른다. 답변 호출의 이미지와 따로 보기 호출의 이미지는 어느 모드든 전체 한 장이다 — 타일 계열(타일 / 타일+전체 / 개요+확대)은 Step 8 나머지의 범위다.
   - 타일 경계에서 잘린 대상을 하나로 잇는 것(분할 박스 병합)은 범위 밖이다 — 겹침 영역의 **중복**만 합친다.
 
 ### 3.3 구조 원칙
 - **단일 tool-calling 루프**만 둔다: 모델 호출 → tool_call 감지 → 실행 → 결과 재주입 → 반복. 프레임워크 금지.
-- **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다. 반대로 **그림을 읽어 답하는 것은 답변 모델 자신**이 한다(보기 도구 `view_page`, Step 10) — 해석을 다른 VLM 호출에 맡기지 않는다.
+- **bbox는 항상 분리된 별도 호출**(`inspect_visual`)로 받는다. 메인 답변과 한 번에 묶지 않는다. 그림을 읽어 답하는 길은 둘이고 **어느 쪽을 쓸지는 모델이 고른다**(Step 10): **같이 보기**(보기 도구 `view_page`)는 쪽 이미지를 답변 모델 자신의 다음 호출에 붙여 직접 보게 하고, **따로 보기**(`analyze_pages`, Step 10 2차)는 쪽마다 별도 VLM 호출로 모델이 넘긴 질문의 답 **글**을 받아 답변 모델이 종합한다(비교는 같이 보기, 쪽마다 독립이거나 후보가 많아 훑어야 하면 따로 보기, 따로 본 글로 애매하면 다시 같이 보기). 앱이 쪽을 골라 주거나 자동으로 훑지 않는다.
 - 통신은 **동기 HTTP**가 기본. 진행률이 필요할 때만 `StreamingResponse`로 **NDJSON 한 줄씩** 흘린다(`data:` 접두사·`text/event-stream` 쓰지 않음).
 - 모델 인터페이스는 하나: `analyze(messages, images=None, tools=None) -> ModelResponse`. 호출마다 달라지는 선택(`temperature`, `disable_thinking`, `max_tokens`, `reasoning_budget`, `on_reasoning`, `reasoning_effort`)은 키워드 인자로만 받는다. 서버↔모델 구간의 스트리밍(추론을 켠 로컬 호출만)은 provider 안에서 끝나고 호출 지점은 완성된 `ModelResponse`만 본다.
 - "페이지 이미지 준비"(`pipeline/images.py`, `pipeline/pdf.py`)와 "VLM에 보낼 이미지 목록 조립"(`assemble_model_images`)을 **분리 유지**한다 — 전체/타일 모드가 갈리는 곳은 `assemble_model_images` 한 곳이다.
@@ -114,7 +114,7 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 
 | 상수 | 값 | 의미 |
 |---|---|---|
-| `DEFAULT_ANSWER_IMAGE_MODE` | `uploads` | `off`(이미지 없음) / `uploads`(업로드 이미지만 — 계획서 §5.3·§5.4, Step 8 이전과 같은 동작) / `whole`(업로드 이미지 + PDF 모든 쪽) / `auto`(업로드 이미지만 + 보기 도구, Step 10) (`DOCCHAT_ANSWER_IMAGE_MODE`) |
+| `DEFAULT_ANSWER_IMAGE_MODE` | `uploads` | `off`(이미지 없음) / `uploads`(업로드 이미지만 — 계획서 §5.3·§5.4, Step 8 이전과 같은 동작) / `whole`(업로드 이미지 + PDF 모든 쪽) / `auto`(업로드 이미지만 + 보기 도구, Step 10 · 따로 보기 도구는 요청 옵션, Step 10 2차) (`DOCCHAT_ANSWER_IMAGE_MODE`) |
 | `MAX_MODEL_IMAGES` | 12 | 답변 호출 한 번에 싣는 이미지 수 상한. `whole`에서 넘치면 쪽 순서로 앞에서부터 |
 
 - 어떤 첨부를 실을지는 `evidence.attachment_context_for_prompt(answer_images=…)` **한 곳**에서 정한다. 아직 렌더하지 않은 PDF 쪽은 자리표시(`pending_page_image`)로 나오고 `chat_service._render_pending_pages`가 실을 것만 그려 첨부로 저장한다(bbox 도구의 즉석 렌더와 같은 `preprocess.render_page_attachment`).
@@ -132,8 +132,25 @@ vectra와 같은 값을 기본으로 두고 환경변수(`DOCCHAT_*`)로 덮어�
 - 보기 도구는 **한 번에 한 쪽**을 받고 모델 호출을 하지 않는다. 요청한 쪽은 `ToolContext.viewed`에 쌓이고, 루프가 **다음 답변 호출부터** `images` 뒤에 붙여 보낸다(`run_tool_loop(viewed_images=…)`). 이미지는 provider마다 **원래 질문(닻)** 에 붙으므로 그 질문 끝에 `[IMAGES ATTACHED TO THIS MESSAGE, in this order - …]` 한 줄을 호출마다 다시 만들어 붙인다(`prompts.attached_images_note`). `analyze()`는 바꾸지 않는다. 5단계 "첨부를 볼 수 없다" 재요청에도 같은 이미지를 보낸다.
 - 상한을 넘으면 그 요청은 실행하지 않고 "더 볼 수 없다, 지금 보는 쪽으로 답하라"를 돌려준다(`view_refusals`에 세어 `meta.viewedPages.refused`). 같은 쪽·이미 실린 업로드 이미지를 다시 요청하면 더하지 않고 자리만 알려 준다. 쪽을 하나씩 부르면 `MAX_TOOL_STEPS`(8)에 먼저 걸린다 — 한 응답에 여러 호출을 담을 수 있다고 도구 설명에 적어 두었다.
 - 이전 턴에서 본 쪽은 다음 턴에 자동으로 실리지 않는다(모델이 다시 요청하면 렌더해 둔 첨부를 다시 쓴다). 보기 도구로 그린 쪽은 bbox 도구처럼 첨부로 저장된다(`_resolve_visual_surface` 공유).
-- **판단 재료**: `auto`에서만 매니페스트에 `drawings on pages …`를 덧붙인다(`evidence.drawing_cue`). 재료는 `PageAnalysis.to_public()`(래스터 면적 비율 포함)을 PDF 첨부의 메타데이터 `pageAnalysis`에 남긴 것이고, 그게 없는 옛 첨부는 본문의 `[PAGE ANALYSIS]` 줄에서 읽는다(면적을 몰라 개수로 대신). 다른 모드의 매니페스트·시스템 프롬프트는 Step 8까지와 같아야 한다(실험 ①의 비교 기준 — `tests/test_view_tool.py`가 지킨다).
+- **판단 재료**: `auto`에서만 매니페스트에 **파일 검사 결과** 한 줄을 덧붙인다(`evidence.drawing_cue`, v2 2026-10-07): `file check (embedded images and vector strokes in the file, not a visual inspection): 37 of 53 pages contain them - …; 16 pages have none detected - …; pages 4, 37, 40, 51 have no text layer, so their text is only a transcription of the visible labels. What is drawn … is NOT in the text of any page`. 전부 스캔본이면 그렇게, 아무것도 안 잡혀도 "none detected - drawings stored in another way would not be detected"라고 적는다(검사는 파일 안의 이미지·선 명령을 **센** 것이라 보안 설정으로 글만 뽑히는 CAD PDF는 놓친다 — 그 한계도 사실로 보여 주고 전부 훑을지는 모델이 정한다). **도구를 가리키지 않는다**(도구 문단이 맡는다). v1("drawings on pages 4, 37, 40, 51 (transcription …); 1, 6-15 … (native text …) … call view_page")은 Qwen3.5가 앞 묶음만 그림 쪽으로 읽어 33쪽을 후보에서 빠뜨렸다(STEPS.md "매니페스트 v2"). 재료는 `PageAnalysis.to_public()`(래스터 면적 비율 포함)을 PDF 첨부의 메타데이터 `pageAnalysis`에 남긴 것이고, 그게 없는 옛 첨부는 본문의 `[PAGE ANALYSIS]` 줄에서 읽는다(면적을 몰라 개수로 대신). 다른 모드의 매니페스트·시스템 프롬프트는 Step 8까지와 같아야 한다(실험 ①의 비교 기준 — `tests/test_view_tool.py`가 지킨다).
 - 메타 `viewedPages{names, limit, refused}`는 `auto`에서만 적는다(한 쪽도 안 봤어도 — "안 봤다"도 결과다). 화면은 `그림 확인: a.pdf 2쪽, 3쪽` / `그림 확인 없음`.
+
+따로 보기(Step 10 2차) — `auto`에서 요청 옵션 `analyzeTool`(없으면 아래 기본값)이 켜져 있을 때만 `analyze_pages`를 더 내놓는다. 모드는 늘리지 않았다 — 끄면 1차의 자동 모드(같이 보기만)와 도구 목록·시스템 프롬프트가 같아야 한다(실험 ③의 비교 기준 — `tests/test_analyze_tool.py`가 문단 하나 차이로 지킨다).
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `ANALYZE_TOOL` | True | 요청에 `analyzeTool`이 없을 때 따로 보기 도구를 내놓을지 (`DOCCHAT_ANALYZE_TOOL`) |
+| `ANALYZE_PAGES_PER_CALL` | 10 | 한 호출이 받는 쪽 수(끊어 보기 단위). 넘치면 **앞에서부터 보고** 다음 범위를 알려 준다 (`DOCCHAT_ANALYZE_PAGES_PER_CALL`) |
+| `MAX_ANALYZED_PAGES` | 60 | 한 턴에 따로 보는 총 쪽 수 — **시간 상한**이다(쪽마다 호출이 실제로 돈다). `MAX_VIEWED_PAGES`(답변 호출의 입력 크기 상한)와 성격이 다르다. 전사 상한과 같은 선 (`DOCCHAT_MAX_ANALYZED_PAGES`) |
+| `ANALYZE_RANGE` | `free` | 따로 보기 한 호출의 범위를 누가 정하나 — `free`(모델이 넘긴 범위, 상한에 넘치면 앞에서부터) / `fixed`(모델이 무엇을 넘기든 **첫 쪽부터 한 호출 상한만큼 꽉 채움**, 그때 도구 정의의 `pages`는 "첫 쪽"). 요청 `analyzeRange`가 우선, 메타 `analyzedPages.range`. 어느 쪽이 나은지는 실험으로 (`DOCCHAT_ANALYZE_RANGE`) |
+| `ANALYZE_GROUP` / `ANALYZE_GROUP_MAX` | 1 / 10 | **묶음 보기**: 따로 보기 한 VLM 호출에 넣는 쪽 수 — `1`(쪽마다 독립) / `k`(k쪽을 한 호출에, 쪽별로 답) / `auto`(모델이 도구 인자 `group`으로 상한 안에서 고름). 요청 `analyzeGroup`이 우선(실험 조건), 메타 `analyzedPages.group`에 남는다. 숫자로 고정하면 `group` 인자를 내놓지 않는다 (`DOCCHAT_ANALYZE_GROUP`, `DOCCHAT_ANALYZE_GROUP_MAX`) |
+
+- 도구는 첨부 이름 · 쪽(`"7"` / `"1-10"` / `"2,5,7-9"`, 이미지 첨부·한 쪽짜리 PDF면 생략) · **질문**(결과를 가장 크게 좌우한다 — 도구 설명에 "구체적으로")을 받아, 쪽마다 `prompts.PAGE_ANALYSIS_SYSTEM_PROMPT`(옮겨 적기가 아니라 질문에 답하기, 보이는 것만, 없으면 없다고)로 **별도 호출**을 돌리고 `[page n] 답`으로 모아 **글만** 돌려준다. 답변 호출에 이미지는 붙지 않는다. 추론 끄기·출력 상한·추론 예산·수준은 **bbox 호출과 같은 축**(`grounding`), temperature 0, 동시 `OCR_CONCURRENCY`개, 트레이스에서는 도구 이벤트의 자식 "따로 보기 호출 · a.pdf · page n"(`TracedProvider._kind`의 `analysis`).
+- 묶음 호출(`group` > 1)은 전용 프롬프트(`PAGES_ANALYSIS_SYSTEM_PROMPT`)로 "몇 번째 이미지가 몇 쪽"을 적고 `[page n]` 표식으로 쪽별 답을 받는다(`tools.split_page_answers`). 표식이 빠지면 묶음 전체를 `[pages a-b]` 한 답으로 두고 그 쪽들이 나눠 갖는다. 호출 수가 1/k여도 시간이 1/k는 아니다(gemma3·Ollama 실측: 3쪽 묶음 8.0초 vs 쪽마다 동시 2개 4.1초) — 어느 쪽이 나은지는 실험으로.
+- **따로 보기가 실행되면 그 전에 보기 도구로 쌓인 쪽을 앱이 내린다**(`context.viewed.clear()`, `view_drops` → `meta.viewedPages.dropped`, 결과에 "Note: … detached … request them again" 한 줄). 같이 보기로 시작했다가 갈아탄 턴에서 10장이 뒤 호출 전부에 따라붙어 입력 49~61k·12장 상한을 잡아먹은 실측(2026-10-07) 때문이다. 그 뒤의 `view_page`는 다시 쌓이고(따로 훑고 → 같이 비교), 따로 보기→보기·보기→bbox·검색은 건드리지 않는다. 모델에게 내리라는 인자는 주지 않는다(사용자 결정).
+- 재시도는 없다(답의 모양을 검사할 기준이 없다). 상한에 닿은 호출은 읽은 데까지 남기고(추론일 수 있으면 버림, `ocr.cut_off_answer`를 전사와 공유), 추론 중단·쪽별 예외는 그 쪽의 글로 표시한다 — **다시 보내지 않는다**(Step 6-0). 전부 실패하면 도구 오류. 같은 턴·같은 쪽·같은 질문은 다시 묻지 않고(`ToolContext.analysis_cache`) 상한에도 세지 않는다. 턴 상한에 닿으면 남은 만큼만 보고 알려 주고, 0이면 실행하지 않고 거절한다(`analysis_refusals`).
+- 쪽을 고르는 것도, 같이 보기 / 따로 보기 / 끊어서 전부 훑기를 고르는 것도 **모델**이다. 시스템 프롬프트 문단(켰을 때만)의 핵심 두 문장: "좁혀지지 않거나 전체를 봐야 답이 되면 후보 일부로 단정하지 말고 끊어서 전부 훑어라", "따로 본 글만으로 애매하면 `view_page`로 그 쪽을 직접 보고 같이 판단하라". 전사 호출에 쪽 종류 판정을 섞지 않는다(사용자 결정). 업로드 이미지는 그대로 처음부터 실린다.
+- 메타 `analyzedPages{enabled, names, calls, limit, refused}`는 `auto`에서 항상 적는다(`enabled`가 실험 조건이다). `vision.analysisCalls`·`analysisLengthStops`·`analysisReasoningForced`·`analysisReasoningStops`. 화면은 `따로 보기: a.pdf 1-10쪽 (10쪽, 호출 1번)` / `따로 보기 없음` / `따로 보기 꺼짐`. `/api/health.analyze`.
 
 개발용 턴 트레이스(Step 7) — `DOCCHAT_DEBUG_TRACE=1`일 때만 기록한다(`config.debug_trace_enabled()`, 요청마다 읽는다).
 
@@ -223,7 +240,7 @@ app/
   chat_service.py    /api/chat 한 턴의 전체 흐름(전처리→OCR→증거 선택→루프→저장)
   pipeline/          geometry(크기 한도·타일 분할 계산) / pdf(판별·렌더·타일 렌더) / images(업로드 준비·타일 자르기·이미지 조립)
                      / preprocess(업로드 펼치기, 쪽 즉석 렌더) / ocr(전사·타일 전사 병합) / evidence(증거 예산·답변 호출 이미지 선택)
-  agent/             prompts / tools(bbox·보기·읽기·검색 도구) / grounding(bbox 파싱·타일 박스 병합) / loop(단일 tool-calling 루프, 본 쪽 싣기)
+  agent/             prompts / tools(bbox·보기·따로 보기·읽기·검색 도구) / grounding(bbox 파싱·타일 박스 병합) / loop(단일 tool-calling 루프, 본 쪽 싣기)
 static/              index.html, styles.css, js/app.js
 tests/               pytest (mock_openai.py = OpenAI 호환 mock 서버, pdf_factory.py = 합성 PDF·큰 도면)
 scripts/             make_samples.py(샘플 생성), e2e_check.py(실모델 점검), compare_tiling.py(전체 vs 타일 비교),

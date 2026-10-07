@@ -47,9 +47,9 @@ def upload(name: str) -> dict:
 
 
 def ask(client, text: str, files: list[str] | None = None, conversation_id: str = "", history: list[dict] | None = None,
-        mode: str = "", answer_images: str = "") -> dict:
+        mode: str = "", answer_images: str = "", analyze_tool: bool | None = None) -> dict:
     body = {**CONNECTION, "model": MODEL, "contextSize": 8192, "conversationId": conversation_id, "imageMode": mode,
-            "answerImageMode": answer_images,
+            "answerImageMode": answer_images, "analyzeTool": analyze_tool,
             "messages": [*(history or []), {"role": "user", "content": text}],
             "attachments": [upload(name) for name in files or []]}
     started = time.time()
@@ -330,6 +330,66 @@ def main() -> int:
             counts = [len(call["data"].get("images", [])) for call in answers]
             check("V5: 후속 턴의 첫 답변 호출에 이전 턴의 쪽이 실리지 않음", bool(counts) and counts[0] == 0,
                   f"답변 호출별 이미지 {counts} · 다시 요청 {'함' if viewed_of(follow) else '안 함'}({', '.join(viewed_of(follow))})")
+
+        # 11) 따로 보기 도구(Step 10 2차) — 자동 모드 + analyze_pages. 기준 P1~P5는 STEPS.md "Step 10 2차 실모델 확인 기준"에
+        #     결과를 보기 전에 고정했다. 쪽마다 독립인 질문 / 전부 훑어야 하는 질문은 따로 보기, 글로 충분한 질문은 아무 도구도
+        #     부르지 않아야 한다(음성 대조). 10)과 같은 조건의 1회 실행이라 비율은 "죽지 않았다"의 근거이지 효과 측정이 아니다.
+        print("\n── 11) 자동 모드 + 따로 보기 도구(analyze_pages)")
+        analyzed_of = lambda reply: ((reply.get("meta") or {}).get("analyzedPages") or {}).get("names", [])  # noqa: E731
+        per_page = [("mixed_3pages.pdf", "세 쪽 각각에 원이 그려져 있는지 쪽마다 하나씩 확인해서 알려 줘."),
+                    ("mixed_3pages.pdf", "원이 그려진 쪽은 몇 쪽이야? 모든 쪽을 확인한 뒤 답해 줘.")]
+        analyzed_turn: dict | None = None
+        used = 0
+        covered = 0
+        for name, question in per_page:
+            reply = ask(client, question, [name], answer_images="auto")
+            analyzed, viewed, bbox = analyzed_of(reply), viewed_of(reply), bool(reply.get("artifacts"))
+            used += bool(analyzed)
+            pages = {int(item.rsplit(" ", 1)[1]) for item in analyzed if " · page " in item}
+            covered += pages == {1, 2, 3}
+            if analyzed and analyzed_turn is None:
+                analyzed_turn = {"reply": reply, "question": question, "name": name}
+            print(f"   [쪽마다  ] 따로 보기 {'호출' if analyzed else '미호출'}({len(analyzed)}쪽) · 보기 {'호출' if viewed else '미호출'} · bbox {'호출' if bbox else '미호출'} "
+                  f"{reply['_seconds']:5.1f}s  {name} — {question}")
+            print(f"            ↳ {str(reply.get('text', reply.get('error', ''))).strip().splitlines()[0][:90] if reply.get('text') or reply.get('error') else ''}")
+        check("P1: 쪽마다 독립·전부 훑기 질문에서 따로 보기 호출 (기준 ≥1/2)", used >= 1, f"{used}/2")
+        check("P2: 따로 보기를 부른 턴이 PDF의 모든 쪽(1-3)을 덮음 (기준: 부른 턴 중 ≥1)", covered >= 1,
+              f"{covered}/{used} (부른 턴 기준)" if used else "따로 보기를 부른 턴이 없어 확인 불가")
+        # P3) 구조: 도구 이벤트 아래에 쪽 수만큼 자식 호출(kind=analysis)이 있고, 답변 호출에는 이미지가 실리지 않는다(보기 도구를 함께 부르지 않은 한)
+        if analyzed_turn is None:
+            check("P3: 따로 보기 호출이 쪽마다 자식 호출로 돌고 답변 호출에는 글만 감", False, "P1에서 따로 보기를 부른 턴이 없어 확인 불가")
+        else:
+            document = trace_of(client, analyzed_turn["reply"])
+            events = (document or {}).get("events", [])
+            tools = [event for event in events if event["kind"] == "tool" and event["data"].get("name") == "analyze_pages"]
+            looks = model_events(document, "analysis") if document else []
+            nested = all(any(look["parent"] == tool["id"] for tool in tools) for look in looks)
+            answers = model_events(document, "answer") if document else []
+            counts = [len(call["data"].get("images", [])) for call in answers]
+            expected_images = 0 if not viewed_of(analyzed_turn["reply"]) else None
+            check("P3: 따로 보기 호출이 쪽마다 자식 호출로 돌고 답변 호출에는 글만 감",
+                  bool(tools) and len(looks) == len(analyzed_of(analyzed_turn["reply"])) and nested
+                  and (expected_images is None or max(counts) == 0),
+                  f"도구 {len(tools)}건 · 쪽 호출 {len(looks)}건 · 답변 호출별 이미지 {counts}")
+        # P4) 끈 조건(실경로): 같은 질문에 analyzeTool=false → 도구 목록·시스템 프롬프트에 따로 보기가 없고 메타에 꺼짐으로 적힌다
+        reply = ask(client, per_page[0][1], [per_page[0][0]], answer_images="auto", analyze_tool=False)
+        document = trace_of(client, reply)
+        evidence = next((event for event in (document or {}).get("events", []) if event["label"] == "증거 조립"), None)
+        offered = evidence is not None and "analyze_pages" in (evidence["data"].get("tools") or [])
+        mentioned = evidence is not None and "analyze_pages" in str(evidence["data"].get("systemPrompt") or "")
+        enabled = ((reply.get("meta") or {}).get("analyzedPages") or {}).get("enabled")
+        check("P4: analyzeTool=false면 도구 목록·시스템 프롬프트에 따로 보기가 없음(1차의 자동 모드)",
+              evidence is not None and not offered and not mentioned and enabled is False,
+              f"도구 {evidence['data'].get('tools') if evidence else None} · 메타 enabled={enabled}")
+        # P5) 음성 대조: 글로 충분한 질문(10)의 V2 세트)에서 따로 보기도 보기도 bbox도 부르지 않는다
+        wrong = 0
+        for name, question in text_enough:
+            reply = ask(client, question, [name], answer_images="auto")
+            analyzed, viewed, bbox = analyzed_of(reply), viewed_of(reply), bool(reply.get("artifacts"))
+            wrong += bool(analyzed or viewed or bbox)
+            print(f"   [글로충분] 따로 보기 {'호출' if analyzed else '미호출'} · 보기 {'호출' if viewed else '미호출'} · bbox {'호출' if bbox else '미호출'} "
+                  f"{reply['_seconds']:5.1f}s  {name} — {question}")
+        check("P5: 글로 충분 질문에서 어느 도구도 부르지 않음 (기준 오호출 ≤1/3)", wrong <= 1, f"오호출 {wrong}/3")
 
     failed = [name for name, passed, _ in results if not passed]
     print(f"\n결과: {len(results) - len(failed)}/{len(results)} 통과" + (f" · 실패: {', '.join(failed)}" if failed else ""))

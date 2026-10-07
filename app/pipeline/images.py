@@ -87,19 +87,23 @@ class VisionUsage:
     ocr_calls: int = 0
     grounding_calls: int = 0
     answer_calls: int = 0
+    analysis_calls: int = 0        # 따로 보기 도구(Step 10 2차)가 쪽마다 보낸 호출 수
     tiled_images: int = 0          # 타일로 나눠 보낸 쪽·이미지 수
     tiles: int = 0                 # 모델에 보낸 타일 수
     blank_tiles: int = 0           # 내용이 없어 건너뛴 타일 수
     # 출력 상한에 닿아 끊긴 호출 수(Step 6-0). 이런 호출은 다시 보내지 않는다.
     ocr_length_stops: int = 0
     grounding_length_stops: int = 0
+    analysis_length_stops: int = 0
     # 추론 제어(Step 6): 추론을 끊고 답으로 넘긴 호출 수(소프트)와 그래도 답을 받지 못해 중단한 호출 수(하드), 호출 종류별.
     answer_reasoning_forced: int = 0
     grounding_reasoning_forced: int = 0
     ocr_reasoning_forced: int = 0
+    analysis_reasoning_forced: int = 0
     answer_reasoning_stops: int = 0
     grounding_reasoning_stops: int = 0
     ocr_reasoning_stops: int = 0
+    analysis_reasoning_stops: int = 0
     reasoning_tokens: int = 0      # 이 턴의 모든 호출이 쓴 추론 토큰 합계(스트리밍으로 센 근사값)
     # 조치가 있었던 호출의 목록: {"kind", "image"(타일이면 타일 이름), "reason"(budget|repeat), "stopped"(하드면 True)}
     # — 화면이 "어느 타일이 왜 끊겼는지"를 보여 주는 데 쓴다. 모델에게는 넘기지 않는다.
@@ -113,7 +117,7 @@ class VisionUsage:
             self.blank_tiles += grid.blank
 
     def count_reasoning(self, kind: str, response: Any, image: str = "") -> None:
-        """호출 하나의 추론 토큰과 조치를 더한다(kind: answer | grounding | ocr, image: 그 호출의 이미지·타일 이름)."""
+        """호출 하나의 추론 토큰과 조치를 더한다(kind: answer | grounding | ocr | analysis, image: 그 호출의 이미지·타일 이름)."""
         self.reasoning_tokens += int(getattr(response, "reasoning_tokens", None) or 0)
         forced, runaway = getattr(response, "forced", ""), getattr(response, "runaway", "")
         if forced:
@@ -126,11 +130,14 @@ class VisionUsage:
 
     def to_public(self) -> dict[str, int]:
         return {"ocrCalls": self.ocr_calls, "groundingCalls": self.grounding_calls, "answerCalls": self.answer_calls,
+                "analysisCalls": self.analysis_calls,
                 "tiledImages": self.tiled_images, "tiles": self.tiles, "blankTiles": self.blank_tiles,
                 "ocrLengthStops": self.ocr_length_stops, "groundingLengthStops": self.grounding_length_stops,
+                "analysisLengthStops": self.analysis_length_stops,
                 "answerReasoningForced": self.answer_reasoning_forced, "groundingReasoningForced": self.grounding_reasoning_forced,
-                "ocrReasoningForced": self.ocr_reasoning_forced, "answerReasoningStops": self.answer_reasoning_stops,
-                "groundingReasoningStops": self.grounding_reasoning_stops, "ocrReasoningStops": self.ocr_reasoning_stops,
+                "ocrReasoningForced": self.ocr_reasoning_forced, "analysisReasoningForced": self.analysis_reasoning_forced,
+                "answerReasoningStops": self.answer_reasoning_stops, "groundingReasoningStops": self.grounding_reasoning_stops,
+                "ocrReasoningStops": self.ocr_reasoning_stops, "analysisReasoningStops": self.analysis_reasoning_stops,
                 "reasoningTokens": self.reasoning_tokens}
 
 

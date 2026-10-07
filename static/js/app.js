@@ -49,6 +49,13 @@
     serverAnswerImageMode: 'uploads',
     maxModelImages: 12,                      // 답변 호출 한 번에 싣는 이미지 수 상한(/api/health)
     maxViewedPages: 12,                      // 자동 모드에서 보기 도구로 한 턴에 모을 수 있는 쪽 수(/api/health, Step 10)
+    // 따로 보기 도구(Step 10 2차, 자동 모드에서만): 'true' | 'false' | ''(고른 적 없음 → 서버 기본값). 상한은 /api/health
+    analyzeTool: store.get('analyzeTool', ''),
+    // 묶음 보기: 따로 보기 한 VLM 호출에 넣는 쪽 수. '1' | '2' … | 'auto' | ''(고른 적 없음 → 서버 기본값). 실험 조건이라 메타에도 남는다
+    analyzeGroup: store.get('analyzeGroup', ''),
+    // 범위 고정: 'free' | 'fixed' | ''(고른 적 없음 → 서버 기본값). 실험 조건이라 메타에도 남는다
+    analyzeRange: store.get('analyzeRange', ''),
+    serverAnalyze: { enabled: true, pagesPerCall: 10, maxPages: 60, group: 1, groupMax: 10, range: 'free' },
     // 호출 종류별 추론 끄기. 'true' | 'false' | ''(고른 적 없음 → 서버 기본값)
     disableThinkingGrounding: store.get('disableThinkingGrounding', ''),
     disableThinkingOcr: store.get('disableThinkingOcr', ''),
@@ -72,7 +79,7 @@
     'settingsDialog', 'providerSelect', 'baseUrlField', 'baseUrl', 'apiKey', 'apiKeyLabel', 'modelName', 'modelOptions',
     'contextField', 'contextSize', 'disableThinking', 'callThinking', 'disableThinkingGrounding', 'disableThinkingOcr', 'callThinkingHelp',
     'effortField', 'effortAnswer', 'effortGrounding', 'effortOcr', 'effortHelp',
-    'imageMode', 'imageModeHelp', 'answerImageMode', 'answerImageHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
+    'imageMode', 'imageModeHelp', 'answerImageMode', 'answerImageHelp', 'analyzeTool', 'analyzeGroup', 'analyzeRange', 'analyzeHelp', 'traceHelp', 'settingsTest', 'testDot', 'testText', 'saveSettings',
     'traceDialog', 'traceStatus', 'traceRefresh', 'traceFoldAll', 'traceUnfoldAll', 'traceDownload', 'traceClose', 'traceSummary', 'traceBody'
   ].map((id) => [id, $(id)]));
 
@@ -229,7 +236,8 @@
   function persistSettings() {
     store.set('provider', state.provider); store.set('baseUrl', state.baseUrl);
     store.set('model', state.model); store.set('contextSize', state.contextSize); store.set('disableThinking', state.disableThinking);
-    store.set('imageMode', state.imageMode); store.set('answerImageMode', state.answerImageMode);
+    store.set('imageMode', state.imageMode); store.set('answerImageMode', state.answerImageMode); store.set('analyzeTool', state.analyzeTool);
+    store.set('analyzeGroup', state.analyzeGroup); store.set('analyzeRange', state.analyzeRange);
     store.set('disableThinkingGrounding', state.disableThinkingGrounding); store.set('disableThinkingOcr', state.disableThinkingOcr);
   }
 
@@ -237,6 +245,12 @@
   const imageMode = () => state.imageMode || state.serverImageMode;
   // 요청에 실을 답변 호출 이미지 모드(Step 8). 고른 적이 없으면 서버 기본값.
   const answerImageMode = () => state.answerImageMode || state.serverAnswerImageMode;
+  // 요청에 실을 따로 보기 도구 켬/끔(Step 10 2차, 자동 모드에서만 의미). 고른 적이 없으면 서버 기본값.
+  const analyzeTool = () => state.analyzeTool === '' ? state.serverAnalyze.enabled !== false : state.analyzeTool === 'true';
+  // 요청에 실을 묶음 크기. 고른 적이 없으면 서버 기본값(요청에는 null → 서버가 기본값을 쓴다).
+  const analyzeGroup = () => state.analyzeGroup || null;
+  // 요청에 실을 범위 방식. 고른 적이 없으면 ''(서버 기본값).
+  const analyzeRange = () => state.analyzeRange;
   // 요청에 실을 호출별 추론 끄기(kind: 'disableThinkingGrounding' | 'disableThinkingOcr'). 고른 적이 없으면 서버 기본값.
   const callThinkingOff = (kind) => state[kind] === '' ? state.serverVision[kind] !== false : state[kind] === 'true';
   // 추론 수준(Step 6 2차)은 **모델 이름별로** 저장한다 — 값이 모델마다 달라서(Qwen3.8의 xhigh를 다른 모델에 보내면 거절될 수 있다)
@@ -253,11 +267,20 @@
       if (ANSWER_IMAGE_LABELS[health.answerImageMode]) state.serverAnswerImageMode = health.answerImageMode;
       if (Number(health.maxModelImages) > 0) state.maxModelImages = Number(health.maxModelImages);
       if (Number(health.view?.maxViewedPages) > 0) state.maxViewedPages = Number(health.view.maxViewedPages);
+      if (health.analyze) state.serverAnalyze = { ...state.serverAnalyze, ...health.analyze };
       if (health.vision) state.serverVision = { ...state.serverVision, ...health.vision };
       state.serverReasoning = health.reasoning || null;
       if (health.reasoningEffort) state.serverReasoningEffort = { ...state.serverReasoningEffort, ...health.reasoningEffort };
       state.serverDebugTrace = health.debugTrace === true;
     } catch { /* 기본값(전체)으로 둔다 */ }
+  }
+
+  // 따로 보기 도구는 답변 이미지 "자동"에서만 쓰인다 → 다른 모드를 고르면 고른 값은 그대로 두고 잠가서 보여 준다.
+  function syncAnalyzeTool() {
+    const off = els.answerImageMode.value !== 'auto';
+    els.analyzeTool.disabled = off;
+    els.analyzeGroup.disabled = off || !els.analyzeTool.checked;
+    els.analyzeRange.disabled = off || !els.analyzeTool.checked;
   }
 
   // "추론 끄기"(모든 호출)가 켜져 있으면 호출별 선택은 적용되지 않는다 → 고른 값은 그대로 두고 잠가서 보여 준다.
@@ -344,6 +367,20 @@
       + `한 번에 최대 ${state.maxModelImages}장(.env의 DOCCHAT_MAX_MODEL_IMAGES), 넘치면 쪽 순서로 앞에서부터. `
       + `"자동"은 업로드 이미지만 싣고 시작하되, 모델이 답하려면 그림을 봐야 한다고 판단한 쪽을 보기 도구로 한 장씩 요청해 그 턴 안에서 모아 봅니다(최대 ${state.maxViewedPages}장, .env의 DOCCHAT_MAX_VIEWED_PAGES). `
       + '위치 확인(bbox) 도구는 어느 방식이든 "표시해줘·시각화해줘"처럼 보여 달라고 할 때만 씁니다. 요청마다 적용되므로 같은 질문을 방식별로 비교할 수 있습니다.';
+    els.analyzeTool.checked = analyzeTool();
+    els.analyzeGroup.value = state.analyzeGroup;
+    els.analyzeRange.value = state.analyzeRange;
+    const serverGroup = state.serverAnalyze.group === 'auto' ? '자동(모델이 고름)' : `${state.serverAnalyze.group}쪽씩`;
+    const serverRange = state.serverAnalyze.range === 'fixed' ? '고정' : '모델이 정함';
+    els.analyzeHelp.textContent = '"자동"에서 보기 도구(같이 보기: 요청한 쪽을 모아 답변 모델이 직접 본다)에 더해 따로 보기 도구를 내놓습니다. '
+      + '따로 보기는 쪽(하나 또는 "1-10" 같은 범위)마다 비전 모델을 따로 불러 모델이 넘긴 질문에 답하게 하고 그 글만 답변 호출에 돌려줍니다 — 쪽마다 독립인 질문이나 후보가 많아 전부 훑어야 하는 질문용이고, 어느 쪽을 쓸지는 모델이 고릅니다. '
+      + `한 호출에 최대 ${state.serverAnalyze.pagesPerCall}쪽(넘치면 다음 범위로 다시 부름), 한 턴에 최대 ${state.serverAnalyze.maxPages}쪽(.env의 DOCCHAT_ANALYZE_PAGES_PER_CALL · DOCCHAT_MAX_ANALYZED_PAGES). `
+      + '끄면 1차의 자동 모드(같이 보기만)와 같아 실험에서 비교 기준이 됩니다. 추론 끄기·출력 상한·추론 수준은 위치 확인(bbox) 호출의 설정을 따릅니다. '
+      + `묶음은 한 VLM 호출에 넣는 쪽 수입니다: 1쪽씩이면 쪽마다 독립이고, k쪽씩이면 k장을 한 호출에 넣어 쪽별로 답하게 합니다(호출 수는 1/k, 묶음 안에서 쪽을 잘못 매길 위험은 실험으로). `
+      + `"자동"이면 모델이 상한(${state.serverAnalyze.groupMax}쪽) 안에서 고릅니다. 서버 기본값은 ${serverGroup}(.env의 DOCCHAT_ANALYZE_GROUP · DOCCHAT_ANALYZE_GROUP_MAX). `
+      + `범위는 한 호출이 보는 쪽 범위를 누가 정하느냐입니다: "모델이 정함"은 모델이 넘긴 범위 그대로(조각내 부르면 호출이 늘 수 있음), "고정"은 모델이 무엇을 넘기든 첫 쪽부터 ${state.serverAnalyze.pagesPerCall}쪽을 꽉 채워 봅니다. 서버 기본값은 ${serverRange}(.env의 DOCCHAT_ANALYZE_RANGE). `
+      + '보기 도구로 쪽을 붙여 둔 채 따로 보기를 부르면 그 쪽들은 내려갑니다(다시 붙이려면 다시 요청). 어떤 값으로 돌았는지는 답변 아래에 남습니다.';
+    syncAnalyzeTool();
     els.traceHelp.textContent = state.serverDebugTrace
       ? '턴 과정 기록(개발용)이 켜져 있습니다. 답변마다 "과정 보기"로 전처리·전사·모델 호출·도구 실행을 시간순으로 볼 수 있습니다(.env의 DOCCHAT_DEBUG_TRACE).'
       : '턴 과정 기록(개발용)은 꺼져 있습니다. 켜려면 .env에 DOCCHAT_DEBUG_TRACE=1을 적고 서버를 다시 띄우세요.';
@@ -400,6 +437,9 @@
     state.disableThinkingOcr = String(els.disableThinkingOcr.checked);
     state.imageMode = IMAGE_MODE_LABELS[els.imageMode.value] ? els.imageMode.value : '';
     state.answerImageMode = ANSWER_IMAGE_LABELS[els.answerImageMode.value] ? els.answerImageMode.value : '';
+    state.analyzeTool = String(els.analyzeTool.checked);
+    state.analyzeGroup = ['', '1', '2', '3', '5', '10', 'auto'].includes(els.analyzeGroup.value) ? els.analyzeGroup.value : '';
+    state.analyzeRange = ['', 'free', 'fixed'].includes(els.analyzeRange.value) ? els.analyzeRange.value : '';
     store.setKey(form.provider, form.apiKey);
     persistSettings();
     els.settingsDialog.close();
@@ -449,7 +489,7 @@
           if (report.truncated) item.status += ` (앞 ${report.processedPages}쪽만 검사)`;
           // 답변 호출 이미지 "전체"(Step 8)면 글자가 충분한 쪽도 이미지로 실린다. "자동"(Step 10)은 모델이 필요할 때 요청한다.
           if (answerImageMode() === 'whole') item.status += ` · 답변 호출에 쪽 이미지 포함(최대 ${state.maxModelImages}장)`;
-          if (answerImageMode() === 'auto') item.status += ` · 쪽 그림은 모델이 필요할 때 요청(한 턴에 최대 ${state.maxViewedPages}장)`;
+          if (answerImageMode() === 'auto') item.status += ` · 쪽 그림은 모델이 필요할 때 요청(한 턴에 최대 ${state.maxViewedPages}장` + (analyzeTool() ? `, 따로 보기 ${state.serverAnalyze.maxPages}쪽)` : ', 따로 보기 꺼짐)');
         } else {
           item.status = report.resized ? `${report.sourceWidth}×${report.sourceHeight} → ${report.width}×${report.height}로 축소해 전달` : `${report.width}×${report.height} 원본 그대로 전달`;
           if (answerImageMode() === 'off') item.status += ' · 답변 호출에는 싣지 않음(끔)';
@@ -497,7 +537,7 @@
       const final = await streamChat({
         ...connection(), model: state.model, contextSize: state.contextSize, disableThinking: state.disableThinking,
         disableThinkingGrounding: callThinkingOff('disableThinkingGrounding'), disableThinkingOcr: callThinkingOff('disableThinkingOcr'),
-        imageMode: imageMode(), answerImageMode: answerImageMode(), conversationId: state.currentId, stream: true,
+        imageMode: imageMode(), answerImageMode: answerImageMode(), analyzeTool: analyzeTool(), analyzeGroup: analyzeGroup(), analyzeRange: analyzeRange(), conversationId: state.currentId, stream: true,
         // 추론 수준(Step 6 2차): 이 모델로 고른 값. 고른 적이 없으면 null → 서버 기본값. 추론을 켠 호출에만 실린다.
         reasoningEffortAnswer: storedEffort('answer'), reasoningEffortGrounding: storedEffort('grounding'), reasoningEffortOcr: storedEffort('ocr'),
         // meta(답변을 어떤 방식으로 처리했는지)도 되돌려 보내야 서버가 대화를 다시 저장할 때 지워지지 않는다.
@@ -653,6 +693,39 @@
     const names = info.names || [];
     let text = names.length ? `그림 확인: ${names.length <= 6 ? names.map(pageLabel).join(', ') : `${names.length}장 (${names.slice(0, 3).map(pageLabel).join(', ')} …)`}` : '그림 확인 없음';
     if (info.refused) text += ` · 상한 ${info.limit}장에 걸려 ${info.refused}번 보지 못함`;
+    if (info.dropped) text += ` · 따로 보기로 넘어가며 내린 쪽 ${info.dropped}`;
+    return text;
+  }
+
+  // 따로 보기 도구(Step 10 2차, 자동 모드)로 쪽마다 따로 본 쪽: "따로 보기: spec.pdf 1-10쪽 (호출 2번)" / "따로 보기 없음" / 꺼져 있으면 "따로 보기 꺼짐".
+  const pageRanges = (pages) => {
+    const sorted = [...new Set(pages)].sort((a, b) => a - b);
+    const parts = [];
+    for (let i = 0; i < sorted.length;) {
+      let j = i;
+      while (j + 1 < sorted.length && sorted[j + 1] === sorted[j] + 1) j++;
+      parts.push(j > i ? `${sorted[i]}-${sorted[j]}` : String(sorted[i]));
+      i = j + 1;
+    }
+    return parts.join(', ');
+  };
+  function summarizePages(names) {
+    const groups = new Map();
+    for (const name of names) {
+      const match = /^(.*) · page (\d+)$/.exec(String(name || ''));
+      const key = match ? match[1] : String(name || '');
+      if (!groups.has(key)) groups.set(key, []);
+      if (match) groups.get(key).push(Number(match[2]));
+    }
+    return [...groups].map(([root, pages]) => (pages.length ? `${root} ${pageRanges(pages)}쪽` : root)).join(', ');
+  }
+  function describeAnalyzedPages(info) {
+    if (!info.enabled) return '따로 보기 꺼짐';
+    const names = info.names || [];
+    const group = info.group === 'auto' ? '묶음 자동' : (Number(info.group) > 1 ? `${info.group}쪽씩` : '');
+    const mode = [group, info.range === 'fixed' ? '범위 고정' : ''].filter(Boolean).join(', ');
+    let text = names.length ? `따로 보기: ${summarizePages(names)} (${names.length}쪽, 호출 ${info.calls || 0}번${mode ? `, ${mode}` : ''})` : `따로 보기 없음${mode ? ` (${mode})` : ''}`;
+    if (info.refused) text += ` · 상한 ${info.limit}쪽에 걸려 ${info.refused}번 보지 못함`;
     return text;
   }
 
@@ -660,25 +733,28 @@
   function describeProcessing(meta) {
     if (!meta || !IMAGE_MODE_LABELS[meta.imageMode]) return '';
     const vision = meta.vision || {};
-    const calls = (vision.ocrCalls || 0) + (vision.groundingCalls || 0);
+    const calls = (vision.ocrCalls || 0) + (vision.groundingCalls || 0) + (vision.analysisCalls || 0);
     const answerImages = meta.answerImages || null;
     // 기본이 아닌 모드(끔·전체·자동)를 골랐으면 이미지가 없어도 적는다 — 방식을 바꿔 가며 비교할 때 어느 답이 어느 모드였는지 보이게.
     const showAnswerImages = !!answerImages && (answerImages.sent > 0 || answerImages.candidates > 0 || (!!meta.answerImageMode && meta.answerImageMode !== 'uploads'));
     const viewed = meta.viewedPages && Array.isArray(meta.viewedPages.names) ? meta.viewedPages : null;
+    const analyzed = meta.analyzedPages && typeof meta.analyzedPages.enabled === 'boolean' ? meta.analyzedPages : null;
     // 추론 제어(Step 6)의 조치가 있었으면 일반 대화 답변에도 적는다.
     const answerActions = (vision.answerReasoningForced || 0) + (vision.answerReasoningStops || 0);
     // 추론 수준(Step 6 2차): 호출 종류별로 실어 보낸 값. 답변 호출에 실었으면 일반 대화 답변에도 적는다(수준별 비교용).
     const effort = meta.reasoningEffort || {};
-    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !viewed && !answerActions && !vision.reasoningTokens && !effort.answer) return '';
+    if (meta.imageMode !== 'tile' && !calls && !showAnswerImages && !viewed && !analyzed && !answerActions && !vision.reasoningTokens && !effort.answer) return '';
     const parts = [`이미지 처리: ${IMAGE_MODE_LABELS[meta.imageMode]}`];
     if (showAnswerImages) parts.push(describeAnswerImages(meta.answerImageMode, answerImages));
     if (viewed) parts.push(describeViewedPages(viewed));
+    if (analyzed) parts.push(describeAnalyzedPages(analyzed));
     if (vision.tiles) parts.push(`타일 ${vision.tiles}장${vision.blankTiles ? ` (빈 타일 ${vision.blankTiles}장 제외)` : ''}`);
     // 호출 종류별로 추론을 끄고 보냈는지, 출력 상한에 닿아 끊긴 호출이 있었는지(끊긴 호출은 다시 보내지 않는다),
-    // 추론을 끊고 답으로 넘기거나(소프트) 끝내 중단한(하드) 호출이 있었는지(Step 6)
-    const detail = (kind, stops, forced, runaways) => {
+    // 추론을 끊고 답으로 넘기거나(소프트) 끝내 중단한(하드) 호출이 있었는지(Step 6).
+    // thinkingKind: 추론 끄기 설정을 어느 호출 종류에서 읽을지 — 따로 보기 호출은 위치 확인(bbox)의 설정을 따른다.
+    const detail = (kind, stops, forced, runaways, thinkingKind = kind) => {
       const notes = [];
-      const off = meta.thinkingDisabled?.[kind];
+      const off = meta.thinkingDisabled?.[thinkingKind];
       if (typeof off === 'boolean') notes.push(off ? '추론 끔' : '추론 끄지 않음');
       if (effort[kind]) notes.push(`추론 수준 ${effort[kind]}`);
       if (stops) notes.push(`출력 상한${meta.visionMaxTokens ? ` ${Number(meta.visionMaxTokens).toLocaleString()}토큰` : ''} 도달 ${stops}회`);
@@ -689,7 +765,8 @@
     if (answerActions || effort.answer) parts.push(`답변 호출 ${vision.answerCalls || 0}회${detail('answer', 0, vision.answerReasoningForced, vision.answerReasoningStops)}`);
     if (vision.ocrCalls) parts.push(`전사 호출 ${vision.ocrCalls}회${detail('ocr', vision.ocrLengthStops, vision.ocrReasoningForced, vision.ocrReasoningStops)}`);
     if (vision.groundingCalls) parts.push(`위치 확인 호출 ${vision.groundingCalls}회${detail('grounding', vision.groundingLengthStops, vision.groundingReasoningForced, vision.groundingReasoningStops)}`);
-    if (!calls) parts.push('이번 턴에는 전사·위치 확인 호출 없음');
+    if (vision.analysisCalls) parts.push(`따로 보기 호출 ${vision.analysisCalls}회${detail('analysis', vision.analysisLengthStops, vision.analysisReasoningForced, vision.analysisReasoningStops, 'grounding')}`);
+    if (!calls) parts.push('이번 턴에는 전사·위치 확인·따로 보기 호출 없음');
     if (vision.reasoningTokens) parts.push(`추론 ${Number(vision.reasoningTokens).toLocaleString()}토큰`);
     if (typeof meta.elapsedMs === 'number') parts.push(`${(meta.elapsedMs / 1000).toFixed(1)}초`);
     return parts.join(' · ');
@@ -1160,6 +1237,8 @@
   // 호출별 추론 끄기를 바꾸면 그 호출의 추론 수준 칸이 잠기거나 풀린다. 모델 이름을 바꾸면 그 모델에 저장된 수준을 보여 준다.
   els.disableThinkingGrounding.addEventListener('change', syncCallThinking);
   els.disableThinkingOcr.addEventListener('change', syncCallThinking);
+  els.answerImageMode.addEventListener('change', syncAnalyzeTool);
+  els.analyzeTool.addEventListener('change', syncAnalyzeTool);
   els.modelName.addEventListener('change', () => fillEffortInputs(els.modelName.value.trim()));
   els.settingsTest.addEventListener('click', () => void testFromSettings());
   els.saveSettings.addEventListener('click', saveSettings);

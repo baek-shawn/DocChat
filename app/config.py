@@ -254,6 +254,90 @@ def view_settings() -> dict[str, float | int]:
             "drawingMinVectorOperations": DRAWING_MIN_VECTOR_OPERATIONS}
 
 
+# 따로 보기 도구(`analyze_pages`, Step 10 2차) — 보기 도구와 달리 쪽마다 **별도 VLM 호출**을 돌려 글을 받는다.
+# 자동 모드에서만, 요청 옵션(`analyzeTool`)으로 끄고 켤 수 있다(실험에서 "같이 보기만" / "따로 보기 포함"을 가르기 위해).
+# 상한 둘은 이유가 다르다: 한 호출에 받는 쪽 수는 "끊어 보기" 단위이고, 한 턴의 총 쪽 수는 **시간 상한**이다(쪽마다 호출이
+# 실제로 돈다). 전체를 훑어야 하는 질문이 있으므로 총 쪽 수는 전처리 전사 상한(DEFAULT_PDF_VISUAL_PAGES)과 같은 선에 둔다.
+ANALYZE_TOOL = _switch("DOCCHAT_ANALYZE_TOOL", True)
+ANALYZE_PAGES_PER_CALL = _int("DOCCHAT_ANALYZE_PAGES_PER_CALL", 10, low=1, high=200)
+MAX_ANALYZED_PAGES = _int("DOCCHAT_MAX_ANALYZED_PAGES", 60, low=1, high=1000)
+
+
+def answer_mode_offers_analyze_tool(mode: str, requested: bool | None = None) -> bool:
+    """이 턴에 따로 보기 도구를 내놓는가 — 자동 모드이고 요청(없으면 서버 기본값)이 켜져 있을 때."""
+    return answer_mode_offers_view_tool(mode) and resolve_switch(requested, ANALYZE_TOOL)
+
+
+# 묶음 보기(Step 10 2차, 2026-10-07 사용자 요청): 따로 보기의 **한 VLM 호출에 넣는 쪽 수**.
+#   1      = 쪽마다 독립(2차 설계 그대로)
+#   k      = k쪽 이미지를 한 호출에 넣고 쪽별로 답하게 한다(호출 수 1/k, 묶음 안에서 쪽을 잘못 매길 위험은 실측)
+#   "auto" = 모델이 도구 인자 `group`으로 상한(ANALYZE_GROUP_MAX) 안에서 고른다. 숫자로 고정하면 그 인자는 내놓지 않는다
+# 실험 조건을 고정해야 하므로 요청마다 고를 수 있고(`analyzeGroup`), 답변 메타에 어떤 값으로 돌았는지 남긴다.
+ANALYZE_GROUP_AUTO = "auto"
+ANALYZE_GROUP_MAX = _int("DOCCHAT_ANALYZE_GROUP_MAX", 10, low=1, high=50)
+
+
+def normalize_analyze_group(value: object) -> str | int:
+    """`"auto"` 또는 1 이상의 정수(상한으로 자른다). 모르는 값이면 ValueError."""
+    if isinstance(value, bool):
+        raise ValueError(value)
+    if isinstance(value, (int, float)):
+        number = int(value)
+    else:
+        text = str(value or "").strip().lower()
+        if text == ANALYZE_GROUP_AUTO:
+            return ANALYZE_GROUP_AUTO
+        if not text.isdigit():
+            raise ValueError(value)
+        number = int(text)
+    if number < 1:
+        raise ValueError(value)
+    return min(number, ANALYZE_GROUP_MAX)
+
+
+def _analyze_group_default() -> str | int:
+    raw = os.environ.get("DOCCHAT_ANALYZE_GROUP", "")
+    try:
+        return normalize_analyze_group(raw) if str(raw).strip() else 1
+    except ValueError:
+        return 1
+
+
+ANALYZE_GROUP = _analyze_group_default()
+
+
+def resolve_analyze_group(requested: object) -> str | int:
+    """요청 값이 비어 있으면 서버 기본값. 모르는 값이면 ValueError(호출부가 사용자 오류로 바꾼다)."""
+    if requested is None or (isinstance(requested, str) and not requested.strip()):
+        return ANALYZE_GROUP
+    return normalize_analyze_group(requested)
+
+
+# 범위 고정(Step 10 2차, 2026-10-07 사용자 결정): 따로 보기 한 호출이 보는 쪽 범위를 누가 정하나.
+#   free  = 모델이 넘긴 범위 그대로(상한에 넘치면 앞에서부터) — 기본. 모델이 잡힌 쪽 목록대로 조각내 부르면 스텝이 는다
+#   fixed = 모델이 무엇을 넘기든 **첫 쪽부터 한 호출 상한(ANALYZE_PAGES_PER_CALL)만큼 꽉 채워** 본다(Claude가 PDF를 읽는 방식)
+# 어느 쪽이 나은지는 실험으로 정한다 → 요청마다 고를 수 있고(`analyzeRange`), 메타에 남긴다.
+ANALYZE_RANGE_MODES = ("free", "fixed")
+_configured_range = str(os.environ.get("DOCCHAT_ANALYZE_RANGE") or "").strip().lower()
+ANALYZE_RANGE = _configured_range if _configured_range in ANALYZE_RANGE_MODES else "free"
+
+
+def resolve_analyze_range(requested: str | None) -> str:
+    """요청 값이 비어 있으면 서버 기본값. 모르는 값이면 ValueError(호출부가 사용자 오류로 바꾼다)."""
+    value = str(requested or "").strip().lower()
+    if not value:
+        return ANALYZE_RANGE
+    if value not in ANALYZE_RANGE_MODES:
+        raise ValueError(value)
+    return value
+
+
+def analyze_settings() -> dict[str, bool | int | str]:
+    """따로 보기 도구의 설정 — /api/health와 트레이스 입력이 같은 값을 본다."""
+    return {"enabled": ANALYZE_TOOL, "pagesPerCall": ANALYZE_PAGES_PER_CALL, "maxPages": MAX_ANALYZED_PAGES,
+            "group": ANALYZE_GROUP, "groupMax": ANALYZE_GROUP_MAX, "range": ANALYZE_RANGE}
+
+
 def tile_settings() -> dict[str, float | int]:
     """지금 적용 중인 타일 설정 — 답변 메타데이터, /api/health, 비교 스크립트가 같은 값을 본다."""
     return {

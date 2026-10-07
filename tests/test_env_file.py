@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from app import config
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -114,10 +116,28 @@ def test_example_file_shows_the_real_defaults():
         "DOCCHAT_MAX_VIEWED_PAGES": config.MAX_VIEWED_PAGES,
         "DOCCHAT_DRAWING_MIN_RASTER_AREA": config.DRAWING_MIN_RASTER_AREA,
         "DOCCHAT_DRAWING_MIN_VECTOR_OPERATIONS": config.DRAWING_MIN_VECTOR_OPERATIONS,
+        "DOCCHAT_ANALYZE_TOOL": config.ANALYZE_TOOL, "DOCCHAT_ANALYZE_PAGES_PER_CALL": config.ANALYZE_PAGES_PER_CALL,
+        "DOCCHAT_MAX_ANALYZED_PAGES": config.MAX_ANALYZED_PAGES, "DOCCHAT_ANALYZE_GROUP_MAX": config.ANALYZE_GROUP_MAX,
     }
     assert {name: float(example[name]) for name in defaults} == {name: float(value) for name, value in defaults.items()}
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST
     assert example["DOCCHAT_ANSWER_IMAGE_MODE"] == config.DEFAULT_ANSWER_IMAGE_MODE == "uploads"
+    assert example["DOCCHAT_ANALYZE_GROUP"] == str(config.ANALYZE_GROUP) == "1"
+    assert example["DOCCHAT_ANALYZE_RANGE"] == config.ANALYZE_RANGE == "free"
+
+
+def test_analyze_group_setting_accepts_a_number_or_auto(tmp_path):
+    """묶음 보기(Step 10 2차): 1 / k(상한으로 자름) / auto. 모르는 값은 1(쪽마다)."""
+    shown = "config.ANALYZE_GROUP, config.ANALYZE_GROUP_MAX, config.resolve_analyze_group(None), config.resolve_analyze_group('5')"
+    assert run_config("off", shown) == "(1, 10, 1, 5)"
+    assert run_config("off", shown, DOCCHAT_ANALYZE_GROUP="auto") == "('auto', 10, 'auto', 5)"
+    assert run_config("off", shown, DOCCHAT_ANALYZE_GROUP="25", DOCCHAT_ANALYZE_GROUP_MAX="4") == "(4, 4, 4, 4)"
+    assert run_config("off", shown, DOCCHAT_ANALYZE_GROUP="many") == "(1, 10, 1, 5)"
+    for bad in ("0", "-1", "x", "1.5", True):
+        with pytest.raises(ValueError):
+            config.normalize_analyze_group(bad)
+    assert config.normalize_analyze_group(" AUTO ") == "auto" and config.normalize_analyze_group(3) == 3
+    assert config.normalize_analyze_group(3.0) == 3 and config.resolve_analyze_group("") == config.ANALYZE_GROUP
 
 
 def test_runaway_guards_can_be_set_from_the_file(tmp_path):

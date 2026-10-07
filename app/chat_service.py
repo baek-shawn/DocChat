@@ -76,6 +76,12 @@ class ChatRequest:
     image_mode: str = ""      # "whole" | "tile". 비어 있으면 config.DEFAULT_IMAGE_MODE
     # 답변 호출의 이미지(Step 8): "off" | "uploads" | "whole" | "auto"(Step 10). 비어 있으면 config.DEFAULT_ANSWER_IMAGE_MODE
     answer_image_mode: str = ""
+    # 따로 보기 도구(Step 10 2차, 자동 모드에서만 의미): None이면 서버 기본값(config.ANALYZE_TOOL)
+    analyze_tool: bool | None = None
+    # 묶음 보기: 따로 보기 한 VLM 호출에 넣는 쪽 수 — 1 | k | "auto"(모델이 고름). None/빈 값이면 서버 기본값(config.ANALYZE_GROUP)
+    analyze_group: str | int | None = None
+    # 범위 고정: "free"(모델이 넘긴 범위) | "fixed"(첫 쪽부터 상한만큼 꽉 채움). 비어 있으면 서버 기본값(config.ANALYZE_RANGE)
+    analyze_range: str = ""
     # 호출 종류별 추론 수준(Step 6 2차). None이면 서버 기본값(config), 빈 문자열이면 보내지 않는다(모델 기본 수준).
     # 추론을 켠 로컬 호출에만 실린다.
     reasoning_effort_answer: str | None = None
@@ -150,6 +156,10 @@ class Answer:
     image_candidates: int = 0                              # 모드상 실을 수 있었던 이미지 수(상한 때문에 뺀 수를 알 수 있게)
     viewed_names: list[str] = field(default_factory=list)  # 보기 도구(Step 10)로 모델이 요청해 본 쪽(순서대로)
     view_refusals: int = 0                                 # 보기 상한에 걸려 붙이지 못한 요청 수
+    view_drops: int = 0                                    # 따로 보기로 전환하며 앱이 내린 보기 쪽 수
+    analyzed_names: list[str] = field(default_factory=list)  # 따로 보기 도구(Step 10 2차)로 쪽마다 따로 본 쪽(순서대로)
+    analysis_calls: int = 0                                # 따로 보기 도구 호출 수(쪽마다의 모델 호출 수는 usage.analysis_calls)
+    analysis_refusals: int = 0                             # 따로 보기 턴 상한에 걸려 보지 못한 도구 호출 수
 
 
 def looks_like_false_attachment_refusal(text: str) -> bool:
@@ -278,11 +288,24 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
         turn.activate()
     thinking = plan_thinking(request, provider)
     effort = plan_effort(request, provider, thinking)
+    # 따로 보기 도구(Step 10 2차)는 자동 모드에서만, 요청(없으면 서버 기본값)이 켰을 때만 내놓는다.
+    analyze_tool = config.answer_mode_offers_analyze_tool(answer_image_mode, request.analyze_tool)
+    try:
+        analyze_group = config.resolve_analyze_group(request.analyze_group)     # 묶음 보기: 1 | k | "auto"
+    except ValueError as error:
+        raise ChatError(f"따로 보기의 묶음 크기가 올바르지 않습니다: {request.analyze_group!r}. 1 이상의 정수(최대 "
+                        f"{config.ANALYZE_GROUP_MAX})나 'auto'(모델이 고름)를 쓰거나 비워 두세요.") from error
+    try:
+        analyze_range = config.resolve_analyze_range(request.analyze_range)       # 범위 고정: "free" | "fixed"
+    except ValueError as error:
+        raise ChatError(f"따로 보기의 범위 방식이 올바르지 않습니다: {request.analyze_range!r}. 'free'(모델이 정함) 또는 "
+                        "'fixed'(첫 쪽부터 상한만큼) 중에서 고르거나 비워 두세요.") from error
     if turn is not None:
-        _record_input(turn, request, messages, uploads, image_mode, answer_image_mode, thinking, provider, effort)
+        _record_input(turn, request, messages, uploads, image_mode, answer_image_mode, thinking, provider, effort,
+                      analyze_tool, analyze_group, analyze_range)
     try:
         answer = await _answer(store, provider, request, conversation_id, messages, uploads, emit, image_mode,
-                               answer_image_mode, thinking, effort)
+                               answer_image_mode, thinking, effort, analyze_tool, analyze_group, analyze_range)
     except (ProviderError, UploadError, PdfError, ImageError, StorageError) as error:
         # 서버가 추론 수준을 받지 않은 것은 설정이 틀린 것이다(모델 서버의 장애가 아니다) → 400.
         upstream = isinstance(error, ProviderError) and not isinstance(error, ReasoningEffortError)
@@ -316,7 +339,12 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
     if config.answer_mode_offers_view_tool(answer_image_mode):
         # 보기 도구(Step 10): 모델이 실제로 본 쪽과 상한. 한 쪽도 보지 않았어도 적는다(자동 모드에서 "안 봤다"도 결과다).
         meta["viewedPages"] = {"names": answer.viewed_names, "limit": config.MAX_VIEWED_PAGES,
-                               "refused": answer.view_refusals}
+                               "refused": answer.view_refusals, "dropped": answer.view_drops}
+        # 따로 보기 도구(Step 10 2차): 내놓았는지(실험 조건), 쪽마다 따로 본 쪽, 도구 호출 수, 턴 상한, 상한에 걸린 호출 수.
+        meta["analyzedPages"] = {"enabled": analyze_tool, "names": answer.analyzed_names, "calls": answer.analysis_calls,
+                                 "limit": config.MAX_ANALYZED_PAGES, "refused": answer.analysis_refusals,
+                                 "group": analyze_group,       # 묶음 크기(실험 조건): 1 | k | "auto"
+                                 "range": analyze_range}       # 범위 방식(실험 조건): "free" | "fixed"
     if thinking.controllable and provider.can_disable_thinking():
         # 호출 종류별로 추론을 끄고 보냈는지. 서버가 그 요청을 거절했으면(can_disable_thinking이 False로 바뀐다) 적지 않는다.
         meta["thinkingDisabled"] = thinking.to_public()
@@ -351,14 +379,18 @@ async def run_chat(store: ChatStore, request: ChatRequest, emit: Emit) -> dict[s
 
 def _record_input(turn: trace.TurnTrace, request: ChatRequest, messages: list[dict[str, Any]], uploads: list[Attachment],
                   image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, provider: Provider,
-                  effort: EffortPlan) -> None:
+                  effort: EffortPlan, analyze_tool: bool = False, analyze_group: str | int = 1,
+                  analyze_range: str = "free") -> None:
     """턴의 입력: 질문, 새 첨부, 이번 턴의 설정. API key는 넣지 않는다."""
+    auto = config.answer_mode_offers_view_tool(answer_image_mode)
     turn.note(
         "input", "입력", question=trace.clip(messages[-1]["content"]), historyMessages=len(messages) - 1,
         attachments=[{"name": item.name, "kind": item.kind, "mime": item.mime, "size": item.size} for item in uploads],
         provider=request.provider, model=request.model, baseUrl=request.base_url or None, imageMode=image_mode,
         answerImageMode=answer_image_mode, maxModelImages=config.MAX_MODEL_IMAGES,
-        view=config.view_settings() if config.answer_mode_offers_view_tool(answer_image_mode) else None,
+        view=config.view_settings() if auto else None,
+        # 따로 보기(Step 10 2차): 이 턴에 내놓았는지(요청 옵션 반영)와 상한 둘
+        analyze={**config.analyze_settings(), "enabled": analyze_tool, "group": analyze_group, "range": analyze_range} if auto else None,
         contextSize=request.context_size, thinkingDisabled=thinking.to_public() if thinking.controllable else None,
         thinkingControl=provider.can_disable_thinking(), visionMaxTokens=config.vision_max_tokens(),
         reasoning=config.reasoning_settings() if provider.is_local else None,
@@ -455,7 +487,8 @@ async def _render_pending_pages(store: ChatStore, attachments: list[Attachment],
 
 async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, conversation_id: str,
                   messages: list[dict[str, Any]], uploads: list[Attachment], emit: Emit,
-                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, effort: EffortPlan) -> Answer:
+                  image_mode: str, answer_image_mode: str, thinking: ThinkingPlan, effort: EffortPlan,
+                  analyze_tool: bool = False, analyze_group: str | int = 1, analyze_range: str = "free") -> Answer:
     def progress(message: str, *, live: bool = False) -> None:
         # live: "추론 중… n토큰"처럼 1초마다 갱신되는 문구. 화면은 같은 줄을 바꿔 쓰고, 트레이스에는 적지 않는다
         # (호출 이벤트가 추론 토큰 수를 직접 갖는다). 단계 알림은 그대로 트레이스의 시간축에 남는다.
@@ -531,7 +564,9 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
     # 보기 도구(Step 10)는 답변 이미지 모드 자동에서만 내놓는다. 그때만 매니페스트에 "그림이 있는 쪽"을 덧붙인다 —
     # 다른 모드의 프롬프트는 Step 8까지와 같아야 한다(실험 ①의 비교 기준).
     view_tool = config.answer_mode_offers_view_tool(answer_image_mode)
-    tools = available_tools(attachments, view_tool=view_tool)
+    group_choice = analyze_tool and analyze_group == config.ANALYZE_GROUP_AUTO     # 묶음 크기를 모델이 고르는 턴
+    tools = available_tools(attachments, view_tool=view_tool, analyze_tool=analyze_tool, analyze_group_choice=group_choice,
+                            analyze_fixed_range=analyze_range == "fixed")
     history = compact_conversation_messages(messages[-config.MAX_HISTORY_MESSAGES:], history_budget)
     if not history or history[-1]["role"] != "user":
         history.append({"role": "user", "content": latest_user})
@@ -540,12 +575,14 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
                                                             context.images)}
     manifest = attachment_manifest(attachments, drawing_cues=view_tool)
     model_messages = [{"role": "system", "content": system_prompt(manifest, tools_enabled=bool(tools),
-                                                                 model_name=request.model, view_tool=view_tool)},
+                                                                 model_name=request.model, view_tool=view_tool,
+                                                                 analyze_tool=analyze_tool, analyze_group_choice=group_choice)},
                       *history]
     if turn is not None:
         _record_evidence(turn, attachments, context, model_images, tools, history, model_messages[0]["content"],
                          budgets=(char_budget, attachment_budget, history_budget), has_visual_ocr=has_visual_ocr,
-                         answer_image_mode=answer_image_mode, manifest=manifest, view_tool=view_tool)
+                         answer_image_mode=answer_image_mode, manifest=manifest, view_tool=view_tool,
+                         analyze_tool=analyze_tool, analyze_group=analyze_group, analyze_range=analyze_range)
 
     # 4) 단일 tool-calling 루프
     tool_context = ToolContext(
@@ -553,6 +590,7 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         default_read_chars=max(1000, min(16_000, attachment_budget // 3)), on_progress=progress,
         image_mode=image_mode, usage=usage, on_tiles=tile_sink, disable_thinking=thinking.grounding, on_live=live,
         reasoning_effort=effort.grounding, base_image_names=[image.name for image in model_images],
+        analysis_group=analyze_group, analysis_range=analyze_range,
     )
     progress("답변을 생성하는 중…")
     language_hint = reply_language_hint(latest_user)
@@ -585,12 +623,16 @@ async def _answer(store: ChatStore, provider: Provider, request: ChatRequest, co
         raise ProviderError("모델이 빈 응답을 돌려주었습니다. 다시 시도하거나 다른 모델을 선택하세요.")
     return Answer(text=text, artifacts=tool_context.artifacts, attachments=attachments, usage=usage,
                   image_names=[image.name for image in model_images], image_candidates=context.image_candidates,
-                  viewed_names=tool_context.viewed_names(), view_refusals=tool_context.view_refusals)
+                  viewed_names=tool_context.viewed_names(), view_refusals=tool_context.view_refusals,
+                  view_drops=tool_context.view_drops,
+                  analyzed_names=list(tool_context.analyzed), analysis_calls=tool_context.analysis_calls,
+                  analysis_refusals=tool_context.analysis_refusals)
 
 
 def _record_evidence(turn: trace.TurnTrace, attachments: list[Attachment], context: Any, model_images: list[ModelImage],
                      tools: list[Any], history: list[dict[str, Any]], system: str, *, budgets: tuple[int, int, int],
-                     has_visual_ocr: bool, answer_image_mode: str, manifest: str, view_tool: bool) -> None:
+                     has_visual_ocr: bool, answer_image_mode: str, manifest: str, view_tool: bool,
+                     analyze_tool: bool = False, analyze_group: str | int = 1, analyze_range: str = "free") -> None:
     """증거 조립: 어떤 텍스트를 얼마나 실었고 무엇이 잘렸는지, 어떤 이미지를 보냈는지, 예산은 얼마였는지."""
     full = {item.name: len(item.text or "") for item in attachments}
     documents = []
@@ -603,6 +645,8 @@ def _record_evidence(turn: trace.TurnTrace, attachments: list[Attachment], conte
         documents=documents, images=turn.describe_images(model_images), tools=trace.describe_tools(tools),
         answerImageMode=answer_image_mode, imageCandidates=context.image_candidates, maxModelImages=config.MAX_MODEL_IMAGES,
         viewTool=view_tool, maxViewedPages=config.MAX_VIEWED_PAGES if view_tool else None,
+        analyzeTool=analyze_tool, maxAnalyzedPages=config.MAX_ANALYZED_PAGES if analyze_tool else None,
+        analyzeGroup=analyze_group if analyze_tool else None, analyzeRange=analyze_range if analyze_tool else None,
         historyMessages=len(history), visualOcrNote=has_visual_ocr, systemPrompt=trace.clip(system),
         manifest=manifest,
     )

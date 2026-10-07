@@ -87,6 +87,8 @@ def create_app() -> FastAPI:
             "maxModelImages": config.MAX_MODEL_IMAGES,
             # 보기 도구(Step 10, 자동 모드): 한 턴에 모을 수 있는 쪽 수 상한과 "그림이 있는 쪽" 판정 기준
             "view": config.view_settings(),
+            # 따로 보기 도구(Step 10 2차, 자동 모드): 기본 켬/끔, 한 호출의 쪽 수, 한 턴의 총 쪽 수
+            "analyze": config.analyze_settings(),
             # 전사·bbox 호출의 폭주 막기(Step 6-0): 호출별 추론 끄기의 기본값과 출력 상한(0 = 상한 없음)
             "vision": {
                 "disableThinkingGrounding": config.GROUNDING_DISABLE_THINKING,

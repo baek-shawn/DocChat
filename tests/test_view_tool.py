@@ -58,20 +58,24 @@ def follow_up(mock, text: str, conversation_id: str, previous: list[tuple[str, s
 
 # --------------------------------------------------------------------------- 모드: 자동에서만 보기 도구와 판단 재료
 def test_auto_mode_offers_the_view_tool_and_marks_drawing_pages(client, mock_llm):
+    """1차의 자동 모드(같이 보기만). 따로 보기 도구(2차)는 끈다 — 그 조건의 도구 목록·프롬프트는 `test_analyze_tool.py`."""
     mock_llm.reset(lambda body: "OCR TEXT" if is_ocr_call(body) else "answer")
     data = client.post("/api/chat", json=chat_body(mock_llm, "이 도면의 형상은?", [upload("scan.pdf", build_pdf("native", "scanned"), PDF)],
-                                                   answerImageMode="auto")).json()
+                                                   answerImageMode="auto", analyzeTool=False)).json()
     (main,) = main_calls(mock_llm)
     assert tool_names(main) == ["view_page", "inspect_visual", "read_attachment", "search_attachments"]
     system = system_text(main)
     assert "view_page attaches the image of one page" in system and f"up to {config.MAX_VIEWED_PAGES} pages" in system
-    # 판단 재료: 그림이 있는 쪽과 그 쪽의 글이 무엇을 담는지(전사한 2쪽) — 네이티브 1쪽은 그림이 없다.
+    assert "analyze_pages" not in system
+    # 판단 재료(v2): 파일 검사 결과 — 잡힌 쪽(전사한 2쪽), 안 잡힌 쪽(네이티브 1쪽), 글 층이 없는 쪽.
     assert ('"scan.pdf": parts=3, pages=2, images=1, parsedText=' in system
-            and "drawings on pages 2 (text = transcription of the visible labels only) - the shapes" in system)
+            and "file check (embedded images and vector strokes in the file, not a visual inspection): 1 of 2 pages contain them - 2; "
+                "1 page has none detected - 1; page 2 has no text layer, so its text is only a transcription of the visible labels. "
+                "What is drawn" in system)
     assert image_count(main) == 0 and "[PAGE IMAGES" not in all_text(main)         # 처음에는 업로드 이미지만(여기선 없음)
     assert data["meta"]["answerImageMode"] == "auto"
     assert data["meta"]["answerImages"] == {"sent": 0, "candidates": 0, "names": []}
-    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
     health = client.get("/api/health").json()
     assert health["view"] == {"maxViewedPages": config.MAX_VIEWED_PAGES, "drawingMinRasterArea": config.DRAWING_MIN_RASTER_AREA,
                               "drawingMinVectorOperations": config.DRAWING_MIN_VECTOR_OPERATIONS}
@@ -86,7 +90,7 @@ def test_other_modes_keep_the_step8_prompt_without_the_view_tool(client, mock_ll
         (main,) = main_calls(mock_llm)
         assert tool_names(main) == ["inspect_visual", "read_attachment", "search_attachments"], mode
         system = system_text(main)
-        assert "view_page" not in system and "drawings on pages" not in system, mode
+        assert "view_page" not in system and "file check" not in system, mode
         assert "viewedPages" not in data["meta"], mode
     bad = client.post("/api/chat", json=chat_body(mock_llm, "hi", answerImageMode="view"))
     assert bad.status_code == 400 and "'auto'" in bad.json()["error"]
@@ -113,18 +117,20 @@ def test_view_page_attaches_the_page_to_the_next_call_and_pages_accumulate(clien
     assert "[IMAGES ATTACHED TO THIS MESSAGE, in this order - 1: spec.pdf · page 2 (requested with view_page)." in anchor_text(second)
     assert isinstance(second["messages"][1]["content"], list)
     result = tool_results(second)[0]
-    assert result.startswith("Attached spec.pdf · page 2 to the user's message as image #1 (images attached, in order: 1: spec.pdf · page 2).")
+    assert result.startswith("Attached spec.pdf · page 2 now as image #1 of the user's message. All images attached to that message so far, "
+                             "in order: 1: spec.pdf · page 2. Look at the attached pages now")
     assert f"up to {config.MAX_VIEWED_PAGES - 1} more pages this turn" in result
-    # 두 번째 보기 → 쌓여서 두 장이 모두, 요청한 순서로 실린다.
+    # 두 번째 보기 → 쌓여서 두 장이 모두, 요청한 순서로 실린다. 결과 글은 "이번에 붙인 쪽"과 "전체 목록"을 나눠 적는다(2차).
     assert image_count(third) == 2
     assert "1: spec.pdf · page 2 (requested with view_page); 2: spec.pdf · page 3 (requested with view_page)." in anchor_text(third)
-    assert "image #2 (images attached, in order: 1: spec.pdf · page 2; 2: spec.pdf · page 3)" in tool_results(third)[1]
+    assert ("Attached spec.pdf · page 3 now as image #2 of the user's message. All images attached to that message so far, "
+            "in order: 1: spec.pdf · page 2; 2: spec.pdf · page 3.") in tool_results(third)[1]
     pages = {item["name"]: item for item in data["attachments"] if item.get("pageNumber")}
     assert sorted(pages) == ["spec.pdf · page 2", "spec.pdf · page 3"]          # 1쪽은 그리지 않았다
     assert [image.size for image in request_images(third)] == [(pages[name]["width"], pages[name]["height"])
                                                                for name in ("spec.pdf · page 2", "spec.pdf · page 3")]
     assert data["text"] == "2쪽과 3쪽을 보고 답합니다." and data["artifacts"] == []     # 보기는 bbox 아티팩트를 만들지 않는다
-    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 2", "spec.pdf · page 3"], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 2", "spec.pdf · page 3"], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
     saved = client.get(f"/api/sessions/{data['conversationId']}").json()["messages"]
     assert saved[1]["meta"]["viewedPages"] == data["meta"]["viewedPages"]
 
@@ -153,7 +159,7 @@ def test_view_limit_and_duplicate_requests(client, mock_llm, monkeypatch):
     assert results[2] == ("Page limit reached: 1 pages are already attached for this turn, so spec.pdf · page 2 was not attached. "
                           "Answer from the pages you can see, and tell the user that only 1 pages were viewed.")
     assert image_count(final) == 1
-    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 1"], "limit": 1, "refused": 1}
+    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 1"], "limit": 1, "refused": 1, "dropped": 0}
     assert [item["name"] for item in data["attachments"]] == ["spec.pdf", "spec.pdf · page 1"]     # 2쪽은 그리지 않았다
 
 
@@ -165,7 +171,7 @@ def test_view_page_on_an_already_attached_upload_adds_nothing(client, mock_llm):
     assert image_count(first) == 1 and image_count(final) == 1                  # 두 장이 되지 않는다
     assert tool_results(final)[0].startswith("pic.png is already attached to the user's message as image #1; nothing was added.")
     assert "[IMAGES ATTACHED" not in anchor_text(final)                         # 보기 도구로 더한 것이 없으면 줄도 없다
-    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
 
 
 def test_follow_up_turn_does_not_carry_pages_but_can_request_them_again(client, mock_llm):
@@ -262,7 +268,8 @@ async def test_view_page_tool_renders_the_page_and_reports_its_position():
     pdf = Attachment(name="spec.pdf", kind="pdf", mime=PDF, data=build_pdf("native", "native"), text="t", total_pages=2)
     context = ToolContext(provider=ScriptedProvider([]), attachments=[pdf], base_image_names=["pic.png"])
     result = await execute_tool(context, ToolCall(name="view_page", arguments={"name": "spec.pdf", "page": 2}))
-    assert result.startswith("Attached spec.pdf · page 2 to the user's message as image #2 (images attached, in order: 1: pic.png; 2: spec.pdf · page 2).")
+    assert result.startswith("Attached spec.pdf · page 2 now as image #2 of the user's message. All images attached to that message so far, "
+                             "in order: 1: pic.png; 2: spec.pdf · page 2.")
     assert [image.name for image in context.viewed] == ["spec.pdf · page 2"] and context.viewed[0].tile is None
     rendered = context.attachments[-1]
     assert rendered.name == "spec.pdf · page 2" and rendered.data.startswith(b"\x89PNG") and not rendered.send_to_model
@@ -312,15 +319,32 @@ def test_manifest_drawing_cue_lists_pages_by_what_their_text_holds():
         {"page": 6, "classification": "native-vector", "chars": 900, "raster": 0, "rasterArea": 0.0, "vector": 300, "vlm": False},
     ])
     assert [page["page"] for page in drawing_pages(pdf)] == [1, 2, 4, 5, 6]
-    assert drawing_cue(pdf) == ("drawings on pages 2, 4-5 (text = transcription of the visible labels only); 1, 6 (native text beside "
-                                "the drawing) - the shapes, their positions and counts, and which label or dimension belongs to which "
-                                "feature are NOT in the text; call view_page to see such a page")
+    not_in_text = ("What is drawn - the shapes, their positions and counts, and which label or dimension belongs to which feature - "
+                   "is NOT in the text of any page")
+    basis = "file check (embedded images and vector strokes in the file, not a visual inspection)"
+    # v2(2026-10-07): 잡힌 쪽을 한 목록과 총수로, 안 잡힌 쪽도, 글 층이 없는 쪽은 부속 사실로. 도구는 가리키지 않는다.
+    assert drawing_cue(pdf) == (f"{basis}: 5 of 6 pages contain them - 1-2, 4-6; 1 page has none detected - 3; pages 2, 4-5 have no text "
+                                f"layer, so their text is only a transcription of the visible labels. {not_in_text}")
     plain = '"a.pdf": parts=1, pages=6, images=0, parsedText=50 chars, visualOcr=0 chars, pendingVision=0'
     assert attachment_manifest([pdf]) == plain                                           # 기본: Step 8까지와 같다
     assert attachment_manifest([pdf], drawing_cues=True) == f"{plain}; {drawing_cue(pdf)}"
+    # 아무것도 안 잡힌 PDF: 검사가 놓칠 수 있다는 것까지 적는다(보안 설정으로 글만 뽑히는 CAD PDF 대비). v1은 줄을 붙이지 않았다.
     no_drawing = Attachment(name="t.pdf", kind="pdf", mime=PDF, text="x", total_pages=1,
                             page_analysis=[{"page": 1, "classification": "native-vector", "chars": 900, "raster": 0, "rasterArea": 0.0, "vector": 3, "vlm": False}])
-    assert attachment_manifest([no_drawing], drawing_cues=True) == '"t.pdf": parts=1, pages=1, images=0, parsedText=1 chars, visualOcr=0 chars, pendingVision=0'
+    assert attachment_manifest([no_drawing], drawing_cues=True) == (
+        f'"t.pdf": parts=1, pages=1, images=0, parsedText=1 chars, visualOcr=0 chars, pendingVision=0; {basis}: no embedded images or '
+        f"vector strokes detected on any page - drawings stored in another way would not be detected. {not_in_text}")
+    # 전부 스캔본: 좁혀 주지 못한다는 사실을 그대로 — 모든 쪽이 그림이고 글 층이 없다
+    scans = Attachment(name="s.pdf", kind="pdf", mime=PDF, text="x", total_pages=2, page_analysis=[
+        {"page": n, "classification": "scanned-raster", "chars": 0, "raster": 1, "rasterArea": 0.99, "vector": 0, "vlm": True} for n in (1, 2)])
+    assert drawing_cue(scans) == f"file check: all 2 pages are full-page scans with no text layer; their text is only a transcription of the visible labels. {not_in_text}"
+    # 모든 쪽에 그림이 있지만 글 층은 있는 PDF, 그리고 쪽 상한 때문에 검사하지 않은 쪽
+    partial = Attachment(name="p.pdf", kind="pdf", mime=PDF, text="x", total_pages=5, page_analysis=[
+        {"page": n, "classification": "mixed-native", "chars": 500, "raster": 1, "rasterArea": 0.3, "vector": 2, "vlm": False} for n in (1, 2, 3)])
+    assert drawing_cue(partial) == f"{basis}: 3 of 5 pages contain them - 1-3; pages 4-5 were not checked (page limit). {not_in_text}"
+    full = Attachment(name="f.pdf", kind="pdf", mime=PDF, text="x", total_pages=2, page_analysis=[
+        {"page": n, "classification": "mixed-native", "chars": 500, "raster": 1, "rasterArea": 0.3, "vector": 2, "vlm": False} for n in (1, 2)])
+    assert drawing_cue(full) == f"{basis}: all 2 pages contain them. {not_in_text}"
     # Step 10 이전에 올린 PDF(메타데이터 없음): 본문의 [PAGE ANALYSIS] 줄에서 읽는다 — 래스터 면적을 몰라 개수로 대신한다.
     legacy = Attachment(name="old.pdf", kind="pdf", mime=PDF, total_pages=3, text=(
         "[PAGE ANALYSIS]\nPage 1: native-vector; native characters=435; raster images=0; vector operations=0; vision OCR=skipped\n"
