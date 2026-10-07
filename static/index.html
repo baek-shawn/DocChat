@@ -181,6 +181,13 @@
         <option value="auto">자동 — 모델이 상한 안에서 고름</option>
       </select>
     </label>
+    <label>따로 보기 범위 — 한 호출이 보는 쪽 범위
+      <select id="analyzeRange">
+        <option value="">서버 기본값</option>
+        <option value="free">모델이 정함 — 넘긴 범위 그대로(상한에 넘치면 앞에서부터)</option>
+        <option value="fixed">고정 — 첫 쪽부터 한 호출 상한만큼 꽉 채움</option>
+      </select>
+    </label>
     <p id="analyzeHelp" class="help"></p>
     <p id="traceHelp" class="help"></p>
 

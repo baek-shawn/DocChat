@@ -79,13 +79,18 @@ VIEW_PAGE = ToolSpec(
     },
 )
 
-def analyze_pages_spec(group_choice: bool = False) -> ToolSpec:
+def analyze_pages_spec(group_choice: bool = False, fixed_range: bool = False) -> ToolSpec:
     """따로 보기 도구의 정의. group_choice(묶음 크기를 모델이 고르는 턴, `analyzeGroup: auto`)일 때만 `group` 인자를 내놓는다 —
-    숫자로 고정한 실험 조건에서 모델이 바꿀 수 없어야 한다."""
+    숫자로 고정한 실험 조건에서 모델이 바꿀 수 없어야 한다. fixed_range(`analyzeRange: fixed`)면 `pages`의 뜻이 "첫 쪽"이 된다."""
+    pages_description = (
+        f"1-based page to start from: each call covers {config.ANALYZE_PAGES_PER_CALL} consecutive pages from there (the end "
+        "of a range you pass is ignored). Omit for an uploaded image or a one-page PDF."
+        if fixed_range else
+        '1-based page number, range or list: "7", "1-10", "2,5,7-9". Omit for an uploaded image or a one-page PDF.'
+    )
     properties: dict[str, Any] = {
         "name": {"type": "string", "description": "Exact attachment name from the attachment manifest."},
-        "pages": {"type": "string", "description": '1-based page number, range or list: "7", "1-10", "2,5,7-9". '
-                                                   "Omit for an uploaded image or a one-page PDF."},
+        "pages": {"type": "string", "description": pages_description},
         "question": {"type": "string", "description": "What to look for on each page and what to report, written concretely."},
     }
     if group_choice:
@@ -172,6 +177,10 @@ class ToolContext:
     analysis_cache: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     # 묶음 보기: 한 VLM 호출에 넣는 쪽 수(1 = 쪽마다, k, 또는 "auto" = 모델이 `group` 인자로 고름). 요청마다 정한다.
     analysis_group: str | int = 1
+    # 범위 고정: "free"(모델이 넘긴 범위 그대로) | "fixed"(첫 쪽부터 한 호출 상한만큼 꽉 채워). 요청마다 정한다.
+    analysis_range: str = "free"
+    # 따로 보기로 전환할 때 앱이 내린, 보기 도구로 붙어 있던 쪽 수(답변 메타 `viewedPages.dropped`).
+    view_drops: int = 0
 
     def viewed_names(self) -> list[str]:
         return [image.name for image in self.viewed]
@@ -182,15 +191,15 @@ class ToolContext:
 
 
 def available_tools(attachments: list[Attachment], *, view_tool: bool = False, analyze_tool: bool = False,
-                    analyze_group_choice: bool = False) -> list[ToolSpec]:
+                    analyze_group_choice: bool = False, analyze_fixed_range: bool = False) -> list[ToolSpec]:
     """첨부가 없으면 도구도 없다(순수 대화). 볼 수 있는 면이 있을 때만 inspect_visual(과, 자동 모드면 view_page,
-    따로 보기를 켰으면 analyze_pages — 묶음 크기를 모델이 고르는 턴이면 `group` 인자 포함)을 내놓는다."""
+    따로 보기를 켰으면 analyze_pages — 묶음 크기를 모델이 고르는 턴이면 `group` 인자 포함, 범위 고정이면 `pages`는 첫 쪽)을 내놓는다."""
     tools: list[ToolSpec] = []
     if any(item.is_image or item.is_pdf for item in attachments):
         if view_tool:
             tools.append(VIEW_PAGE)
         if analyze_tool:
-            tools.append(analyze_pages_spec(analyze_group_choice))
+            tools.append(analyze_pages_spec(analyze_group_choice, analyze_fixed_range))
         tools.append(INSPECT_VISUAL)
     if any(item.text and not item.is_image for item in attachments):
         tools += [READ_ATTACHMENT, SEARCH_ATTACHMENTS]
@@ -648,6 +657,11 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
             wanted = [page for page in wanted if page <= total]
         if not wanted:
             raise ToolError(f'"{record.name}" has only {total} pages; none of the requested pages exist.')
+        if context.analysis_range == "fixed":
+            # 범위 고정: 모델이 무엇을 넘기든 첫 쪽부터 한 호출 상한만큼 꽉 채운다(끝 쪽·목록은 무시, 없는 쪽 수도 의미 없음).
+            start = wanted[0]
+            end = min(start + config.ANALYZE_PAGES_PER_CALL - 1, total or start + config.ANALYZE_PAGES_PER_CALL - 1)
+            wanted, beyond = list(range(start, end + 1)), 0
         targets: list[tuple[str, int | None, str]] = [(page_image_name(record.name, page), page, f"page {page}") for page in wanted]
     elif record.is_image:
         targets = [(record.name, record.page_number, f"page {record.page_number}" if record.page_number else record.name)]
@@ -656,7 +670,14 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
 
     # 2) 상한: 한 호출의 쪽 수 → 턴의 총 쪽 수(같은 턴에 같은 쪽·같은 질문은 다시 묻지 않고 상한에도 세지 않는다)
     per_call = config.ANALYZE_PAGES_PER_CALL
-    deferred = [page for _, page, _ in targets[per_call:] if page]
+    fixed = ""
+    if context.analysis_range == "fixed" and record.is_pdf:
+        numbers = [page for _, page, _ in targets if page]
+        fixed = page_ranges(numbers)
+        total_pages = int(record.total_pages or 0)
+        deferred = list(range(numbers[-1] + 1, total_pages + 1)) if numbers and total_pages > numbers[-1] else []
+    else:
+        deferred = [page for _, page, _ in targets[per_call:] if page]
     targets = targets[:per_call]
     fresh = [target for target in targets if (target[0], question) not in context.analysis_cache]
     remaining = config.MAX_ANALYZED_PAGES - context.analyzed_pages
@@ -674,6 +695,14 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
                question=question, pages=[marker for _, _, marker in targets], cached=[m for n, _, m in targets if (n, question) in context.analysis_cache],
                deferred=page_ranges(deferred) or None, notAnalyzed=page_ranges(not_analyzed) or None, beyond=beyond or None,
                group=group_size)
+
+    # 따로 보기로 전환하면 보기 도구로 붙여 둔 쪽을 내린다(2026-10-07 사용자 결정): 같이 보기로 시작했다가 갈아탄 경우 그 이미지가
+    # 턴 끝까지 모든 답변 호출에 따라붙어 입력만 키우고(49~61k 실측) 12장 상한을 잡아먹는다. 그 뒤의 view_page는 다시 쌓인다.
+    dropped = context.viewed_names()
+    if dropped:
+        context.viewed.clear()                # 루프는 같은 목록 객체를 호출마다 다시 읽는다 → 다음 답변 호출부터 빠진다
+        context.view_drops += len(dropped)
+        trace.note("tool", f"보기 도구로 붙여 둔 {len(dropped)}장을 내림 — 따로 보기로 전환", dropped=dropped)
 
     # 3) 쪽 이미지 준비(그리지 않은 쪽은 지금 그려 한 번에 저장) → 쪽마다(또는 묶음마다) 별도 호출(동시 OCR_CONCURRENCY개, 순서 유지)
     marker_of = {surface_name: marker for surface_name, _, marker in targets}
@@ -747,7 +776,7 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
                         for marker, answer in answers], remaining=remaining, group=group_size, calls=len(chunks))
     return analyze_pages_result(record.name, question, answers, remaining=remaining, limit=config.MAX_ANALYZED_PAGES,
                                 deferred=page_ranges(deferred), not_analyzed=page_ranges(not_analyzed), beyond=beyond,
-                                per_call=per_call, group=group_size, pages=len(targets))
+                                per_call=per_call, group=group_size, pages=len(targets), fixed=fixed, dropped=dropped)
 
 
 # --------------------------------------------------------------------------- 텍스트 도구

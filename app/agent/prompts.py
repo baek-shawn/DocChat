@@ -243,12 +243,14 @@ def view_page_limit_reached(name: str, limit: int) -> str:
 
 def analyze_pages_result(name: str, question: str, answers: list[tuple[str, str]], *, remaining: int, limit: int,
                          deferred: str = "", not_analyzed: str = "", beyond: int = 0, per_call: int = 0, group: int = 1,
-                         pages: int | None = None) -> str:
+                         pages: int | None = None, fixed: str = "", dropped: list[str] | None = None) -> str:
     """따로 보기 도구(Step 10 2차)가 모델에게 돌려주는 글: 쪽마다 `[page n] 답`, 그리고 다음에 할 일.
 
     answers: (쪽 표식, 답) — 표식은 PDF 쪽이면 "page 3", 업로드 이미지면 그 이름, 묶음 보기에서 모델이 쪽을 가르지 않았으면 "pages 6-10".
     deferred: 한 호출의 쪽 수 상한 때문에 이번에 보지 않은 쪽 범위(비어 있으면 없음). not_analyzed: 턴 상한에 걸려 보지 않은 쪽 범위.
     beyond: PDF에 없는 쪽을 요청해 무시한 수. group: 한 VLM 호출에 넣은 쪽 수(묶음 보기). pages: 본 쪽 수(answers가 묶음이면 다르다).
+    fixed: 범위 고정 모드에서 실제로 본 연속 범위("6-15"). 그때 deferred는 그 다음부터 문서 끝까지.
+    dropped: 이 호출이 내린, 보기 도구로 붙어 있던 쪽 이름(따로 보기로 전환하면 앱이 내린다).
     """
     count = len(answers) if pages is None else pages
     how = ("Each answer below comes from a separate look at that page only" if group <= 1 else
@@ -261,9 +263,19 @@ def analyze_pages_result(name: str, question: str, answers: list[tuple[str, str]
     notes: list[str] = []
     if beyond:
         notes.append(f"{beyond} requested page{'s' if beyond != 1 else ''} beyond the end of the document {'were' if beyond != 1 else 'was'} ignored.")
-    if deferred:
+    if fixed and deferred:
+        notes.append(f"Range mode is fixed: each call covers {per_call} consecutive pages from the first page you request, so this "
+                     f'call covered pages {fixed}; to continue, call analyze_pages again with pages "{deferred}".')
+    elif fixed:
+        notes.append(f"Range mode is fixed: this call covered pages {fixed}, which reaches the end of the document.")
+    elif deferred:
         notes.append(f"Only the first {per_call} requested pages were analyzed in this call; call analyze_pages again with "
                      f'pages "{deferred}" to continue.')
+    if dropped:
+        listing = ", ".join(dropped)
+        notes.append(f"Note: the {len(dropped)} page{'s' if len(dropped) != 1 else ''} you had attached with view_page ({listing}) "
+                     f"{'were' if len(dropped) != 1 else 'was'} detached from the user's message because you switched to "
+                     "analyze_pages; request them again with view_page if you need to look at them side by side.")
     if not_analyzed:
         notes.append(f"The per-turn limit of {limit} analyzed pages is now reached; the remaining requested pages ({not_analyzed}) "
                      f"were not analyzed. Answer from what you have, and tell the user that only {limit} pages could be analyzed this turn.")

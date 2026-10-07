@@ -92,7 +92,7 @@ def test_analyze_tool_is_offered_in_auto_mode_and_can_be_switched_off(client, mo
     assert f"up to {config.ANALYZE_PAGES_PER_CALL} pages per call" in system and f"up to {config.MAX_ANALYZED_PAGES} pages per turn" in system
     assert "go through all the pages in ranges" in system and "call view_page on the decisive pages" in system
     assert "view_page attaches the image of one page" in system                  # 같이 보기 안내는 그대로
-    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [], "calls": 0, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1}
+    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [], "calls": 0, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1, "range": "free"}
     assert data["meta"]["viewedPages"]["names"] == []
     # 끄면 1차의 자동 모드와 같다: 도구 목록, 그리고 시스템 프롬프트는 따로 보기 문단 하나만 빠진 것
     mock_llm.reset(lambda body: "OCR TEXT" if is_ocr_call(body) else "answer")
@@ -101,7 +101,7 @@ def test_analyze_tool_is_offered_in_auto_mode_and_can_be_switched_off(client, mo
     assert tool_names(main_off) == ["view_page", "inspect_visual", "read_attachment", "search_attachments"]
     start, end = system.index("analyze_pages looks at"), system.index("If a supplied excerpt is truncated")
     assert system_text(main_off) == system[:start] + system[end:]
-    assert off["meta"]["analyzedPages"] == {"enabled": False, "names": [], "calls": 0, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1}
+    assert off["meta"]["analyzedPages"] == {"enabled": False, "names": [], "calls": 0, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1, "range": "free"}
     # 다른 모드에서는 옵션을 켜도 내놓지 않고 메타에도 없다(Step 8까지의 프롬프트 그대로)
     for mode in ("off", "uploads", "whole"):
         mock_llm.reset(lambda body: "OCR TEXT" if is_ocr_call(body) else "answer")
@@ -111,7 +111,7 @@ def test_analyze_tool_is_offered_in_auto_mode_and_can_be_switched_off(client, mo
         assert "analyzedPages" not in other["meta"], mode
     health = client.get("/api/health").json()
     assert health["analyze"] == {"enabled": config.ANALYZE_TOOL, "pagesPerCall": config.ANALYZE_PAGES_PER_CALL,
-                                 "maxPages": config.MAX_ANALYZED_PAGES, "group": config.ANALYZE_GROUP, "groupMax": config.ANALYZE_GROUP_MAX}
+                                 "maxPages": config.MAX_ANALYZED_PAGES, "group": config.ANALYZE_GROUP, "groupMax": config.ANALYZE_GROUP_MAX, "range": config.ANALYZE_RANGE}
 
 
 def test_analyze_tool_is_offered_only_with_a_visual_surface():
@@ -148,7 +148,7 @@ def test_analyze_pages_runs_one_call_per_page_and_returns_text_only(client, mock
     assert f"You may analyze up to {config.MAX_ANALYZED_PAGES - 3} more pages this turn." in result
     assert "call view_page on the decisive pages to look at them yourself" in result
     assert data["text"] == "글로 답" and data["artifacts"] == []
-    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1, P2, P3], "calls": 1, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1}
+    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1, P2, P3], "calls": 1, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1, "range": "free"}
     assert data["meta"]["viewedPages"]["names"] == []
     vision = data["meta"]["vision"]
     assert vision["analysisCalls"] == 3 and vision["groundingCalls"] == 0 and vision["answerCalls"] == 2
@@ -189,7 +189,7 @@ def test_per_call_and_per_turn_limits(client, mock_llm, monkeypatch):
     assert third == ("Page limit reached: 3 pages have already been analyzed this turn, so spec.pdf (pages 4) was not analyzed. "
                      "Answer from the results you already have, and tell the user that only 3 pages could be analyzed.")
     assert len(analysis_calls(mock_llm)) == 3
-    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1, P2, P3], "calls": 3, "limit": 3, "refused": 1, "group": 1}
+    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1, P2, P3], "calls": 3, "limit": 3, "refused": 1, "group": 1, "range": "free"}
     assert [item["name"] for item in data["attachments"]] == ["spec.pdf", P1, P2, P3]      # 4쪽은 그리지 않았다
 
 
@@ -212,7 +212,7 @@ def test_same_page_and_question_is_not_asked_twice_but_a_new_question_is(client,
     assert len(analysis_calls(mock_llm)) == 2
     assert first.split("\n")[1] == second.split("\n")[1] == f"[page 1] answer for {P1}"
     assert third.startswith('Analyzed 1 page of spec.pdf with the question: "Q2".')
-    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1], "calls": 3, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1}
+    assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1], "calls": 3, "limit": config.MAX_ANALYZED_PAGES, "refused": 0, "group": 1, "range": "free"}
     assert data["meta"]["vision"]["analysisCalls"] == 2
 
 
@@ -315,7 +315,7 @@ def test_trace_nests_the_per_page_calls_under_the_tool(client, mock_llm, monkeyp
     document = client.get(f"/api/traces/{data['meta']['traceId']}").json()
     events = document["events"]
     (entry,) = [event for event in events if event["kind"] == "input"]
-    assert entry["data"]["analyze"] == {"enabled": True, "pagesPerCall": config.ANALYZE_PAGES_PER_CALL, "maxPages": config.MAX_ANALYZED_PAGES, "group": config.ANALYZE_GROUP, "groupMax": config.ANALYZE_GROUP_MAX}
+    assert entry["data"]["analyze"] == {"enabled": True, "pagesPerCall": config.ANALYZE_PAGES_PER_CALL, "maxPages": config.MAX_ANALYZED_PAGES, "group": config.ANALYZE_GROUP, "groupMax": config.ANALYZE_GROUP_MAX, "range": config.ANALYZE_RANGE}
     (evidence,) = [event for event in events if event["label"] == "증거 조립"]
     assert evidence["data"]["analyzeTool"] is True and evidence["data"]["tools"][1] == "analyze_pages"
     assert evidence["data"]["maxAnalyzedPages"] == config.MAX_ANALYZED_PAGES
@@ -406,8 +406,8 @@ async def test_cut_off_runaway_and_errors_are_reported_per_page():
 
 
 def test_meta_keeps_only_well_formed_analyzed_pages():
-    good = {"enabled": True, "names": ["a.pdf · page 1", 7], "calls": 2, "limit": 60, "refused": 0, "group": 1}
-    assert sanitize_meta({"analyzedPages": good})["analyzedPages"] == {"enabled": True, "names": ["a.pdf · page 1"], "calls": 2, "limit": 60, "refused": 0, "group": 1}
+    good = {"enabled": True, "names": ["a.pdf · page 1", 7], "calls": 2, "limit": 60, "refused": 0, "group": 1, "range": "free"}
+    assert sanitize_meta({"analyzedPages": good})["analyzedPages"] == {"enabled": True, "names": ["a.pdf · page 1"], "calls": 2, "limit": 60, "refused": 0, "group": 1, "range": "free"}
     assert sanitize_meta({"analyzedPages": {**good, "enabled": False, "names": []}})["analyzedPages"]["enabled"] is False
     assert "analyzedPages" not in sanitize_meta({"analyzedPages": {**good, "enabled": "yes"}})
     assert "analyzedPages" not in sanitize_meta({"analyzedPages": {**good, "calls": "two"}})
@@ -457,7 +457,7 @@ def test_fixed_group_sends_several_pages_in_one_call_and_splits_the_answers(clie
     assert result.startswith('Analyzed 3 pages of spec.pdf with the question: "Q". The pages were looked at 2 at a time in separate calls')
     assert f"\n[page 1] answer for {P1}\n[page 2] answer for {P2}\n[page 3] answer for {P3}\n" in result
     assert data["meta"]["analyzedPages"] == {"enabled": True, "names": [P1, P2, P3], "calls": 1, "limit": config.MAX_ANALYZED_PAGES,
-                                             "refused": 0, "group": 2}
+                                             "refused": 0, "group": 2, "range": "free"}
     assert data["meta"]["vision"]["analysisCalls"] == 2
     assert client.post("/api/chat", json=chat_body(mock_llm, "q", answerImageMode="auto", analyzeGroup="lots")).status_code == 400
 
@@ -520,3 +520,127 @@ async def test_grouped_answer_without_markers_is_kept_as_one_block_and_a_bad_gro
     assert bad.startswith('ERROR: "group" must be a whole number of pages from 1 to')
     await execute_tool(context, ToolCall(name="analyze_pages", arguments={"name": "spec.pdf", "pages": "1-2", "question": "Q"}))
     assert context.usage.analysis_calls == 2
+
+
+# --------------------------------------------------------------------------- 따로 보기로 갈아타면 쌓인 보기 쪽을 내린다
+def test_switching_to_analyze_pages_drops_the_pages_attached_with_view_page(client, mock_llm):
+    """같이 보기로 시작했다가 따로 보기로 넘어가면 앱이 붙여 둔 쪽을 내린다(2026-10-07 사용자 결정). 그 뒤의 view_page는 다시 쌓인다."""
+    def handler(body):
+        if is_analysis_call(body):
+            return page_answer(body)
+        results = tool_results(body)
+        if not results:
+            return view("spec.pdf", 1)
+        if len(results) == 1:
+            return analyze("spec.pdf", "2-3", "Q")
+        if len(results) == 2:
+            return view("spec.pdf", 3)
+        return "답"
+
+    mock_llm.reset(handler)
+    data = client.post("/api/chat", json=chat_body(mock_llm, "훑어줘", [upload("spec.pdf", build_pdf("native", "native", "native"), PDF)],
+                                                   answerImageMode="auto")).json()
+    first, after_view, after_analyze, final = main_calls(mock_llm)
+    assert image_count(after_view) == 1 and f"1: {P1} (requested with view_page)" in anchor_text(after_view)
+    assert image_count(after_analyze) == 0 and "[IMAGES ATTACHED" not in anchor_text(after_analyze)       # 내려갔다
+    analyzed = tool_results(after_analyze)[1]
+    assert (f"Note: the 1 page you had attached with view_page ({P1}) was detached from the user's message because you switched to "
+            "analyze_pages; request them again with view_page if you need to look at them side by side.") in analyzed
+    assert image_count(final) == 1 and f"1: {P3} (requested with view_page)" in anchor_text(final)        # 그 뒤의 보기는 다시 쌓인다
+    assert tool_results(final)[2].startswith(f"Attached {P3} now as image #1")
+    assert data["meta"]["viewedPages"] == {"names": [P3], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 1}
+    assert data["meta"]["analyzedPages"]["names"] == [P2, P3]
+
+
+def test_analyze_then_view_and_view_then_bbox_do_not_drop_anything(client, mock_llm):
+    def handler(body):
+        if is_grounding_call(body):
+            return json.dumps({"text": "", "regions": [{"type": "text", "label": "A", "bbox": [10, 10, 50, 50]}]})
+        if is_analysis_call(body):
+            return page_answer(body)
+        results = tool_results(body)
+        if not results:
+            return view("spec.pdf", 1)
+        if len(results) == 1:
+            return {"tool_calls": [{"name": "inspect_visual", "arguments": {"name": "spec.pdf", "page": 2, "task": "find A"}}]}
+        return "답"
+
+    mock_llm.reset(handler)
+    data = client.post("/api/chat", json=chat_body(mock_llm, "1쪽 보고 2쪽에 표시", [upload("spec.pdf", build_pdf("native", "native"), PDF)],
+                                                   answerImageMode="auto")).json()
+    final = main_calls(mock_llm)[-1]
+    assert image_count(final) == 1 and data["meta"]["viewedPages"] == {"names": [P1], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
+    assert "보기 도구로 붙여 둔" not in json.dumps(data)
+
+
+def test_trace_records_the_drop(client, mock_llm, monkeypatch):
+    monkeypatch.setenv("DOCCHAT_DEBUG_TRACE", "1")
+
+    def handler(body):
+        if is_analysis_call(body):
+            return page_answer(body)
+        results = tool_results(body)
+        if not results:
+            return view("spec.pdf", 1)
+        if len(results) == 1:
+            return analyze("spec.pdf", "2", "Q")
+        return "답"
+
+    mock_llm.reset(handler)
+    data = client.post("/api/chat", json=chat_body(mock_llm, "q", [upload("spec.pdf", build_pdf("native", "native"), PDF)], answerImageMode="auto")).json()
+    events = client.get(f"/api/traces/{data['meta']['traceId']}").json()["events"]
+    (note,) = [event for event in events if event["label"] == "보기 도구로 붙여 둔 1장을 내림 — 따로 보기로 전환"]
+    (tool,) = [event for event in events if event["kind"] == "tool" and event["data"].get("name") == "analyze_pages"]
+    assert note["parent"] == tool["id"] and note["data"]["dropped"] == [P1]
+    answers = [event for event in events if event["kind"] == "model" and event["data"]["kind"] == "answer"]
+    assert [len(call["data"]["images"]) for call in answers] == [0, 1, 0]
+    assert sanitize_meta({"viewedPages": {"names": [], "limit": 12, "refused": 0, "dropped": 3}})["viewedPages"]["dropped"] == 3
+    assert "dropped" not in sanitize_meta({"viewedPages": {"names": [], "limit": 12, "refused": 0}})["viewedPages"]
+
+
+# --------------------------------------------------------------------------- 범위 고정: 첫 쪽부터 한 호출 상한만큼 꽉 채운다
+def test_fixed_range_fills_each_call_from_the_first_requested_page(client, mock_llm, monkeypatch):
+    monkeypatch.setattr(config, "ANALYZE_PAGES_PER_CALL", 3)
+
+    def handler(body):
+        if is_analysis_call(body):
+            return page_answer(body)
+        results = tool_results(body)
+        if not results:
+            return analyze("spec.pdf", "2-5", "Q")              # 끝 쪽은 무시된다
+        if len(results) == 1:
+            return analyze("spec.pdf", "1,4", "Q")              # 목록도 첫 쪽만 뜻한다
+        if len(results) == 2:
+            return analyze("spec.pdf", "4-5", "Q")              # 문서 끝에서는 남은 만큼
+        return "답"
+
+    mock_llm.reset(handler)
+    data = client.post("/api/chat", json=chat_body(mock_llm, "훑어줘", [upload("spec.pdf", build_pdf(*["native"] * 5), PDF)],
+                                                   answerImageMode="auto", analyzeRange="fixed")).json()
+    first = main_calls(mock_llm)[0]
+    assert "page to start from: each call covers 3 consecutive pages" in first["tools"][1]["function"]["parameters"]["properties"]["pages"]["description"]
+    one, two, three = tool_results(main_calls(mock_llm)[-1])
+    assert "\n[page 2] " in one and "\n[page 4] " in one and "[page 5]" not in one
+    assert 'Range mode is fixed: each call covers 3 consecutive pages from the first page you request, so this call covered pages 2-4; to continue, call analyze_pages again with pages "5".' in one
+    assert "Only the first" not in one
+    assert "\n[page 1] " in two and "\n[page 3] " in two and "[page 4]" not in two and "covered pages 1-3" in two
+    assert "\n[page 4] " in three and "\n[page 5] " in three
+    assert "Range mode is fixed: this call covered pages 4-5, which reaches the end of the document." in three
+    assert data["meta"]["analyzedPages"]["range"] == "fixed" and data["meta"]["analyzedPages"]["calls"] == 3
+    assert data["meta"]["vision"]["analysisCalls"] == 5                                        # 2-4(3) + 1-3(1쪽만 새것) + 4-5(5쪽만 새것)
+    assert client.post("/api/chat", json=chat_body(mock_llm, "q", answerImageMode="auto", analyzeRange="sideways")).status_code == 400
+    assert client.get("/api/health").json()["analyze"]["range"] == config.ANALYZE_RANGE == "free"
+
+
+async def test_free_range_keeps_the_requested_pages_and_fixed_is_pdf_only():
+    pdf = Attachment(name="spec.pdf", kind="pdf", mime=PDF, data=build_pdf("native", "native", "native"), text="t", total_pages=3)
+    provider = PageProvider({P1: "one", P2: "two", P3: "three"})
+    free = ToolContext(provider=provider, attachments=[pdf], analysis_range="free")
+    result = await execute_tool(free, ToolCall(name="analyze_pages", arguments={"name": "spec.pdf", "pages": "1,3", "question": "Q"}))
+    assert "\n[page 1] one\n[page 3] three\n" in result and "[page 2]" not in result and "Range mode" not in result
+    fixed = ToolContext(provider=PageProvider({P1: "one", P2: "two", P3: "three"}), attachments=[pdf], analysis_range="fixed")
+    result = await execute_tool(fixed, ToolCall(name="analyze_pages", arguments={"name": "spec.pdf", "pages": "2", "question": "Q"}))
+    assert "\n[page 2] two\n[page 3] three\n" in result and "covered pages 2-3, which reaches the end" in result
+    image = Attachment(name="pic.png", kind="image", mime="image/png", data=png_bytes(), send_to_model=True)
+    only = ToolContext(provider=PageProvider({"pic.png": "bolts"}), attachments=[image], analysis_range="fixed")
+    assert "\n[pic.png] bolts\n" in await execute_tool(only, ToolCall(name="analyze_pages", arguments={"name": "pic.png", "question": "Q"}))

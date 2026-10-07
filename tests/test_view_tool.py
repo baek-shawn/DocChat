@@ -75,7 +75,7 @@ def test_auto_mode_offers_the_view_tool_and_marks_drawing_pages(client, mock_llm
     assert image_count(main) == 0 and "[PAGE IMAGES" not in all_text(main)         # 처음에는 업로드 이미지만(여기선 없음)
     assert data["meta"]["answerImageMode"] == "auto"
     assert data["meta"]["answerImages"] == {"sent": 0, "candidates": 0, "names": []}
-    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
     health = client.get("/api/health").json()
     assert health["view"] == {"maxViewedPages": config.MAX_VIEWED_PAGES, "drawingMinRasterArea": config.DRAWING_MIN_RASTER_AREA,
                               "drawingMinVectorOperations": config.DRAWING_MIN_VECTOR_OPERATIONS}
@@ -130,7 +130,7 @@ def test_view_page_attaches_the_page_to_the_next_call_and_pages_accumulate(clien
     assert [image.size for image in request_images(third)] == [(pages[name]["width"], pages[name]["height"])
                                                                for name in ("spec.pdf · page 2", "spec.pdf · page 3")]
     assert data["text"] == "2쪽과 3쪽을 보고 답합니다." and data["artifacts"] == []     # 보기는 bbox 아티팩트를 만들지 않는다
-    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 2", "spec.pdf · page 3"], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 2", "spec.pdf · page 3"], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
     saved = client.get(f"/api/sessions/{data['conversationId']}").json()["messages"]
     assert saved[1]["meta"]["viewedPages"] == data["meta"]["viewedPages"]
 
@@ -159,7 +159,7 @@ def test_view_limit_and_duplicate_requests(client, mock_llm, monkeypatch):
     assert results[2] == ("Page limit reached: 1 pages are already attached for this turn, so spec.pdf · page 2 was not attached. "
                           "Answer from the pages you can see, and tell the user that only 1 pages were viewed.")
     assert image_count(final) == 1
-    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 1"], "limit": 1, "refused": 1}
+    assert data["meta"]["viewedPages"] == {"names": ["spec.pdf · page 1"], "limit": 1, "refused": 1, "dropped": 0}
     assert [item["name"] for item in data["attachments"]] == ["spec.pdf", "spec.pdf · page 1"]     # 2쪽은 그리지 않았다
 
 
@@ -171,7 +171,7 @@ def test_view_page_on_an_already_attached_upload_adds_nothing(client, mock_llm):
     assert image_count(first) == 1 and image_count(final) == 1                  # 두 장이 되지 않는다
     assert tool_results(final)[0].startswith("pic.png is already attached to the user's message as image #1; nothing was added.")
     assert "[IMAGES ATTACHED" not in anchor_text(final)                         # 보기 도구로 더한 것이 없으면 줄도 없다
-    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0}
+    assert data["meta"]["viewedPages"] == {"names": [], "limit": config.MAX_VIEWED_PAGES, "refused": 0, "dropped": 0}
 
 
 def test_follow_up_turn_does_not_carry_pages_but_can_request_them_again(client, mock_llm):

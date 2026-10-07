@@ -313,10 +313,29 @@ def resolve_analyze_group(requested: object) -> str | int:
     return normalize_analyze_group(requested)
 
 
+# 범위 고정(Step 10 2차, 2026-10-07 사용자 결정): 따로 보기 한 호출이 보는 쪽 범위를 누가 정하나.
+#   free  = 모델이 넘긴 범위 그대로(상한에 넘치면 앞에서부터) — 기본. 모델이 잡힌 쪽 목록대로 조각내 부르면 스텝이 는다
+#   fixed = 모델이 무엇을 넘기든 **첫 쪽부터 한 호출 상한(ANALYZE_PAGES_PER_CALL)만큼 꽉 채워** 본다(Claude가 PDF를 읽는 방식)
+# 어느 쪽이 나은지는 실험으로 정한다 → 요청마다 고를 수 있고(`analyzeRange`), 메타에 남긴다.
+ANALYZE_RANGE_MODES = ("free", "fixed")
+_configured_range = str(os.environ.get("DOCCHAT_ANALYZE_RANGE") or "").strip().lower()
+ANALYZE_RANGE = _configured_range if _configured_range in ANALYZE_RANGE_MODES else "free"
+
+
+def resolve_analyze_range(requested: str | None) -> str:
+    """요청 값이 비어 있으면 서버 기본값. 모르는 값이면 ValueError(호출부가 사용자 오류로 바꾼다)."""
+    value = str(requested or "").strip().lower()
+    if not value:
+        return ANALYZE_RANGE
+    if value not in ANALYZE_RANGE_MODES:
+        raise ValueError(value)
+    return value
+
+
 def analyze_settings() -> dict[str, bool | int | str]:
     """따로 보기 도구의 설정 — /api/health와 트레이스 입력이 같은 값을 본다."""
     return {"enabled": ANALYZE_TOOL, "pagesPerCall": ANALYZE_PAGES_PER_CALL, "maxPages": MAX_ANALYZED_PAGES,
-            "group": ANALYZE_GROUP, "groupMax": ANALYZE_GROUP_MAX}
+            "group": ANALYZE_GROUP, "groupMax": ANALYZE_GROUP_MAX, "range": ANALYZE_RANGE}
 
 
 def tile_settings() -> dict[str, float | int]:

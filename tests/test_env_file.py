@@ -123,6 +123,7 @@ def test_example_file_shows_the_real_defaults():
     assert example["DOCCHAT_IMAGE_MODE"] == config.DEFAULT_IMAGE_MODE and example["DOCCHAT_HOST"] == config.HOST
     assert example["DOCCHAT_ANSWER_IMAGE_MODE"] == config.DEFAULT_ANSWER_IMAGE_MODE == "uploads"
     assert example["DOCCHAT_ANALYZE_GROUP"] == str(config.ANALYZE_GROUP) == "1"
+    assert example["DOCCHAT_ANALYZE_RANGE"] == config.ANALYZE_RANGE == "free"
 
 
 def test_analyze_group_setting_accepts_a_number_or_auto(tmp_path):

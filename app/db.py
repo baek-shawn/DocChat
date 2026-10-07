@@ -263,6 +263,9 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
         if all(number is not None for number in counts.values()) and isinstance(names, list):
             meta["viewedPages"] = {"names": [str(item)[:300] for item in names[:200] if isinstance(item, str)],
                                    **{name: int(number) for name, number in counts.items()}}
+            dropped = _bounded_number(viewed.get("dropped"), 100_000)     # 따로 보기로 전환하며 내린 수(2026-10-07, 옛 메타에는 없다)
+            if dropped is not None:
+                meta["viewedPages"]["dropped"] = int(dropped)
     # 따로 보기 도구(Step 10 2차, 자동 모드): 도구를 내놓았는지, 따로 본 쪽, 도구 호출 수, 상한, 상한에 걸려 보지 못한 요청 수
     analyzed = value.get("analyzedPages")
     if isinstance(analyzed, dict) and isinstance(analyzed.get("enabled"), bool):
@@ -278,6 +281,8 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
                 meta["analyzedPages"]["group"] = "auto"
             elif _bounded_number(group, 1000) is not None and int(_bounded_number(group, 1000)) >= 1:
                 meta["analyzedPages"]["group"] = int(_bounded_number(group, 1000))
+            if analyzed.get("range") in config.ANALYZE_RANGE_MODES:       # 범위 방식(실험 조건)
+                meta["analyzedPages"]["range"] = analyzed["range"]
     # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
     if valid_id(value.get("traceId")):
         meta["traceId"] = value["traceId"]
