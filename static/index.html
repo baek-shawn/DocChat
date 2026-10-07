@@ -170,6 +170,17 @@
     <p id="answerImageHelp" class="help"></p>
     <!-- 따로 보기 도구(Step 10 2차): 자동 모드에서만 의미가 있다. 실험에서 "같이 보기만" / "따로 보기 포함"을 가르는 스위치. -->
     <label class="check"><input id="analyzeTool" type="checkbox" /> 자동에서 따로 보기 도구(analyze_pages)도 내놓기 — 쪽마다 별도 호출로 보고 글로 받음</label>
+    <label>따로 보기 묶음 — 한 호출에 넣는 쪽 수
+      <select id="analyzeGroup">
+        <option value="">서버 기본값</option>
+        <option value="1">1쪽씩 — 쪽마다 독립 호출</option>
+        <option value="2">2쪽씩</option>
+        <option value="3">3쪽씩</option>
+        <option value="5">5쪽씩</option>
+        <option value="10">10쪽씩</option>
+        <option value="auto">자동 — 모델이 상한 안에서 고름</option>
+      </select>
+    </label>
     <p id="analyzeHelp" class="help"></p>
     <p id="traceHelp" class="help"></p>
 

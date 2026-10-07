@@ -272,6 +272,12 @@ def sanitize_meta(value: Any) -> dict[str, Any]:
             meta["analyzedPages"] = {"enabled": analyzed["enabled"],
                                      "names": [str(item)[:300] for item in names[:1000] if isinstance(item, str)],
                                      **{name: int(number) for name, number in counts.items()}}
+            # 묶음 크기(실험 조건): 1 이상의 정수 또는 "auto". 옛 메타에는 없다.
+            group = analyzed.get("group")
+            if group == "auto":
+                meta["analyzedPages"]["group"] = "auto"
+            elif _bounded_number(group, 1000) is not None and int(_bounded_number(group, 1000)) >= 1:
+                meta["analyzedPages"]["group"] = int(_bounded_number(group, 1000))
     # 이 답을 만든 턴의 트레이스(Step 7). 트레이스를 켠 턴에만 있다.
     if valid_id(value.get("traceId")):
         meta["traceId"] = value["traceId"]

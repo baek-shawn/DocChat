@@ -268,9 +268,55 @@ def answer_mode_offers_analyze_tool(mode: str, requested: bool | None = None) ->
     return answer_mode_offers_view_tool(mode) and resolve_switch(requested, ANALYZE_TOOL)
 
 
-def analyze_settings() -> dict[str, bool | int]:
+# 묶음 보기(Step 10 2차, 2026-10-07 사용자 요청): 따로 보기의 **한 VLM 호출에 넣는 쪽 수**.
+#   1      = 쪽마다 독립(2차 설계 그대로)
+#   k      = k쪽 이미지를 한 호출에 넣고 쪽별로 답하게 한다(호출 수 1/k, 묶음 안에서 쪽을 잘못 매길 위험은 실측)
+#   "auto" = 모델이 도구 인자 `group`으로 상한(ANALYZE_GROUP_MAX) 안에서 고른다. 숫자로 고정하면 그 인자는 내놓지 않는다
+# 실험 조건을 고정해야 하므로 요청마다 고를 수 있고(`analyzeGroup`), 답변 메타에 어떤 값으로 돌았는지 남긴다.
+ANALYZE_GROUP_AUTO = "auto"
+ANALYZE_GROUP_MAX = _int("DOCCHAT_ANALYZE_GROUP_MAX", 10, low=1, high=50)
+
+
+def normalize_analyze_group(value: object) -> str | int:
+    """`"auto"` 또는 1 이상의 정수(상한으로 자른다). 모르는 값이면 ValueError."""
+    if isinstance(value, bool):
+        raise ValueError(value)
+    if isinstance(value, (int, float)):
+        number = int(value)
+    else:
+        text = str(value or "").strip().lower()
+        if text == ANALYZE_GROUP_AUTO:
+            return ANALYZE_GROUP_AUTO
+        if not text.isdigit():
+            raise ValueError(value)
+        number = int(text)
+    if number < 1:
+        raise ValueError(value)
+    return min(number, ANALYZE_GROUP_MAX)
+
+
+def _analyze_group_default() -> str | int:
+    raw = os.environ.get("DOCCHAT_ANALYZE_GROUP", "")
+    try:
+        return normalize_analyze_group(raw) if str(raw).strip() else 1
+    except ValueError:
+        return 1
+
+
+ANALYZE_GROUP = _analyze_group_default()
+
+
+def resolve_analyze_group(requested: object) -> str | int:
+    """요청 값이 비어 있으면 서버 기본값. 모르는 값이면 ValueError(호출부가 사용자 오류로 바꾼다)."""
+    if requested is None or (isinstance(requested, str) and not requested.strip()):
+        return ANALYZE_GROUP
+    return normalize_analyze_group(requested)
+
+
+def analyze_settings() -> dict[str, bool | int | str]:
     """따로 보기 도구의 설정 — /api/health와 트레이스 입력이 같은 값을 본다."""
-    return {"enabled": ANALYZE_TOOL, "pagesPerCall": ANALYZE_PAGES_PER_CALL, "maxPages": MAX_ANALYZED_PAGES}
+    return {"enabled": ANALYZE_TOOL, "pagesPerCall": ANALYZE_PAGES_PER_CALL, "maxPages": MAX_ANALYZED_PAGES,
+            "group": ANALYZE_GROUP, "groupMax": ANALYZE_GROUP_MAX}
 
 
 def tile_settings() -> dict[str, float | int]:

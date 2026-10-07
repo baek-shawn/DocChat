@@ -33,9 +33,9 @@ from ..providers.base import (Provider, ReasoningEffortError, ToolCall, ToolSpec
 from ..providers.reasoning import describe_reasoning_progress
 from .grounding import (VisualInspection, map_box_to_source, merge_tile_boxes, parse_visual_inspection,
                         valid_box)
-from .prompts import (GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, PAGE_ANALYSIS_SYSTEM_PROMPT, analyze_pages_limit_reached,
-                      analyze_pages_result, grounding_instruction, page_analysis_instruction, view_page_already_attached,
-                      view_page_limit_reached, view_page_result)
+from .prompts import (GROUNDING_RETRY_NOTE, GROUNDING_SYSTEM_PROMPT, PAGE_ANALYSIS_SYSTEM_PROMPT, PAGES_ANALYSIS_SYSTEM_PROMPT,
+                      analyze_pages_limit_reached, analyze_pages_result, grounding_instruction, page_analysis_instruction,
+                      view_page_already_attached, view_page_limit_reached, view_page_result)
 
 
 class ToolError(Exception):
@@ -79,26 +79,33 @@ VIEW_PAGE = ToolSpec(
     },
 )
 
-ANALYZE_PAGES = ToolSpec(
-    name="analyze_pages",
-    description=(
-        "Analyze pages of an uploaded PDF (or an uploaded image) one by one in separate vision calls and get a text answer "
-        "per page; the pages are not attached to your own call. Pass a concrete question - what to look for on each page "
-        "and what to report. Use it for questions each page can answer on its own, or to go through many pages: pass a "
-        f'range such as "1-10" (up to {config.ANALYZE_PAGES_PER_CALL} pages per call) and call it again for the next range '
-        "until every page is covered. To compare pages side by side, use view_page instead."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "description": "Exact attachment name from the attachment manifest."},
-            "pages": {"type": "string", "description": '1-based page number, range or list: "7", "1-10", "2,5,7-9". '
-                                                       "Omit for an uploaded image or a one-page PDF."},
-            "question": {"type": "string", "description": "What to look for on each page and what to report, written concretely."},
-        },
-        "required": ["name", "question"],
-    },
-)
+def analyze_pages_spec(group_choice: bool = False) -> ToolSpec:
+    """따로 보기 도구의 정의. group_choice(묶음 크기를 모델이 고르는 턴, `analyzeGroup: auto`)일 때만 `group` 인자를 내놓는다 —
+    숫자로 고정한 실험 조건에서 모델이 바꿀 수 없어야 한다."""
+    properties: dict[str, Any] = {
+        "name": {"type": "string", "description": "Exact attachment name from the attachment manifest."},
+        "pages": {"type": "string", "description": '1-based page number, range or list: "7", "1-10", "2,5,7-9". '
+                                                   "Omit for an uploaded image or a one-page PDF."},
+        "question": {"type": "string", "description": "What to look for on each page and what to report, written concretely."},
+    }
+    if group_choice:
+        properties["group"] = {"type": "integer", "minimum": 1, "maximum": config.ANALYZE_GROUP_MAX,
+                               "description": "How many pages to look at in one vision call (default 1). Use 1 to read each "
+                                              "page precisely; use more only to sort pages by what they show."}
+    return ToolSpec(
+        name="analyze_pages",
+        description=(
+            "Analyze pages of an uploaded PDF (or an uploaded image) in separate vision calls and get a text answer per page; "
+            "the pages are not attached to your own call. Pass a concrete question - what to look for on each page and what "
+            "to report. Use it for questions each page can answer on its own, or to go through many pages: pass a range such "
+            f'as "1-10" (up to {config.ANALYZE_PAGES_PER_CALL} pages per call) and call it again for the next range until '
+            "every page is covered. To compare pages side by side, use view_page instead."
+        ),
+        parameters={"type": "object", "properties": properties, "required": ["name", "question"]},
+    )
+
+
+ANALYZE_PAGES = analyze_pages_spec()
 
 READ_ATTACHMENT = ToolSpec(
     name="read_attachment",
@@ -160,8 +167,11 @@ class ToolContext:
     analysis_calls: int = 0
     analyzed_pages: int = 0
     analysis_refusals: int = 0
-    # (쪽 이름, 질문) → 답. 같은 턴 안에서 같은 쪽을 같은 질문으로 다시 부르면 호출하지 않고 이것을 돌려준다.
-    analysis_cache: dict[tuple[str, str], str] = field(default_factory=dict)
+    # (쪽 이름, 질문) → (표식, 답). 같은 턴 안에서 같은 쪽을 같은 질문으로 다시 부르면 호출하지 않고 이것을 돌려준다.
+    # 표식은 "page 3"이고, 묶음 보기에서 모델이 쪽을 가르지 않았으면 그 묶음의 쪽들이 같은 ("pages 6-10", 답)을 나눠 갖는다.
+    analysis_cache: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # 묶음 보기: 한 VLM 호출에 넣는 쪽 수(1 = 쪽마다, k, 또는 "auto" = 모델이 `group` 인자로 고름). 요청마다 정한다.
+    analysis_group: str | int = 1
 
     def viewed_names(self) -> list[str]:
         return [image.name for image in self.viewed]
@@ -171,15 +181,16 @@ class ToolContext:
         return [*self.base_image_names, *self.viewed_names()]
 
 
-def available_tools(attachments: list[Attachment], *, view_tool: bool = False, analyze_tool: bool = False) -> list[ToolSpec]:
+def available_tools(attachments: list[Attachment], *, view_tool: bool = False, analyze_tool: bool = False,
+                    analyze_group_choice: bool = False) -> list[ToolSpec]:
     """첨부가 없으면 도구도 없다(순수 대화). 볼 수 있는 면이 있을 때만 inspect_visual(과, 자동 모드면 view_page,
-    따로 보기를 켰으면 analyze_pages)을 내놓는다."""
+    따로 보기를 켰으면 analyze_pages — 묶음 크기를 모델이 고르는 턴이면 `group` 인자 포함)을 내놓는다."""
     tools: list[ToolSpec] = []
     if any(item.is_image or item.is_pdf for item in attachments):
         if view_tool:
             tools.append(VIEW_PAGE)
         if analyze_tool:
-            tools.append(ANALYZE_PAGES)
+            tools.append(analyze_pages_spec(analyze_group_choice))
         tools.append(INSPECT_VISUAL)
     if any(item.text and not item.is_image for item in attachments):
         tools += [READ_ATTACHMENT, SEARCH_ATTACHMENTS]
@@ -195,7 +206,8 @@ def describe_tool_call(call: ToolCall) -> str:
         return f"그림을 보는 중… ({call.arguments.get('name', '')}{page})"
     if call.name == "analyze_pages":
         pages = f" {call.arguments.get('pages')}쪽" if call.arguments.get("pages") else ""
-        return f"쪽을 따로 보는 중… ({call.arguments.get('name', '')}{pages})"
+        group = f", {call.arguments.get('group')}쪽씩" if isinstance(call.arguments.get("group"), (int, float)) and call.arguments.get("group", 1) > 1 else ""
+        return f"쪽을 따로 보는 중… ({call.arguments.get('name', '')}{pages}{group})"
     if call.name == "read_attachment":
         return f"문서 본문을 읽는 중… ({call.arguments.get('name', '')})"
     if call.name == "search_attachments":
@@ -537,33 +549,70 @@ def _limit_note(context: ToolContext) -> str:
     return f"{context.analyzed_pages}/{config.MAX_ANALYZED_PAGES}쪽"
 
 
-async def _analyze_one(context: ToolContext, surface: Attachment, image: ModelImage, question: str) -> str:
-    """쪽 한 장에 대한 따로 보기 호출(전용 시스템 프롬프트, 추론·출력 상한·추론 수준은 bbox 호출과 같은 축). 답 글을 돌려준다.
+_PAGE_MARKER = re.compile(r"^[ \t]*\[\s*page\s+(\d+)\s*\][ \t]*:?[ \t]*", re.IGNORECASE | re.MULTILINE)
+
+
+def split_page_answers(text: str, numbers: list[int]) -> dict[int, str] | None:
+    """묶음 보기 응답을 `[page n]` 표식으로 쪽별로 가른다. 요청한 쪽이 하나라도 빠지면 None(가르지 않고 묶음 답으로 둔다)."""
+    matches = list(_PAGE_MARKER.finditer(text or ""))
+    found: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        number = int(match.group(1))
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        if number in numbers and number not in found:
+            found[number] = text[match.end():end].strip()
+    if any(number not in found for number in numbers):
+        return None
+    return found
+
+
+def _resolve_group(context: ToolContext, arguments: dict[str, Any]) -> int:
+    """이 호출의 묶음 크기. 요청이 숫자로 고정했으면 그 값(모델 인자는 무시), `auto`면 모델의 `group`(없으면 1), 상한 안에서."""
+    choice: str | int = context.analysis_group
+    if choice == config.ANALYZE_GROUP_AUTO:
+        raw = arguments.get("group")
+        if raw in (None, ""):
+            return 1
+        try:
+            choice = config.normalize_analyze_group(raw)
+        except ValueError:
+            raise ToolError(f'"group" must be a whole number of pages from 1 to {config.ANALYZE_GROUP_MAX} (got {raw!r}).') from None
+        if choice == config.ANALYZE_GROUP_AUTO:
+            return 1
+    return max(1, min(int(choice), config.ANALYZE_GROUP_MAX))
+
+
+async def _analyze_group(context: ToolContext, surfaces: list[Attachment], images: list[ModelImage], question: str) -> str:
+    """쪽 한 장(또는 묶음 보기의 여러 장)에 대한 따로 보기 호출(전용 시스템 프롬프트, 추론·출력 상한·추론 수준은 bbox 호출과
+    같은 축). 응답 글(잡음만 정리)을 돌려준다 — 묶음이면 호출부가 `[page n]` 표식으로 가른다.
 
     재시도는 없다 — 전사(비전사 응답)·bbox(비구조화 JSON)와 달리 "답의 모양"을 검사할 기준이 없다. 출력 상한에 닿은 호출도
     다시 보내지 않고(Step 6-0) 읽은 데까지만 남기며, 끊긴 글이 추론일 수 있으면 버린다.
     """
+    grouped = len(images) > 1
+    where = images[0].name if not grouped else f"{images[0].name} 외 {len(images) - 1}장"
     budget = config.reasoning_budget("grounding") if not context.disable_thinking else None
     effort = (context.reasoning_effort or None) if not context.disable_thinking else None
     watch = (lambda info: context.on_live(describe_reasoning_progress(info))) if context.on_live is not None else None
     context.usage.analysis_calls += 1
     response = await context.provider.analyze(
-        [{"role": "system", "content": PAGE_ANALYSIS_SYSTEM_PROMPT},
-         {"role": "user", "content": page_analysis_instruction(question, surface.name)}],
-        images=[image], temperature=0.0, disable_thinking=context.disable_thinking,
+        [{"role": "system", "content": PAGES_ANALYSIS_SYSTEM_PROMPT if grouped else PAGE_ANALYSIS_SYSTEM_PROMPT},
+         {"role": "user", "content": page_analysis_instruction(question, surfaces[0].name,
+                                                               [surface.name for surface in surfaces] if grouped else None)}],
+        images=images, temperature=0.0, disable_thinking=context.disable_thinking,
         max_tokens=config.vision_max_tokens(), reasoning_budget=budget, on_reasoning=watch, reasoning_effort=effort,
     )
-    context.usage.count_reasoning("analysis", response, image.name)
+    context.usage.count_reasoning("analysis", response, where)
     if is_reasoning_runaway(response.finish_reason):
-        trace.note("tool", f"추론이 끝나지 않아 중단 → 다시 묻지 않음 · {image.name}", reason=response.runaway)
+        trace.note("tool", f"추론이 끝나지 않아 중단 → 다시 묻지 않음 · {where}", reason=response.runaway)
         return "(not analyzed: the model's reasoning did not finish and was stopped; the call was not retried)"
     if is_output_length_stop(response.finish_reason):
         context.usage.analysis_length_stops += 1
         partial = clean_transcription(cut_off_answer(context.provider, response, thinking_disabled=context.disable_thinking))
-        trace.note("tool", "출력 상한에서 끊김 → 다시 묻지 않음" + (" · 읽은 데까지 남김" if partial else " · 버림") + f" · {image.name}",
+        trace.note("tool", "출력 상한에서 끊김 → 다시 묻지 않음" + (" · 읽은 데까지 남김" if partial else " · 버림") + f" · {where}",
                    keptChars=len(partial), finishReason=response.finish_reason)
         if partial:
-            return f"{partial}\n[cut off at {_limit_words()}; the rest of this page's answer is missing]"
+            return f"{partial}\n[cut off at {_limit_words()}; the rest of this answer is missing]"
         return f"(not analyzed: the model reached {_limit_words()} before answering; the call was not retried)"
     text = clean_transcription(response.text)
     return text or "(the vision model returned no answer for this page)"
@@ -619,11 +668,15 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
     allowed = {target[0] for target in fresh[:max(0, remaining)]}
     not_analyzed = [page for surface_name, page, _ in fresh if surface_name not in allowed and page]
     targets = [target for target in targets if (target[0], question) in context.analysis_cache or target[0] in allowed]
-    trace.note("tool", f"{record.name}의 {len(targets)}쪽을 쪽마다 따로 보기 (이 턴 {_limit_note(context)} 전)",
+    group_size = _resolve_group(context, arguments)
+    trace.note("tool", f"{record.name}의 {len(targets)}쪽을 따로 보기" + (f" · {group_size}쪽씩 묶어서" if group_size > 1 else " · 쪽마다")
+               + f" (이 턴 {_limit_note(context)} 전)",
                question=question, pages=[marker for _, _, marker in targets], cached=[m for n, _, m in targets if (n, question) in context.analysis_cache],
-               deferred=page_ranges(deferred) or None, notAnalyzed=page_ranges(not_analyzed) or None, beyond=beyond or None)
+               deferred=page_ranges(deferred) or None, notAnalyzed=page_ranges(not_analyzed) or None, beyond=beyond or None,
+               group=group_size)
 
-    # 3) 쪽 이미지 준비(그리지 않은 쪽은 지금 그려 한 번에 저장) → 쪽마다 별도 호출(동시 OCR_CONCURRENCY개, 순서 유지)
+    # 3) 쪽 이미지 준비(그리지 않은 쪽은 지금 그려 한 번에 저장) → 쪽마다(또는 묶음마다) 별도 호출(동시 OCR_CONCURRENCY개, 순서 유지)
+    marker_of = {surface_name: marker for surface_name, _, marker in targets}
     before = len(context.attachments)
     surfaces: dict[str, Attachment] = {}
     for surface_name, page, _ in targets:
@@ -632,45 +685,69 @@ async def _analyze_pages(context: ToolContext, arguments: dict[str, Any]) -> str
     if len(context.attachments) > before:
         await _save_rendered_pages(context)
     limiter = asyncio.Semaphore(config.OCR_CONCURRENCY)
+    ordered = list(surfaces.values())
+    chunks = [ordered[start:start + group_size] for start in range(0, len(ordered), group_size)]
     finished = 0
 
-    async def one(surface: Attachment) -> str:
+    async def one(chunk: list[Attachment]) -> str:
         nonlocal finished
-        # 따로 보기의 이미지는 답변 호출과 같은 규칙(전체 한 장)이다. 타일은 전사·bbox 호출에만.
-        images = await assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="analysis",
-                                             mode=context.image_mode)
+        images: list[ModelImage] = []
+        for surface in chunk:
+            # 따로 보기의 이미지는 답변 호출과 같은 규칙(전체 한 장)이다. 타일은 전사·bbox 호출에만.
+            images += await assemble_model_images(surface.name, surface.mime, surface.data or b"", purpose="analysis",
+                                                  mode=context.image_mode)
         async with limiter:
-            context.analyzed_pages += 1
-            text = await _analyze_one(context, surface, images[0], question)
-        finished += 1
-        context.on_progress(f"쪽을 따로 보는 중… {record.name} ({finished}/{len(surfaces)}쪽 · 이 턴 {_limit_note(context)})")
+            context.analyzed_pages += len(chunk)
+            text = await _analyze_group(context, chunk, images, question)
+        finished += len(chunk)
+        context.on_progress(f"쪽을 따로 보는 중… {record.name} ({finished}/{len(ordered)}쪽"
+                            + (f", {group_size}쪽씩" if group_size > 1 else "") + f" · 이 턴 {_limit_note(context)})")
         return text
 
-    ordered = list(surfaces.values())
-    outcomes = await asyncio.gather(*(one(surface) for surface in ordered), return_exceptions=True)
+    outcomes = await asyncio.gather(*(one(chunk) for chunk in chunks), return_exceptions=True)
     for outcome in outcomes:
         # 취소, 그리고 서버가 추론 수준을 받지 않은 경우(설정 오류 — 모든 쪽이 같은 값이다)는 "한 쪽의 실패"가 아니다.
         if isinstance(outcome, (asyncio.CancelledError, ReasoningEffortError)):
             raise outcome
     errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-    if ordered and len(errors) == len(ordered):
+    if chunks and len(errors) == len(chunks):
         raise errors[0]      # 한 쪽도 보지 못했다 → 도구 오류로 되돌린다(모델이 다시 부를 수 있게)
-    for surface, outcome in zip(ordered, outcomes):
-        context.analysis_cache[(surface.name, question)] = (f"ERROR: {outcome}" if isinstance(outcome, BaseException) else outcome)
-        if surface.name not in context.analyzed:
-            context.analyzed.append(surface.name)
-        # 그린 쪽의 바이트는 저장돼 있다(필요하면 도구가 다시 읽는다). 수십 쪽을 메모리에 붙들지 않는다.
-        if surface.id is not None and surface.page_number and surface.name not in context.attached_image_names():
-            surface.data = None
+    for chunk, outcome in zip(chunks, outcomes):
+        numbers = [int(surface.page_number or 0) for surface in chunk]
+        if isinstance(outcome, BaseException):
+            entries = {surface.name: (marker_of[surface.name], f"ERROR: {outcome}") for surface in chunk}
+        elif len(chunk) == 1:
+            entries = {chunk[0].name: (marker_of[chunk[0].name], outcome)}
+        else:
+            # 묶음 보기: 모델이 `[page n]`으로 쪽마다 갈랐으면 쪽별로, 아니면 묶음 전체를 한 답으로(쪽들이 같은 답을 나눠 갖는다)
+            parts = split_page_answers(outcome, numbers) if all(numbers) else None
+            if parts is not None:
+                entries = {surface.name: (marker_of[surface.name], parts[int(surface.page_number)]) for surface in chunk}
+            else:
+                marker = f"pages {page_ranges(numbers)}" if all(numbers) else "images"
+                trace.note("tool", f"묶음 답을 쪽별로 가르지 못해 묶음 그대로 둠 · {marker}", chars=len(outcome))
+                entries = {surface.name: (marker, outcome) for surface in chunk}
+        for surface in chunk:
+            context.analysis_cache[(surface.name, question)] = entries[surface.name]
+            if surface.name not in context.analyzed:
+                context.analyzed.append(surface.name)
+            # 그린 쪽의 바이트는 저장돼 있다(필요하면 도구가 다시 읽는다). 수십 쪽을 메모리에 붙들지 않는다.
+            if surface.id is not None and surface.page_number and surface.name not in context.attached_image_names():
+                surface.data = None
 
-    answers = [(marker, context.analysis_cache[(surface_name, question)]) for surface_name, _, marker in targets]
+    answers: list[tuple[str, str]] = []
+    for surface_name, _, _ in targets:
+        entry = context.analysis_cache[(surface_name, question)]
+        if answers and answers[-1] == entry and entry[0].startswith("pages "):
+            continue                      # 묶음 전체의 답은 한 번만 적는다
+        answers.append(entry)
     remaining = config.MAX_ANALYZED_PAGES - context.analyzed_pages
-    trace.note("tool", f"따로 보기 결과 · {len(answers)}쪽 (이 턴 {_limit_note(context)})",
+    trace.note("tool", f"따로 보기 결과 · {len(targets)}쪽 (이 턴 {_limit_note(context)})",
                results=[{"page": marker, "chars": len(answer), "failed": answer.startswith(("ERROR:", "(not analyzed"))}
-                        for marker, answer in answers], remaining=remaining)
+                        for marker, answer in answers], remaining=remaining, group=group_size, calls=len(chunks))
     return analyze_pages_result(record.name, question, answers, remaining=remaining, limit=config.MAX_ANALYZED_PAGES,
                                 deferred=page_ranges(deferred), not_analyzed=page_ranges(not_analyzed), beyond=beyond,
-                                per_call=per_call)
+                                per_call=per_call, group=group_size, pages=len(targets))
 
 
 # --------------------------------------------------------------------------- 텍스트 도구

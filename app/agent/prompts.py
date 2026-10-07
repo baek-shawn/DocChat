@@ -98,7 +98,30 @@ PAGE_ANALYSIS_SYSTEM_PROMPT = (
 )
 
 
-def page_analysis_instruction(question: str, name: str) -> str:
+# 묶음 보기(한 호출에 쪽 여러 장). 쪽마다 따로 답하게 하고 표식을 약속해 두어야 앱이 쪽별로 가를 수 있다.
+PAGES_ANALYSIS_SYSTEM_PROMPT = (
+    "You are a visual analysis engine. Answer one question about each of the attached images; every image is one complete "
+    "page of the user's document, and the message lists which image is which page. Look only at these images. Answer the "
+    "question for EACH page separately, from what is visible on that page: describe shapes, layout, symbols, counts, labels "
+    "and dimensions exactly as they appear, read values exactly as printed, and say which feature a label or dimension "
+    "belongs to when you can see it. If a page does not contain what the question asks about, say so for that page. Never "
+    "guess from prior knowledge, never invent content that is not visible, and never mix one page's content into another. "
+    "Reply in plain text, concise and factual: no preface, no Markdown, no code fences."
+)
+
+
+def page_analysis_instruction(question: str, name: str, pages: list[str] | None = None) -> str:
+    """쪽별 호출의 user 글. pages가 둘 이상이면 묶음 보기 — 몇 번째 이미지가 어느 쪽인지 적고 `[page n]` 표식으로 나눠 답하게 한다."""
+    if pages and len(pages) > 1:
+        listing = "; ".join(f"{index}: {page}" for index, page in enumerate(pages, start=1))
+        markers = ", ".join(f"[page {page.rsplit(' ', 1)[-1]}]" for page in pages)
+        return "\n".join([
+            f"Question: {question}",
+            f"Images attached to this message, in this order - {listing}.",
+            f"Answer for each page separately. Start each page's answer on its own line with its marker, exactly {markers}, "
+            "in that order, and write nothing else before the first marker. If nothing on a page is relevant to the question, "
+            "say so after its marker in one sentence.",
+        ])
     return "\n".join([
         f"Question: {question}",
         f"Source: {name}",
@@ -108,9 +131,10 @@ def page_analysis_instruction(question: str, name: str) -> str:
 
 
 def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", view_tool: bool = False,
-                  analyze_tool: bool = False) -> str:
+                  analyze_tool: bool = False, analyze_group_choice: bool = False) -> str:
     """view_tool: 보기 도구(`view_page`)를 내놓는 턴인가(답변 이미지 모드 자동, Step 10). 그때만 그 안내가 붙는다.
-    analyze_tool: 따로 보기 도구(`analyze_pages`)도 내놓는가(Step 10 2차). 끄면 1차의 자동 모드 프롬프트와 같다(실험 ③의 비교 기준)."""
+    analyze_tool: 따로 보기 도구(`analyze_pages`)도 내놓는가(Step 10 2차). 끄면 1차의 자동 모드 프롬프트와 같다(실험 ③의 비교 기준).
+    analyze_group_choice: 묶음 크기(`group`)를 모델이 고르는 턴인가(`analyzeGroup: auto`). 그때만 그 한 문장이 붙는다."""
     served_by = (f' You are served by the model "{model_name}"; mention that only when the user asks which model '
                  "this is.") if model_name else ""
     parts = [
@@ -170,6 +194,9 @@ def system_prompt(manifest: str, *, tools_enabled: bool, model_name: str = "", v
                 f"to {config.MAX_ANALYZED_PAGES} pages per turn. If the per-page answers leave the decision ambiguous, call "
                 "view_page on the decisive pages and judge them yourself together with those answers; use view_page from the "
                 "start when pages must be compared side by side."
+                + (f' Pass "group" (1-{config.ANALYZE_GROUP_MAX}) to have that many pages looked at in one call: 1 when each '
+                   "page must be read precisely, a larger value when you only need to sort pages by what they show."
+                   if analyze_group_choice else "")
             )
         parts.append(
             "If a supplied excerpt is truncated, call read_attachment with increasing start offsets until hasMore is "
@@ -215,16 +242,20 @@ def view_page_limit_reached(name: str, limit: int) -> str:
 
 
 def analyze_pages_result(name: str, question: str, answers: list[tuple[str, str]], *, remaining: int, limit: int,
-                         deferred: str = "", not_analyzed: str = "", beyond: int = 0, per_call: int = 0) -> str:
+                         deferred: str = "", not_analyzed: str = "", beyond: int = 0, per_call: int = 0, group: int = 1,
+                         pages: int | None = None) -> str:
     """따로 보기 도구(Step 10 2차)가 모델에게 돌려주는 글: 쪽마다 `[page n] 답`, 그리고 다음에 할 일.
 
-    answers: (쪽 표식, 답) — 표식은 PDF 쪽이면 "page 3", 업로드 이미지면 그 이름.
+    answers: (쪽 표식, 답) — 표식은 PDF 쪽이면 "page 3", 업로드 이미지면 그 이름, 묶음 보기에서 모델이 쪽을 가르지 않았으면 "pages 6-10".
     deferred: 한 호출의 쪽 수 상한 때문에 이번에 보지 않은 쪽 범위(비어 있으면 없음). not_analyzed: 턴 상한에 걸려 보지 않은 쪽 범위.
-    beyond: PDF에 없는 쪽을 요청해 무시한 수.
+    beyond: PDF에 없는 쪽을 요청해 무시한 수. group: 한 VLM 호출에 넣은 쪽 수(묶음 보기). pages: 본 쪽 수(answers가 묶음이면 다르다).
     """
-    count = len(answers)
-    lines = [f'Analyzed {count} page{"s" if count != 1 else ""} of {name} with the question: "{question}". Each answer below '
-             "comes from a separate look at that page only; the pages are not attached to your call."]
+    count = len(answers) if pages is None else pages
+    how = ("Each answer below comes from a separate look at that page only" if group <= 1 else
+           f"The pages were looked at {group} at a time in separate calls, and the answers are per page where the vision "
+           "model kept them apart ([pages a-b] marks an answer it gave for several pages together)")
+    lines = [f'Analyzed {count} page{"s" if count != 1 else ""} of {name} with the question: "{question}". {how}; '
+             "the pages are not attached to your call."]
     for marker, answer in answers:
         lines.append(f"[{marker}] {answer}")
     notes: list[str] = []
