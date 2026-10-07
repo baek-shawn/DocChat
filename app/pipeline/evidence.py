@@ -83,31 +83,58 @@ def page_ranges(numbers: list[int]) -> str:
     return ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in spans)
 
 
-def drawing_cue(pdf: Attachment) -> str:
-    """매니페스트에 덧붙이는 판단 재료(Step 10): 어느 쪽에 그림이 있고 그 쪽의 글이 무엇을 담는지.
+_NOT_IN_TEXT = ("What is drawn - the shapes, their positions and counts, and which label or dimension belongs to which "
+                "feature - is NOT in the text of any page")
 
-    모델이 "글로 충분한가"를 추측하지 않게 한다 — 전사한 쪽의 글은 보이는 라벨을 옮겨 적은 것일 뿐이고, 네이티브 글이 있는
-    쪽도 그림 자체(형상·배치·개수·어느 대상의 치수인지)는 글에 없다. 그림이 없으면 빈 문자열.
+
+def _pages_phrase(numbers: list[int]) -> str:
+    return f"page {page_ranges(numbers)}" if len(numbers) == 1 else f"pages {page_ranges(numbers)}"
+
+
+def drawing_cue(pdf: Attachment) -> str:
+    """매니페스트에 덧붙이는 판단 재료(Step 10) — **파일 검사 결과**로 적는다(v2, 2026-10-07).
+
+    v1은 그림 쪽을 "전사한 쪽; 네이티브 글이 있는 쪽"으로 나눠 적고 끝에 view_page를 가리켰는데, Qwen3.5가 두 세션 모두 앞 묶음만
+    "그림 쪽"으로 읽어 네이티브 그림 쪽 33개를 후보에서 빠뜨렸다(STEPS.md Step 10 2차 "매니페스트 v2"). v2는 사실만 적되 모델이
+    후보를 스스로 정할 수 있게 한다: ① 검사의 근거(박힌 이미지·선 명령이지 눈으로 본 것이 아니다) ② 잡힌 쪽을 **한 목록**과 총수로
+    ③ **안 잡힌 쪽**도 ④ 글 층이 없는 쪽(전사) ⑤ 60쪽 상한 때문에 검사하지 않은 쪽. 도구는 가리키지 않는다(도구 문단이 맡는다).
+    검사가 놓칠 수 있다는 것(보안 설정 등으로 글만 뽑히는 CAD PDF)도 사실이라, 아무것도 안 잡혀도 그렇게 적는다.
     """
-    pages = drawing_pages(pdf)
+    pages = page_analysis_of(pdf)
     if not pages:
         return ""
-    transcribed = [page["page"] for page in pages if page.get("vlm")]
-    native = [page["page"] for page in pages if not page.get("vlm")]
-    parts = []
-    if transcribed:
-        parts.append(f"{page_ranges(transcribed)} (text = transcription of the visible labels only)")
-    if native:
-        parts.append(f"{page_ranges(native)} (native text beside the drawing)")
-    return (f"drawings on pages {'; '.join(parts)} - the shapes, their positions and counts, and which label or "
-            "dimension belongs to which feature are NOT in the text; call view_page to see such a page")
+    total = int(pdf.total_pages or 0) or len(pages)
+    checked = sorted(page["page"] for page in pages)
+    unchecked = [number for number in range(1, total + 1) if number not in set(checked)]
+    drawn = drawing_pages(pdf)
+    drawn_numbers = [page["page"] for page in drawn]
+    none_detected = [number for number in checked if number not in set(drawn_numbers)]
+    no_text = [page["page"] for page in drawn if page.get("vlm")]
+    tail = f"; {_pages_phrase(unchecked)} were not checked (page limit)" if unchecked else ""
+    if pages and all(page.get("classification") == "scanned-raster" for page in pages) and not unchecked:
+        return (f"file check: all {total} pages are full-page scans with no text layer; their text is only a transcription of "
+                f"the visible labels. {_NOT_IN_TEXT}")
+    basis = "file check (embedded images and vector strokes in the file, not a visual inspection)"
+    if not drawn:
+        return (f"{basis}: no embedded images or vector strokes detected on any page - drawings stored in another way would "
+                f"not be detected{tail}. {_NOT_IN_TEXT}")
+    found = (f"all {total} pages contain them" if not none_detected and not unchecked
+             else f"{len(drawn_numbers)} of {total} pages contain them - {page_ranges(drawn_numbers)}")
+    parts = [found]
+    if none_detected:
+        parts.append(f"{len(none_detected)} page{'s have' if len(none_detected) != 1 else ' has'} none detected - "
+                     f"{page_ranges(none_detected)}")
+    if no_text:
+        parts.append(f"{_pages_phrase(no_text)} {'have' if len(no_text) != 1 else 'has'} no text layer, so "
+                     f"{'their' if len(no_text) != 1 else 'its'} text is only a transcription of the visible labels")
+    return f"{basis}: {'; '.join(parts)}{tail}. {_NOT_IN_TEXT}"
 
 
 def attachment_manifest(attachments: list[Attachment], *, drawing_cues: bool = False) -> str:
     """시스템 프롬프트에 넣는 한 줄 요약. 모델이 정확한 첨부 이름을 알 수 있게 한다.
 
-    drawing_cues: 보기 도구를 내놓는 턴(답변 이미지 모드 자동, Step 10)에만 True — PDF마다 그림이 있는 쪽을 덧붙인다.
-    다른 모드의 매니페스트는 Step 8까지와 같다(실험 ①의 비교 기준).
+    drawing_cues: 보기 도구를 내놓는 턴(답변 이미지 모드 자동, Step 10)에만 True — PDF마다 파일 검사 결과(어느 쪽에 박힌
+    이미지·선이 있는지)를 덧붙인다. 다른 모드의 매니페스트는 Step 8까지와 같다(실험 ①의 비교 기준).
     """
     if not attachments:
         return "none"

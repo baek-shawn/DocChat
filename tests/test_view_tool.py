@@ -67,9 +67,11 @@ def test_auto_mode_offers_the_view_tool_and_marks_drawing_pages(client, mock_llm
     system = system_text(main)
     assert "view_page attaches the image of one page" in system and f"up to {config.MAX_VIEWED_PAGES} pages" in system
     assert "analyze_pages" not in system
-    # 판단 재료: 그림이 있는 쪽과 그 쪽의 글이 무엇을 담는지(전사한 2쪽) — 네이티브 1쪽은 그림이 없다.
+    # 판단 재료(v2): 파일 검사 결과 — 잡힌 쪽(전사한 2쪽), 안 잡힌 쪽(네이티브 1쪽), 글 층이 없는 쪽.
     assert ('"scan.pdf": parts=3, pages=2, images=1, parsedText=' in system
-            and "drawings on pages 2 (text = transcription of the visible labels only) - the shapes" in system)
+            and "file check (embedded images and vector strokes in the file, not a visual inspection): 1 of 2 pages contain them - 2; "
+                "1 page has none detected - 1; page 2 has no text layer, so its text is only a transcription of the visible labels. "
+                "What is drawn" in system)
     assert image_count(main) == 0 and "[PAGE IMAGES" not in all_text(main)         # 처음에는 업로드 이미지만(여기선 없음)
     assert data["meta"]["answerImageMode"] == "auto"
     assert data["meta"]["answerImages"] == {"sent": 0, "candidates": 0, "names": []}
@@ -88,7 +90,7 @@ def test_other_modes_keep_the_step8_prompt_without_the_view_tool(client, mock_ll
         (main,) = main_calls(mock_llm)
         assert tool_names(main) == ["inspect_visual", "read_attachment", "search_attachments"], mode
         system = system_text(main)
-        assert "view_page" not in system and "drawings on pages" not in system, mode
+        assert "view_page" not in system and "file check" not in system, mode
         assert "viewedPages" not in data["meta"], mode
     bad = client.post("/api/chat", json=chat_body(mock_llm, "hi", answerImageMode="view"))
     assert bad.status_code == 400 and "'auto'" in bad.json()["error"]
@@ -317,15 +319,32 @@ def test_manifest_drawing_cue_lists_pages_by_what_their_text_holds():
         {"page": 6, "classification": "native-vector", "chars": 900, "raster": 0, "rasterArea": 0.0, "vector": 300, "vlm": False},
     ])
     assert [page["page"] for page in drawing_pages(pdf)] == [1, 2, 4, 5, 6]
-    assert drawing_cue(pdf) == ("drawings on pages 2, 4-5 (text = transcription of the visible labels only); 1, 6 (native text beside "
-                                "the drawing) - the shapes, their positions and counts, and which label or dimension belongs to which "
-                                "feature are NOT in the text; call view_page to see such a page")
+    not_in_text = ("What is drawn - the shapes, their positions and counts, and which label or dimension belongs to which feature - "
+                   "is NOT in the text of any page")
+    basis = "file check (embedded images and vector strokes in the file, not a visual inspection)"
+    # v2(2026-10-07): 잡힌 쪽을 한 목록과 총수로, 안 잡힌 쪽도, 글 층이 없는 쪽은 부속 사실로. 도구는 가리키지 않는다.
+    assert drawing_cue(pdf) == (f"{basis}: 5 of 6 pages contain them - 1-2, 4-6; 1 page has none detected - 3; pages 2, 4-5 have no text "
+                                f"layer, so their text is only a transcription of the visible labels. {not_in_text}")
     plain = '"a.pdf": parts=1, pages=6, images=0, parsedText=50 chars, visualOcr=0 chars, pendingVision=0'
     assert attachment_manifest([pdf]) == plain                                           # 기본: Step 8까지와 같다
     assert attachment_manifest([pdf], drawing_cues=True) == f"{plain}; {drawing_cue(pdf)}"
+    # 아무것도 안 잡힌 PDF: 검사가 놓칠 수 있다는 것까지 적는다(보안 설정으로 글만 뽑히는 CAD PDF 대비). v1은 줄을 붙이지 않았다.
     no_drawing = Attachment(name="t.pdf", kind="pdf", mime=PDF, text="x", total_pages=1,
                             page_analysis=[{"page": 1, "classification": "native-vector", "chars": 900, "raster": 0, "rasterArea": 0.0, "vector": 3, "vlm": False}])
-    assert attachment_manifest([no_drawing], drawing_cues=True) == '"t.pdf": parts=1, pages=1, images=0, parsedText=1 chars, visualOcr=0 chars, pendingVision=0'
+    assert attachment_manifest([no_drawing], drawing_cues=True) == (
+        f'"t.pdf": parts=1, pages=1, images=0, parsedText=1 chars, visualOcr=0 chars, pendingVision=0; {basis}: no embedded images or '
+        f"vector strokes detected on any page - drawings stored in another way would not be detected. {not_in_text}")
+    # 전부 스캔본: 좁혀 주지 못한다는 사실을 그대로 — 모든 쪽이 그림이고 글 층이 없다
+    scans = Attachment(name="s.pdf", kind="pdf", mime=PDF, text="x", total_pages=2, page_analysis=[
+        {"page": n, "classification": "scanned-raster", "chars": 0, "raster": 1, "rasterArea": 0.99, "vector": 0, "vlm": True} for n in (1, 2)])
+    assert drawing_cue(scans) == f"file check: all 2 pages are full-page scans with no text layer; their text is only a transcription of the visible labels. {not_in_text}"
+    # 모든 쪽에 그림이 있지만 글 층은 있는 PDF, 그리고 쪽 상한 때문에 검사하지 않은 쪽
+    partial = Attachment(name="p.pdf", kind="pdf", mime=PDF, text="x", total_pages=5, page_analysis=[
+        {"page": n, "classification": "mixed-native", "chars": 500, "raster": 1, "rasterArea": 0.3, "vector": 2, "vlm": False} for n in (1, 2, 3)])
+    assert drawing_cue(partial) == f"{basis}: 3 of 5 pages contain them - 1-3; pages 4-5 were not checked (page limit). {not_in_text}"
+    full = Attachment(name="f.pdf", kind="pdf", mime=PDF, text="x", total_pages=2, page_analysis=[
+        {"page": n, "classification": "mixed-native", "chars": 500, "raster": 1, "rasterArea": 0.3, "vector": 2, "vlm": False} for n in (1, 2)])
+    assert drawing_cue(full) == f"{basis}: all 2 pages contain them. {not_in_text}"
     # Step 10 이전에 올린 PDF(메타데이터 없음): 본문의 [PAGE ANALYSIS] 줄에서 읽는다 — 래스터 면적을 몰라 개수로 대신한다.
     legacy = Attachment(name="old.pdf", kind="pdf", mime=PDF, total_pages=3, text=(
         "[PAGE ANALYSIS]\nPage 1: native-vector; native characters=435; raster images=0; vector operations=0; vision OCR=skipped\n"
